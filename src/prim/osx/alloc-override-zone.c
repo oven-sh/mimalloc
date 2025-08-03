@@ -143,25 +143,7 @@ static size_t intro_good_size(malloc_zone_t* zone, size_t size) {
 static boolean_t intro_check(malloc_zone_t* zone) {
   MI_UNUSED(zone);
   
-  // Mimalloc doesn't have a direct heap consistency check API,
-  // but we can perform some basic validation:
-  
-  // 1. Force a heap collection which exercises internal heap structures
-  mi_collect(true);  // true = force collection
-  
-  // 2. The fact that we didn't crash during collection is a good sign
-  // In a debug build, mimalloc would have caught corruption during collection
-  
-  // 3. Try to walk the heap blocks (this also validates the heap structure)
-  // Note: we don't actually need to visit all blocks, just verify we can walk the heap
-  mi_heap_t* heap = mi_heap_get_default();
-  if (heap != NULL) {
-    // This visitor just returns true immediately to stop the walk
-    // The fact that mi_heap_visit_blocks doesn't crash means the heap structure is valid
-    mi_heap_visit_blocks(heap, false, NULL, NULL);
-  }
-  
-  // If we made it here without crashes, basic heap integrity is good
+  mi_collect();
   return true;
 }
 
