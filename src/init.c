@@ -764,14 +764,6 @@ void mi_cdecl mi_process_done(void) mi_attr_noexcept {
 
 
   #ifndef MI_SKIP_COLLECT_ON_EXIT
-    #if (MI_DEBUG || !defined(MI_SHARED_LIB))
-    // free all memory if possible on process exit. This is not needed for a stand-alone process
-    // but should be done if mimalloc is statically linked into another shared library which
-    // is repeatedly loaded/unloaded, see issue #281.
-    mi_heap_collect(heap, true /* force */ );
-    #endif
-  #endif
-
   // Forcefully release all retained memory; this can be dangerous in general if overriding regular malloc/free
   // since after process_done there might still be other code running that calls `free` (like at_exit routines,
   // or C-runtime termination code.
@@ -782,6 +774,7 @@ void mi_cdecl mi_process_done(void) mi_attr_noexcept {
     _mi_page_map_unsafe_destroy(_mi_subproc_main());
   }
   //_mi_page_map_unsafe_destroy(_mi_subproc_main());
+  #endif
 
   if (mi_option_is_enabled(mi_option_show_stats) || mi_option_is_enabled(mi_option_verbose)) {
     _mi_stats_print(&_mi_subproc_main()->stats, NULL, NULL);  // use always main subproc at process exit to avoid dereferencing the heap (as it may be destroyed by now)
