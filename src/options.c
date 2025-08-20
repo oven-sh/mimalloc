@@ -163,6 +163,7 @@ static mi_option_desc_t options[_mi_option_last] =
   { 0,   UNINIT, MI_OPTION(guarded_sample_seed)},
   { 0,   UNINIT, MI_OPTION(target_segments_per_thread) }, // abandon segments beyond this point, or 0 to disable.
   { 10000, UNINIT, MI_OPTION(generic_collect) },          // collect heaps every N (=10000) generic allocation calls
+  { 100, UNINIT, MI_OPTION(generic_administrative) },     // perform administrative tasks every N (=100) generic allocation calls
 };
 
 static void mi_option_init(mi_option_desc_t* desc);

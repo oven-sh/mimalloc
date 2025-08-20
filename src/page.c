@@ -990,7 +990,7 @@ void* _mi_malloc_generic(mi_heap_t* heap, size_t size, bool zero, size_t huge_al
   mi_assert_internal(mi_heap_is_initialized(heap));
 
   // do administrative tasks every N generic mallocs
-  if mi_unlikely(++heap->generic_count >= 100) {
+  if mi_unlikely(++heap->generic_count >= mi_option_get(mi_option_generic_administrative)) {
     heap->generic_collect_count += heap->generic_count;
     heap->generic_count = 0;
     // call potential deferred free routines

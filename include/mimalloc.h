@@ -387,6 +387,7 @@ typedef enum mi_option_e {
   mi_option_guarded_sample_seed,        // can be set to allow for a (more) deterministic re-execution when a guard page is triggered (=0)
   mi_option_target_segments_per_thread, // experimental (=0)
   mi_option_generic_collect,            // collect heaps every N (=10000) generic allocation calls
+  mi_option_generic_administrative,     // perform administrative tasks every N (=100) generic allocation calls
   _mi_option_last,
   // legacy option names
   mi_option_large_os_pages = mi_option_allow_large_os_pages,
