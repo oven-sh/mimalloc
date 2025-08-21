@@ -174,7 +174,7 @@ static mi_option_desc_t mi_options[_mi_option_last] =
          MI_OPTION_UNINIT, MI_OPTION(page_max_reclaim) },         // don't reclaim (small) pages of the same originating heap if we already own N pages in that size class
   { MI_DEFAULT_PAGE_CROSS_THREAD_MAX_RECLAIM,
          MI_OPTION_UNINIT, MI_OPTION(page_cross_thread_max_reclaim) }, // don't reclaim (small) pages across threads if we already own N pages in that size class
-  { 100, UNINIT, MI_OPTION(generic_administrative) },     // perform administrative tasks every N (=100) generic allocation calls
+  { 100, MI_OPTION_UNINIT, MI_OPTION(generic_administrative) },     // perform administrative tasks every N (=100) generic allocation calls
 };
 
 static void mi_option_init(mi_option_desc_t* desc);
