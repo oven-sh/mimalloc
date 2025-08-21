@@ -176,9 +176,7 @@ static void mi_heap_collect_ex(mi_heap_t* heap, mi_collect_t collect)
   _mi_arenas_collect(collect == MI_FORCE /* force purge? */);
 
   // merge statistics
-  if (collect <= MI_FORCE) {
-    mi_stats_merge();
-  }
+  if (collect <= MI_FORCE) { _mi_stats_merge_thread(heap->tld); }
 }
 
 void _mi_heap_collect_abandon(mi_heap_t* heap) {
@@ -344,17 +342,17 @@ static bool _mi_heap_page_destroy(mi_heap_t* heap, mi_page_queue_t* pq, mi_page_
       mi_heap_stat_decrease(heap, malloc_huge, bsize);
     }
   }
-#if (MI_STAT)
+  #if (MI_STAT>0)
   _mi_page_free_collect(page, false);  // update used count
   const size_t inuse = page->used;
   if (bsize <= MI_LARGE_OBJ_SIZE_MAX) {
     mi_heap_stat_decrease(heap, malloc_normal, bsize * inuse);
-#if (MI_STAT>1)
+    #if (MI_STAT>1)
     mi_heap_stat_decrease(heap, malloc_bins[_mi_bin(bsize)], inuse);
-#endif
+    #endif
   }
-  mi_heap_stat_decrease(heap, malloc_requested, bsize * inuse);  // todo: off for aligned blocks...
-#endif
+  // mi_heap_stat_decrease(heap, malloc_requested, bsize * inuse);  // todo: off for aligned blocks...
+  #endif
 
   /// pretend it is all free now
   mi_assert_internal(mi_page_thread_free(page) == NULL);

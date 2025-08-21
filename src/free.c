@@ -348,7 +348,10 @@ mi_decl_nodiscard size_t mi_usable_size(const void* p) mi_attr_noexcept {
 
 void mi_free_size(void* p, size_t size) mi_attr_noexcept {
   MI_UNUSED_RELEASE(size);
-  mi_assert(p == NULL || size <= _mi_usable_size(p,"mi_free_size"));
+  #if MI_DEBUG
+  const size_t available = _mi_usable_size(p,"mi_free_size");
+  mi_assert(p == NULL || size <= available || available == 0 /* invalid pointer */ );
+  #endif
   mi_free(p);
 }
 
@@ -522,15 +525,13 @@ static void mi_check_padding(const mi_page_t* page, const mi_block_t* block) {
 // only maintain stats for smaller objects if requested
 #if (MI_STAT>0)
 static void mi_stat_free(const mi_page_t* page, const mi_block_t* block) {
-  #if (MI_STAT < 2)
   MI_UNUSED(block);
-  #endif
   mi_heap_t* const heap = mi_heap_get_default();
   const size_t bsize = mi_page_usable_block_size(page);
-  #if (MI_STAT>1)
-  const size_t usize = mi_page_usable_size_of(page, block);
-  mi_heap_stat_decrease(heap, malloc_requested, usize);
-  #endif
+  // #if (MI_STAT>1)
+  // const size_t usize = mi_page_usable_size_of(page, block);
+  // mi_heap_stat_decrease(heap, malloc_requested, usize);
+  // #endif
   if (bsize <= MI_MEDIUM_OBJ_SIZE_MAX) {
     mi_heap_stat_decrease(heap, malloc_normal, bsize);
     #if (MI_STAT > 1)
