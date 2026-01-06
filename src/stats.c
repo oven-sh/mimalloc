@@ -95,11 +95,15 @@ void __mi_stat_adjust_decrease(mi_stat_count_t* stat, size_t amount) {
 static void mi_stat_count_add_mt(mi_stat_count_t* stat, const mi_stat_count_t* src) {
   if (stat==src) return;
   mi_atomic_void_addi64_relaxed(&stat->total, &src->total); 
-  mi_atomic_void_addi64_relaxed(&stat->current, &src->current); 
-  // peak scores do really not work across threads .. we just add them
-  mi_atomic_void_addi64_relaxed( &stat->peak, &src->peak);
-  // or, take the max?
-  // mi_atomic_maxi64_relaxed(&stat->peak, src->peak);
+  const int64_t prev_current = mi_atomic_addi64_relaxed(&stat->current, src->current);
+
+  // Global current plus thread peak approximates new global peak
+  // note: peak scores do really not work across threads.
+  // we used to just add them together but that often overestimates in practice.
+  // similarly, max does not seem to work well. The current approach
+  // by Artem Kharytoniuk (@artem-lunarg) seems to work better, see PR#1112 
+  // for a longer description.
+  mi_atomic_maxi64_relaxed(&stat->peak, prev_current + src->peak);
 }
 
 static void mi_stat_counter_add_mt(mi_stat_counter_t* stat, const mi_stat_counter_t* src) {
@@ -374,11 +378,11 @@ void _mi_stats_print(mi_stats_t* stats, mi_output_fun* out0, void* arg0) mi_attr
   size_t page_faults;
   mi_process_info(&elapsed, &user_time, &sys_time, &current_rss, &peak_rss, &current_commit, &peak_commit, &page_faults);
   _mi_fprintf(out, arg, "%10s: %5zu.%03zu s\n", "elapsed", elapsed/1000, elapsed%1000);
-  _mi_fprintf(out, arg, "%10s: user: %zu.%03zu s, system: %zu.%03zu s, faults: %zu, rss: ", "process",
+  _mi_fprintf(out, arg, "%10s: user: %zu.%03zu s, system: %zu.%03zu s, faults: %zu, peak rss: ", "process",
               user_time/1000, user_time%1000, sys_time/1000, sys_time%1000, page_faults );
   mi_printf_amount((int64_t)peak_rss, 1, out, arg, "%s");
   if (peak_commit > 0) {
-    _mi_fprintf(out, arg, ", commit: ");
+    _mi_fprintf(out, arg, ", peak commit: ");
     mi_printf_amount((int64_t)peak_commit, 1, out, arg, "%s");
   }
   _mi_fprintf(out, arg, "\n");
@@ -569,10 +573,11 @@ static void mi_heap_buf_print_count_bin(mi_heap_buf_t* hbuf, const char* prefix,
 static void mi_heap_buf_print_count_cbin(mi_heap_buf_t* hbuf, const char* prefix, mi_stat_count_t* stat, mi_chunkbin_t bin, bool add_comma) {
   const char* cbin = " ";
   switch(bin) {
-    case MI_CBIN_SMALL: cbin = "S"; break;
+    case MI_CBIN_SMALL:  cbin = "S"; break;
     case MI_CBIN_MEDIUM: cbin = "M"; break;
-    case MI_CBIN_LARGE: cbin = "L"; break;
-    case MI_CBIN_OTHER: cbin = "X"; break;
+    case MI_CBIN_LARGE:  cbin = "L"; break;
+    case MI_CBIN_HUGE:   cbin = "H"; break;
+    case MI_CBIN_OTHER:  cbin = "X"; break;
     default: cbin = " "; break;
   }
   char buf[128];

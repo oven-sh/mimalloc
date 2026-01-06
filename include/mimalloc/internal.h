@@ -126,6 +126,7 @@ void          _mi_strlcpy(char* dest, const char* src, size_t dest_size);
 void          _mi_strlcat(char* dest, const char* src, size_t dest_size);
 size_t        _mi_strlen(const char* s);
 size_t        _mi_strnlen(const char* s, size_t max_len);
+char*         _mi_strnstr(char* s, size_t max_len, const char* pat);
 bool          _mi_getenv(const char* name, char* result, size_t result_size);
 
 // "options.c"
@@ -184,6 +185,7 @@ size_t        _mi_os_good_alloc_size(size_t size);
 bool          _mi_os_has_overcommit(void);
 bool          _mi_os_has_virtual_reserve(void);
 size_t        _mi_os_virtual_address_bits(void);
+size_t        _mi_os_minimal_purge_size(void);
 
 bool          _mi_os_reset(void* addr, size_t size);
 bool          _mi_os_decommit(void* addr, size_t size);
@@ -208,7 +210,7 @@ void*         _mi_os_alloc_aligned(size_t size, size_t alignment, bool commit, b
 void*         _mi_os_alloc_aligned_at_offset(size_t size, size_t alignment, size_t align_offset, bool commit, bool allow_large, mi_memid_t* memid);
 
 void*         _mi_os_get_aligned_hint(size_t try_alignment, size_t size);
-bool          _mi_os_use_large_page(size_t size, size_t alignment);
+bool          _mi_os_canuse_large_page(size_t size, size_t alignment);
 size_t        _mi_os_large_page_size(void);
 void*         _mi_os_alloc_huge_os_pages(size_t pages, int numa_node, mi_msecs_t max_secs, size_t* pages_reserved, size_t* psize, mi_memid_t* memid);
 
@@ -245,7 +247,7 @@ mi_page_t*    _mi_safe_ptr_page(const void* p);
 void          _mi_page_map_unsafe_destroy(mi_subproc_t* subproc);
 
 // "page.c"
-void*         _mi_malloc_generic(mi_heap_t* heap, size_t size, bool zero, size_t huge_alignment)  mi_attr_noexcept mi_attr_malloc;
+void*         _mi_malloc_generic(mi_heap_t* heap, size_t size, bool zero, size_t huge_alignment, size_t* usable)  mi_attr_noexcept mi_attr_malloc;
 
 void          _mi_page_retire(mi_page_t* page) mi_attr_noexcept;       // free the page if there are no other pages with many free blocks
 void          _mi_page_unfull(mi_page_t* page);
@@ -289,12 +291,12 @@ mi_msecs_t    _mi_clock_end(mi_msecs_t start);
 mi_msecs_t    _mi_clock_start(void);
 
 // "alloc.c"
-void*         _mi_page_malloc_zero(mi_heap_t* heap, mi_page_t* page, size_t size, bool zero) mi_attr_noexcept;  // called from `_mi_malloc_generic`
+void*         _mi_page_malloc_zero(mi_heap_t* heap, mi_page_t* page, size_t size, bool zero, size_t* usable) mi_attr_noexcept;  // called from `_mi_malloc_generic`
 void*         _mi_page_malloc(mi_heap_t* heap, mi_page_t* page, size_t size) mi_attr_noexcept;                  // called from `_mi_heap_malloc_aligned`
 void*         _mi_page_malloc_zeroed(mi_heap_t* heap, mi_page_t* page, size_t size) mi_attr_noexcept;           // called from `_mi_heap_malloc_aligned`
 void*         _mi_heap_malloc_zero(mi_heap_t* heap, size_t size, bool zero) mi_attr_noexcept;
-void*         _mi_heap_malloc_zero_ex(mi_heap_t* heap, size_t size, bool zero, size_t huge_alignment) mi_attr_noexcept;     // called from `_mi_heap_malloc_aligned`
-void*         _mi_heap_realloc_zero(mi_heap_t* heap, void* p, size_t newsize, bool zero) mi_attr_noexcept;
+void*         _mi_heap_malloc_zero_ex(mi_heap_t* heap, size_t size, bool zero, size_t huge_alignment, size_t* usable) mi_attr_noexcept;     // called from `_mi_heap_malloc_aligned`
+void*         _mi_heap_realloc_zero(mi_heap_t* heap, void* p, size_t newsize, bool zero, size_t* usable_pre, size_t* usable_post) mi_attr_noexcept;
 mi_block_t*   _mi_page_ptr_unalign(const mi_page_t* page, const void* p);
 void          _mi_padding_shrink(const mi_page_t* page, const mi_block_t* block, const size_t min_size);
 
@@ -814,7 +816,7 @@ static inline void mi_page_set_heap(mi_page_t* page, mi_heap_t* heap) {
   }
   const mi_threadid_t tid = (heap == NULL ? MI_THREADID_ABANDONED : heap->tld->thread_id);
   mi_assert_internal((tid & MI_PAGE_FLAG_MASK) == 0);
-  
+
   // we need to use an atomic cas since a concurrent thread may still set the MI_PAGE_HAS_INTERIOR_POINTERS flag (see `alloc_aligned.c`).
   mi_threadid_t xtid_old = mi_page_xthread_id(page);
   mi_threadid_t xtid;
@@ -868,48 +870,15 @@ static inline bool mi_page_has_any_available(const mi_page_t* page) {
   return (page->used < page->reserved || (mi_page_thread_free(page) != NULL));
 }
 
-
 // Owned?
 static inline bool mi_page_is_owned(const mi_page_t* page) {
   return mi_tf_is_owned(mi_atomic_load_relaxed(&((mi_page_t*)page)->xthread_free));
-}
-
-// Unown a page that is currently owned
-static inline void _mi_page_unown_unconditional(mi_page_t* page) {
-  mi_assert_internal(mi_page_is_owned(page));
-  mi_assert_internal(mi_page_thread_id(page)==0);
-  const uintptr_t old = mi_atomic_and_acq_rel(&page->xthread_free, ~((uintptr_t)1));
-  mi_assert_internal((old&1)==1); MI_UNUSED(old);
 }
 
 // get ownership if it is not yet owned
 static inline bool mi_page_try_claim_ownership(mi_page_t* page) {
   const uintptr_t old = mi_atomic_or_acq_rel(&page->xthread_free, 1);
   return ((old&1)==0);
-}
-
-// release ownership of a page. This may free the page if all blocks were concurrently
-// freed in the meantime. Returns true if the page was freed.
-static inline bool _mi_page_unown(mi_page_t* page) {
-  mi_assert_internal(mi_page_is_owned(page));
-  mi_assert_internal(mi_page_is_abandoned(page));
-  mi_thread_free_t tf_new;
-  mi_thread_free_t tf_old = mi_atomic_load_relaxed(&page->xthread_free);
-  do {
-    mi_assert_internal(mi_tf_is_owned(tf_old));
-    while mi_unlikely(mi_tf_block(tf_old) != NULL) {
-      _mi_page_free_collect(page, false);  // update used
-      if (mi_page_all_free(page)) {        // it may become free just before unowning it
-        _mi_arenas_page_unabandon(page);
-        _mi_arenas_page_free(page,NULL);
-        return true;
-      }
-      tf_old = mi_atomic_load_relaxed(&page->xthread_free);
-    }
-    mi_assert_internal(mi_tf_block(tf_old)==NULL);
-    tf_new = mi_tf_create(NULL, false);
-  } while (!mi_atomic_cas_weak_acq_rel(&page->xthread_free, &tf_old, tf_new));
-  return false;
 }
 
 

@@ -1,5 +1,5 @@
 /* ----------------------------------------------------------------------------
-Copyright (c) 2018-2024, Microsoft Research, Daan Leijen
+Copyright (c) 2018-2025, Microsoft Research, Daan Leijen
 This is free software; you can redistribute it and/or modify it under the
 terms of the MIT license. A copy of the license can be found in the file
 "LICENSE" at the root of this distribution.
@@ -10,12 +10,16 @@ terms of the MIT license. A copy of the license can be found in the file
 
 // --------------------------------------------------------------------------
 // This file contains the main type definitions for mimalloc:
-// mi_heap_t      : all data for a thread-local heap, contains
-//                  lists of all managed heap pages.
+// mi_heap_t      : all data for a heap; usually there is just one main default heap.
+// mi_theap_t     : a thread local heap belonging to a specific heap: 
+//                  maintains lists of thread-local heap pages that have free space.
 // mi_page_t      : a mimalloc page (usually 64KiB or 512KiB) from
 //                  where objects of a single size are allocated.
 //                  Note: we write "OS page" for OS memory pages while
 //                  using plain "page" for mimalloc pages (`mi_page_t`).
+// mi_arena_t     : a large memory area where pages are allocated (process shared)
+// mi_tld_t       : thread local data
+// mi_subproc_t   : all heaps belong to a sub-process (usually just the main one)
 // --------------------------------------------------------------------------
 
 
@@ -112,9 +116,10 @@ terms of the MIT license. A copy of the license can be found in the file
 #endif
 
 // Enable large pages for objects between 64KiB and 512KiB.
-// Disabled by default as for many workloads the block sizes above 64 KiB are quite random which can lead to too many partially used large pages.
+// This should perhaps be disabled by default as for many workloads the block sizes above 64 KiB 
+// are quite random which can lead to too many partially used large pages (but see issue #1104).
 #ifndef MI_ENABLE_LARGE_PAGES
-#define MI_ENABLE_LARGE_PAGES  0
+#define MI_ENABLE_LARGE_PAGES  1
 #endif
 
 // --------------------------------------------------------------
@@ -126,6 +131,8 @@ terms of the MIT license. A copy of the license can be found in the file
 #ifndef MI_ARENA_SLICE_SHIFT
   #ifdef  MI_SMALL_PAGE_SHIFT   // backward compatibility
   #define MI_ARENA_SLICE_SHIFT              MI_SMALL_PAGE_SHIFT
+  #elif MI_SECURE && __APPLE__ && MI_ARCH_ARM64 
+  #define MI_ARENA_SLICE_SHIFT              (17)                        // 128 KiB to not waste too much due to 16 KiB guard pages
   #else
   #define MI_ARENA_SLICE_SHIFT              (13 + MI_SIZE_SHIFT)        // 64 KiB (32 KiB on 32-bit)
   #endif
@@ -149,12 +156,13 @@ terms of the MIT license. A copy of the license can be found in the file
 #define MI_ARENA_SLICE_ALIGN              (MI_ARENA_SLICE_SIZE)
 
 #define MI_ARENA_MIN_OBJ_SLICES           (1)
-#define MI_ARENA_MAX_OBJ_SLICES           (MI_BCHUNK_BITS)            // 32 MiB (for now, cannot cross chunk boundaries)
+#define MI_ARENA_MAX_CHUNK_OBJ_SLICES     (MI_BCHUNK_BITS)            // 32 MiB (for now, cannot cross chunk boundaries) (or 8 MiB on 32-bit)
 
 #define MI_ARENA_MIN_OBJ_SIZE             (MI_ARENA_MIN_OBJ_SLICES * MI_ARENA_SLICE_SIZE)
-#define MI_ARENA_MAX_OBJ_SIZE             (MI_ARENA_MAX_OBJ_SLICES * MI_ARENA_SLICE_SIZE)
+#define MI_ARENA_MAX_CHUNK_OBJ_SIZE       (MI_ARENA_MAX_CHUNK_OBJ_SLICES * MI_ARENA_SLICE_SIZE)  
+#define MI_ARENA_MAX_OBJ_SIZE             (MI_SIZE_BITS * MI_ARENA_MAX_CHUNK_OBJ_SIZE)  // 1 GiB (or 256 MiB on 32-bit)
 
-#if MI_ARENA_MAX_OBJ_SIZE < MI_SIZE_SIZE*1024
+#if MI_ARENA_MAX_CHUNK_OBJ_SIZE < MI_SIZE_SIZE*1024
 #error maximum object size may be too small to hold local thread data  
 #endif
 
@@ -362,7 +370,8 @@ typedef struct mi_page_s {
 
 #define MI_PAGE_ALIGN                     MI_ARENA_SLICE_ALIGN // pages must be aligned on this for the page map.
 #define MI_PAGE_MIN_START_BLOCK_ALIGN     MI_MAX_ALIGN_SIZE    // minimal block alignment for the first block in a page (16b)
-#define MI_PAGE_MAX_START_BLOCK_ALIGN2    MI_KiB               // maximal block alignment for "power of 2"-sized blocks (such that we guarantee natural alignment)
+#define MI_PAGE_MAX_START_BLOCK_ALIGN2    (4*MI_KiB)           // maximal block alignment for "power of 2"-sized blocks (such that we guarantee natural alignment)
+#define MI_PAGE_OSPAGE_BLOCK_ALIGN2       (4*MI_KiB)           // also aligns any multiple of this size to avoid TLB misses.
 #define MI_PAGE_MAX_OVERALLOC_ALIGN       MI_ARENA_SLICE_SIZE  // (64 KiB) limit for which we overallocate in arena pages, beyond this use OS allocation
 
 #if (MI_ENCODE_FREELIST || MI_PADDING) && MI_SIZE_SIZE == 8
@@ -371,11 +380,11 @@ typedef struct mi_page_s {
 #define MI_PAGE_INFO_SIZE                 ((MI_INTPTR_SHIFT+1)*32)  // 128/96 >= sizeof(mi_page_t)
 #endif
 
-// The max object size are checked to not waste more than 12.5% internally over the page sizes.
-#define MI_SMALL_MAX_OBJ_SIZE             ((MI_SMALL_PAGE_SIZE-MI_PAGE_INFO_SIZE)/8)   // < ~8 KiB
+// The max object sizes are intended to not waste more than ~ 12.5% internally over the page sizes.
+#define MI_SMALL_MAX_OBJ_SIZE             ((MI_SMALL_PAGE_SIZE-MI_PAGE_OSPAGE_BLOCK_ALIGN2)/6)   // = 10 KiB
 #if MI_ENABLE_LARGE_PAGES
-#define MI_MEDIUM_MAX_OBJ_SIZE            ((MI_MEDIUM_PAGE_SIZE-MI_PAGE_INFO_SIZE)/8)  // < ~64 KiB
-#define MI_LARGE_MAX_OBJ_SIZE             (MI_LARGE_PAGE_SIZE/8)    // <= 512KiB // note: this must be a nice power of 2 or we get rounding issues with `_mi_bin`
+#define MI_MEDIUM_MAX_OBJ_SIZE            ((MI_MEDIUM_PAGE_SIZE-MI_PAGE_OSPAGE_BLOCK_ALIGN2)/6)  // ~ 84 KiB
+#define MI_LARGE_MAX_OBJ_SIZE             (MI_LARGE_PAGE_SIZE/8)    // <= 512 KiB // note: this must be a nice power of 2 or we get rounding issues with `_mi_bin`
 #else
 #define MI_MEDIUM_MAX_OBJ_SIZE            (MI_MEDIUM_PAGE_SIZE/8)   // <= 64 KiB
 #define MI_LARGE_MAX_OBJ_SIZE             MI_MEDIUM_MAX_OBJ_SIZE    // note: this must be a nice power of 2 or we get rounding issues with `_mi_bin`
