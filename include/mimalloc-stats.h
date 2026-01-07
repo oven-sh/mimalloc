@@ -100,8 +100,8 @@ typedef struct mi_stats_s
   mi_stat_counter_t _stat_counter_reserved[4];
 
   // size segregated statistics
-  mi_stat_count_t   malloc_bins[MI_BIN_COUNT];   // allocation per size bin
-  mi_stat_count_t   page_bins[MI_BIN_COUNT];     // pages allocated per size bin
+  mi_stat_count_t   malloc_bins[MI_BIN_FULL+1];   // allocation per size bin
+  mi_stat_count_t   page_bins[MI_BIN_FULL+1];     // pages allocated per size bin
   mi_stat_count_t   chunk_bins[MI_CBIN_COUNT];    // chunks per page sizes
 } mi_stats_t;
 
