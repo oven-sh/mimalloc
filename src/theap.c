@@ -277,6 +277,11 @@ void _mi_theap_free(mi_theap_t* theap) {
   if (theap->tprev != NULL) { theap->tprev->tnext = theap->tnext;  }
                        else { mi_assert_internal(theap->tld->theaps == theap); theap->tld->theaps = theap->tnext; }
 
+  // clear the cached theap slot if it points to this theap (prevent use-after-free of stale cache)
+  if (_mi_theap_cached() == theap) {
+    _mi_theap_cached_set((mi_theap_t*)&_mi_theap_empty);
+  }
+
   // and free the used memory
   if (theap->memid.memkind == MI_MEM_HEAP_MAIN) {  // note: for now unused as it would access theap_default stats in mi_free of the current theap
     mi_assert_internal(_mi_is_heap_main(mi_heap_of(theap)));
