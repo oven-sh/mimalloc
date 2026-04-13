@@ -241,7 +241,7 @@ static void mi_stat_counter_print(const mi_stat_counter_t* stat, const char* msg
 }
 
 static void mi_stat_counter_print_size(const mi_stat_counter_t* stat, const char* msg, mi_output_fun* out, void* arg ) {
-  _mi_fprintf(out, arg, "  %10s:", msg);
+  _mi_fprintf(out, arg, "  %-10s:", msg);
   mi_print_amount(stat->total, 1, out, arg);
   _mi_fprintf(out, arg, "\n");
 }

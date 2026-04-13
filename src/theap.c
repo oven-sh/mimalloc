@@ -201,18 +201,19 @@ void _mi_theap_init(mi_theap_t* theap, mi_heap_t* heap, mi_tld_t* tld)
     theap->tnext = head;
     if (head!=NULL) { head->tprev = theap; }
     theap->tld->theaps = theap;
+    // initialize random by splitting from `head` while it is pinned by the lock;
+    // a concurrent mi_heap_delete on another thread may free `head` (via _mi_theap_free)
+    // as soon as we release `tld->theaps_lock`.
+    if (head != NULL) {
+      _mi_random_split(&head->random, &theap->random);
+    }
   }
-
-  // initialize random
-  if (head == NULL) {  // first theap in this thread?
+  if (head == NULL) {  // first theap in this thread? (do OS random init outside the lock)
     #if defined(_WIN32) && !defined(MI_SHARED_LIB)
       _mi_random_init_weak(&theap->random);    // prevent allocation failure during bcrypt dll initialization with static linking (issue #1185)
     #else
       _mi_random_init(&theap->random);
     #endif
-  }
-  else {
-    _mi_random_split(&head->random, &theap->random);
   }
   theap->cookie  = _mi_theap_random_next(theap) | 1;
   _mi_theap_guarded_init(theap);
@@ -248,7 +249,7 @@ mi_theap_t* _mi_theap_create(mi_heap_t* heap, mi_tld_t* tld) {
     // note: takes up at least one slice which is quite wasteful...
     const size_t size = _mi_align_up(sizeof(mi_theap_t),MI_ARENA_MIN_OBJ_SIZE);
     theap = (mi_theap_t*)_mi_arenas_alloc(heap, size, true, true, heap->exclusive_arena, tld->thread_seq, tld->numa_node, &memid);
-    mi_assert_internal(memid.mem.os.size >= size);
+    mi_assert_internal(theap == NULL || memid.mem.os.size >= size);
   }
   if (theap==NULL) {
     _mi_error_message(ENOMEM, "unable to allocate theap meta-data\n");

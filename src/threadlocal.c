@@ -172,7 +172,7 @@ static mi_thread_local_t mi_thread_local_claim(void) {
   size_t idx = 0;
   if (mi_thread_locals_free != NULL && mi_bitmap_try_find_and_claim(mi_thread_locals_free,0,&idx,&mi_thread_local_claim_fun,NULL)) {
     mi_thread_locals_version++;
-    if (mi_thread_locals_version == SIZE_MAX/2) { mi_thread_locals_version = 1; }
+    if (mi_thread_locals_version == MI_TLS_IDX_MASK) { mi_thread_locals_version = 1; }
     return mi_key_create( idx, mi_thread_locals_version);
   }
   else {
@@ -187,9 +187,9 @@ static bool mi_thread_local_create_expand(void) {
   const size_t newcount = 1024 + oldcount;
   if (newcount > MI_TLS_IDX_MASK) { return false; }
   const size_t newsize = mi_bitmap_size( newcount, NULL );
-  slots = (mi_bitmap_t*)mi_realloc_aligned(slots, newsize, MI_BCHUNK_SIZE);
+  slots = (mi_bitmap_t*)mi_rezalloc_aligned(slots, newsize, MI_BCHUNK_SIZE);
   if (slots == NULL) { return false; }
-  mi_bitmap_init(slots, newcount, true /* or otherwise we would zero all old entries */);
+  mi_bitmap_init(slots, newcount, true /* preserves prior entries; rezalloc zeroed the new tail */);
   mi_bitmap_unsafe_setN(slots, oldcount, newcount - oldcount);
   mi_thread_locals_free = slots;
   return true;

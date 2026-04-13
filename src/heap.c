@@ -201,6 +201,7 @@ static void mi_heap_free(mi_heap_t* heap) {
   _mi_thread_local_free(heap->theap);
   mi_lock_done(&heap->theaps_lock);
   mi_lock_done(&heap->os_abandoned_pages_lock);
+  mi_lock_done(&heap->arena_pages_lock);
   mi_free(heap);
 }
 

@@ -2210,6 +2210,8 @@ typedef struct mi_heap_visit_info_s {
   mi_block_visit_fun* visitor;
   void* arg;
   bool visit_blocks;
+  bool claim_pages;                // claim ownership before visiting (for delete/destroy)
+  mi_arena_pages_t* arena_pages;   // current arena's pages bitmap (for re-check during claim)
 } mi_heap_visit_info_t;
 
 static bool mi_heap_visit_page(mi_page_t* page, mi_heap_visit_info_t* vinfo) {
@@ -2231,20 +2233,36 @@ static bool mi_heap_visit_page_at(size_t slice_index, size_t slice_count, mi_are
   MI_UNUSED(slice_count);
   mi_heap_visit_info_t* vinfo = (mi_heap_visit_info_t*)arg;
   mi_page_t* page = mi_arena_page_at_slice(arena, slice_index);
+  if (vinfo->claim_pages) {
+    // Invariant: during heap delete/destroy, no theaps remain on this heap, so no new pages are
+    // allocated into it. `arena_pages->pages` bits therefore only ever clear (via `_mi_arenas_page_free`
+    // from a concurrent `mi_free`). While the bit is set the page at this slice has been continuously
+    // ours; if we ever observe it clear, the page was freed and we must skip. The intermediate reads
+    // of `xthread_free`/`xthread_id` may race with page reuse, but every loop exit is gated by the
+    // final bit re-check below, so a stale read at worst costs an extra yield.
+    while (mi_bitmap_is_set(vinfo->arena_pages->pages, slice_index)) {
+      if (mi_page_claim_ownership(page)) break;      // we transitioned the owned bit 0->1
+      if (!mi_page_is_abandoned(page)) break;        // theap-owned: bit was set at alloc, no concurrent claimer
+      mi_atomic_yield();                             // abandoned and a concurrent `mi_free` owns it: wait
+    }
+    if (!mi_bitmap_is_set(vinfo->arena_pages->pages, slice_index)) return true;
+    mi_assert_internal(mi_page_is_owned(page));
+  }
   return mi_heap_visit_page(page, vinfo);
 }
 
-bool _mi_heap_visit_blocks(mi_heap_t* heap, bool abandoned_only, bool visit_blocks, mi_block_visit_fun* visitor, void* arg) {
+bool _mi_heap_visit_blocks(mi_heap_t* heap, bool abandoned_only, bool visit_blocks, bool claim_pages, mi_block_visit_fun* visitor, void* arg) {
   mi_assert(visitor!=NULL);
   if (visitor==NULL) return false;
   if (heap==NULL) { heap = mi_heap_main(); }
   // visit all pages in a heap
-  // we don't have to claim because we assume we are the only thread running (with this heap).
-  // (but we could atomically claim as well by first doing abandoned_reclaim and afterwards reabandoning).
-  mi_heap_visit_info_t visit_info = { heap, visitor, arg, visit_blocks };
+  // note: when `claim_pages` is set we claim each page before visiting so that concurrent
+  // `mi_free` calls (which may briefly own abandoned pages) cannot race with the visitor.
+  mi_heap_visit_info_t visit_info = { heap, visitor, arg, visit_blocks, claim_pages, NULL };
   bool ok = true;
   mi_forall_arenas(heap, NULL, 0, arena) {
     mi_arena_pages_t* arena_pages = mi_heap_arena_pages(heap, arena);
+    visit_info.arena_pages = arena_pages;
     if (ok && arena_pages != NULL) {
       if (abandoned_only) {
         for (size_t bin = 0; ok && bin < MI_BIN_COUNT; bin++) {
@@ -2270,6 +2288,9 @@ bool _mi_heap_visit_blocks(mi_heap_t* heap, bool abandoned_only, bool visit_bloc
   }
   while (ok && page != NULL) {
     mi_page_t* next = page->next;  // read upfront in case the visitor frees the page
+    if (claim_pages) {
+      mi_page_claim_ownership(page);
+    }
     ok = mi_heap_visit_page(page, &visit_info);
     page = next;
   }
@@ -2278,11 +2299,11 @@ bool _mi_heap_visit_blocks(mi_heap_t* heap, bool abandoned_only, bool visit_bloc
 }
 
 bool mi_heap_visit_blocks(mi_heap_t* heap, bool visit_blocks, mi_block_visit_fun* visitor, void* arg) {
-  return _mi_heap_visit_blocks(heap, false, visit_blocks, visitor, arg);
+  return _mi_heap_visit_blocks(heap, false, visit_blocks, false, visitor, arg);
 }
 
 bool mi_heap_visit_abandoned_blocks(mi_heap_t* heap, bool visit_blocks, mi_block_visit_fun* visitor, void* arg) {
-  return _mi_heap_visit_blocks(heap, true, visit_blocks, visitor, arg);
+  return _mi_heap_visit_blocks(heap, true, visit_blocks, false, visitor, arg);
 }
 
 
@@ -2299,7 +2320,7 @@ static bool mi_heap_delete_page(const mi_heap_t* heap, const mi_heap_area_t* are
   mi_theap_t* const theap           = NULL; // info->theap;       mi_assert_internal(_mi_theap_heap(theap) == heap);
   mi_page_t*  const page            = (mi_page_t*)area->reserved1;
 
-  mi_page_claim_ownership(page);       // claim ownership
+  mi_assert_internal(mi_page_is_owned(page));   // pre-claimed by `_mi_heap_visit_blocks(..., claim_pages=true, ...)`
   if (mi_page_is_abandoned(page)) {
     _mi_arenas_page_unabandon(page,theap);
   }
@@ -2364,7 +2385,7 @@ static void mi_heap_delete_pages(mi_heap_t* heap, mi_heap_t* heap_target) {
   mi_theap_t* const theap_target = (heap_target != NULL ? _mi_heap_theap(heap_target) : NULL);
   // mi_theap_t* const theap = _mi_heap_theap(heap);
   mi_heap_delete_visit_info_t info = { heap_target, theap_target, NULL };
-  _mi_heap_visit_blocks(heap, false, false, &mi_heap_delete_page, &info);
+  _mi_heap_visit_blocks(heap, false, false, true /* claim each page */, &mi_heap_delete_page, &info);
   #if MI_DEBUG>1
   // no more arena pages?
   for (size_t i = 0; i < MI_ARENA_BIN_COUNT; i++) {
