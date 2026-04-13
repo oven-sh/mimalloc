@@ -2104,18 +2104,22 @@ static bool mi_arena_try_purge_visitor(size_t slice_index, size_t slice_count, m
   if (mi_arena_try_purge_range(arena, slice_index, slice_count)) {
     vinfo->any_purged = true;
     vinfo->all_purged = true;
+    return true;
   }
-  else if (slice_count > 1)
-  {
-    // failed to claim the full range, try per slice instead
-    for (size_t i = 0; i < slice_count; i++) {
-      const bool purged = mi_arena_try_purge_range(arena, slice_index + i, 1);
-      vinfo->any_purged = vinfo->any_purged || purged;
-      vinfo->all_purged = vinfo->all_purged && purged;
+  // failed to claim the full range; try per slice and reschedule any that still fail.
+  // `_mi_bitmap_forall_setc_ranges` already cleared `slices_purge` for this range, and a slice
+  // can fail here either because it was reallocated, or because the freer in `_mi_arenas_free`
+  // has set `slices_purge` but not yet `slices_free`. In both cases re-setting the purge bit
+  // is correct (the next cycle will either succeed or keep waiting), and prevents committed
+  // memory from being silently dropped from the purge schedule.
+  for (size_t i = 0; i < slice_count; i++) {
+    const bool purged = mi_arena_try_purge_range(arena, slice_index + i, 1);
+    vinfo->any_purged = vinfo->any_purged || purged;
+    vinfo->all_purged = vinfo->all_purged && purged;
+    if (!purged) {
+      mi_bitmap_setN(arena->slices_purge, slice_index + i, 1, NULL);
     }
   }
-  // don't clear the purge bits as that is done atomically be the _bitmap_forall_set_ranges
-  // mi_bitmap_clearN(arena->slices_purge, slice_index, slice_count);
   return true; // continue
 }
 
