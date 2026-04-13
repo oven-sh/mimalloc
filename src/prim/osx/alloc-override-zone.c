@@ -25,6 +25,7 @@ terms of the MIT license. A copy of the license can be found in the file
 
 #include <AvailabilityMacros.h>
 #include <malloc/malloc.h>
+#include <mach/mach_init.h>  // mach_task_self
 #include <string.h>  // memset
 #include <stdlib.h>
 #include <unistd.h>  // getpid
@@ -123,14 +124,84 @@ static boolean_t zone_claimed_address(malloc_zone_t* zone, void* p) {
    Introspection members
 ------------------------------------------------------ */
 
-static kern_return_t intro_enumerator(task_t task, void* p,
+#define MI_ZONE_ENUM_BATCH 256
+
+typedef struct mi_zone_enum_s {
+  task_t   task;
+  void*    context;
+  unsigned type_mask;
+  vm_range_recorder_t* recorder;
+  unsigned count;
+  vm_range_t ranges[MI_ZONE_ENUM_BATCH];
+} mi_zone_enum_t;
+
+static void mi_zone_enum_flush(mi_zone_enum_t* e, unsigned type) {
+  if (e->count > 0) {
+    e->recorder(e->task, e->context, type, e->ranges, e->count);
+    e->count = 0;
+  }
+}
+
+static void mi_zone_enum_push(mi_zone_enum_t* e, unsigned type, void* addr, size_t size) {
+  if (e->count == MI_ZONE_ENUM_BATCH) mi_zone_enum_flush(e, type);
+  e->ranges[e->count].address = (vm_address_t)addr;
+  e->ranges[e->count].size    = (vm_size_t)size;
+  e->count++;
+}
+
+static bool mi_zone_block_visit(const mi_heap_t* heap, const mi_heap_area_t* area, void* block, size_t block_size, void* arg) {
+  MI_UNUSED(heap);
+  mi_zone_enum_t* e = (mi_zone_enum_t*)arg;
+  if (block != NULL) {
+    mi_zone_enum_push(e, MALLOC_PTR_IN_USE_RANGE_TYPE, block, block_size);
+  }
+  else if (e->type_mask & MALLOC_PTR_REGION_RANGE_TYPE) {
+    // area-level call (block==NULL): report the page's block region
+    mi_zone_enum_flush(e, MALLOC_PTR_IN_USE_RANGE_TYPE);
+    mi_zone_enum_push(e, MALLOC_PTR_REGION_RANGE_TYPE, area->blocks, area->reserved);
+    mi_zone_enum_flush(e, MALLOC_PTR_REGION_RANGE_TYPE);
+  }
+  return true;
+}
+
+static bool mi_zone_heap_visit(mi_heap_t* heap, void* arg) {
+  mi_zone_enum_t* e = (mi_zone_enum_t*)arg;
+  const bool visit_blocks = (e->type_mask & MALLOC_PTR_IN_USE_RANGE_TYPE) != 0;
+  mi_heap_visit_blocks(heap, visit_blocks, &mi_zone_block_visit, arg);
+  mi_zone_enum_flush(e, MALLOC_PTR_IN_USE_RANGE_TYPE);
+  return true;
+}
+
+static kern_return_t intro_enumerator(task_t task, void* context,
                             unsigned type_mask, vm_address_t zone_address,
                             memory_reader_t reader,
                             vm_range_recorder_t recorder)
 {
-  // todo: enumerate all memory
-  MI_UNUSED(task); MI_UNUSED(p); MI_UNUSED(type_mask); MI_UNUSED(zone_address);
-  MI_UNUSED(reader); MI_UNUSED(recorder);
+  MI_UNUSED(zone_address); MI_UNUSED(reader);
+  if (recorder == NULL) return KERN_SUCCESS;
+  // in-process only: walking pages dereferences our own pointers directly
+  if (task != mach_task_self()) return KERN_FAILURE;
+
+  mi_zone_enum_t e = { task, context, type_mask, recorder, 0, {} };
+
+  if (type_mask & MALLOC_ADMIN_REGION_RANGE_TYPE) {
+    // report each arena's full reservation as admin/metadata
+    mi_subproc_t* subproc = _mi_subproc_main();
+    for (size_t i = 0; i < MI_MAX_ARENAS; i++) {
+      mi_arena_t* arena = mi_atomic_load_ptr_relaxed(mi_arena_t, &subproc->arenas[i]);
+      if (arena == NULL) continue;
+      size_t size = 0;
+      void*  base = mi_arena_area((mi_arena_id_t)arena, &size);
+      if (base != NULL && size > 0) {
+        mi_zone_enum_push(&e, MALLOC_ADMIN_REGION_RANGE_TYPE, base, size);
+      }
+    }
+    mi_zone_enum_flush(&e, MALLOC_ADMIN_REGION_RANGE_TYPE);
+  }
+
+  if (type_mask & (MALLOC_PTR_IN_USE_RANGE_TYPE | MALLOC_PTR_REGION_RANGE_TYPE)) {
+    mi_subproc_visit_heaps(mi_subproc_main(), &mi_zone_heap_visit, &e);
+  }
   return KERN_SUCCESS;
 }
 
@@ -179,6 +250,8 @@ static void intro_reinit_lock(malloc_zone_t* zone) {
 
 static void intro_statistics(malloc_zone_t* zone, malloc_statistics_t* stats) {
   MI_UNUSED(zone);
+  // note: subproc stats are a lower bound — per-theap counters merge up lazily
+  // (on collect/thread-done). For exact numbers use the enumerator.
   mi_stats_t_decl(mst);
   if (mi_stats_get(&mst)) {
     stats->blocks_in_use   = (unsigned)(mst.malloc_normal_count.total + mst.malloc_huge_count.total);
