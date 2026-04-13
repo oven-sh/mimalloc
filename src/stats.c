@@ -606,7 +606,9 @@ static bool mi_cdecl mi_heap_aggregate_visitor(mi_heap_t* heap, void* arg) {
 bool mi_subproc_stats_get(mi_subproc_id_t subproc_id, mi_stats_t* stats) mi_attr_noexcept {
   mi_subproc_t* subproc = _mi_subproc_from_id(subproc_id);
   if (stats == NULL || stats->size != sizeof(mi_stats_t) || stats->version != MI_STAT_VERSION) return false;
-  _mi_memzero(stats,stats->size);  
+  const size_t sz = stats->size; const int ver = stats->version;
+  _mi_memzero(stats, sz);
+  stats->size = sz; stats->version = ver;
   mi_subproc_visit_heaps(subproc, &mi_heap_aggregate_visitor, stats);
   mi_stats_add_into(stats, &subproc->stats);
   return true;
@@ -788,11 +790,9 @@ static char* mi_stats_get_json_from(mi_stats_t* stats, size_t output_size, char*
 }
 
 char* mi_subproc_stats_get_json(mi_subproc_id_t subproc_id, size_t buf_size, char* buf) mi_attr_noexcept {
-  mi_subproc_t* subproc = _mi_subproc_from_id(subproc_id);
-  if (subproc==NULL) return NULL;
   mi_stats_t_decl(stats);
   if (!mi_subproc_stats_get(subproc_id,&stats)) return NULL;
-  return mi_stats_get_json_from(&subproc->stats, buf_size, buf);  
+  return mi_stats_get_json_from(&stats, buf_size, buf);
 }
 
 char* mi_heap_stats_get_json(mi_heap_t* heap, size_t buf_size, char* buf) mi_attr_noexcept {
