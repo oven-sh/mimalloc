@@ -326,6 +326,12 @@ bool _mi_theap_free(mi_theap_t* theap, bool acquire_heap_theaps_lock, bool acqui
       theap->tnext = theap->tprev = NULL;                        
     }
     theap->tld = NULL;
+    // clear the per-thread cached theap if it is this one (this only catches the case where
+    // the *current* thread is the one freeing; cross-thread callers cannot reach the owning
+    // thread's TLS, but cache lookups still re-validate via `theap->heap` which is now NULL)
+    if (_mi_theap_cached() == theap) {
+      _mi_theap_cached_set((mi_theap_t*)&_mi_theap_empty);
+    }
     _mi_theap_decref(theap);
     return true;
   }

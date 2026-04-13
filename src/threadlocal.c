@@ -144,6 +144,11 @@ Create and free fresh TLS key's
 #include "bitmap.h"
 
 static mi_lock_t    mi_thread_locals_lock;    // we need a lock in order to re-allocate the slot bits
+
+void _mi_thread_locals_fork_prepare(void) { mi_lock_acquire(&mi_thread_locals_lock); }
+void _mi_thread_locals_fork_parent(void)  { mi_lock_release(&mi_thread_locals_lock); }
+void _mi_thread_locals_fork_child(void)   { mi_lock_init(&mi_thread_locals_lock); }
+
 static mi_bitmap_t* mi_thread_locals_free;    // reuse an arena bitmap to track which slots were assigned (1=free, 0=in-use)
 static size_t       mi_thread_locals_version; // version to be able to reuse slots safely
 

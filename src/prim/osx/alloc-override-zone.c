@@ -27,6 +27,9 @@ terms of the MIT license. A copy of the license can be found in the file
 #include <malloc/malloc.h>
 #include <string.h>  // memset
 #include <stdlib.h>
+#include <unistd.h>  // getpid
+
+#include "mimalloc-stats.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -151,28 +154,46 @@ static void intro_log(malloc_zone_t* zone, void* p) {
   // todo?
 }
 
+static pid_t mi_zone_locked_pid = -1;
+
 static void intro_force_lock(malloc_zone_t* zone) {
   MI_UNUSED(zone);
-  // todo?
+  mi_zone_locked_pid = getpid();
+  _mi_process_fork_prepare();
 }
 
 static void intro_force_unlock(malloc_zone_t* zone) {
   MI_UNUSED(zone);
-  // todo?
+  if (mi_zone_locked_pid == -1) return;
+  if (getpid() == mi_zone_locked_pid) { _mi_process_fork_parent(); }
+                                 else { _mi_process_fork_child(); }
+  mi_zone_locked_pid = -1;
+}
+
+static void intro_reinit_lock(malloc_zone_t* zone) {
+  MI_UNUSED(zone);
+  // zone version 9+ calls this in the child instead of force_unlock
+  _mi_process_fork_child();
+  mi_zone_locked_pid = -1;
 }
 
 static void intro_statistics(malloc_zone_t* zone, malloc_statistics_t* stats) {
   MI_UNUSED(zone);
-  // todo...
-  stats->blocks_in_use = 0;
-  stats->size_in_use = 0;
-  stats->max_size_in_use = 0;
-  stats->size_allocated = 0;
+  mi_stats_t_decl(mst);
+  if (mi_stats_get(&mst)) {
+    stats->blocks_in_use   = (unsigned)(mst.malloc_normal_count.total + mst.malloc_huge_count.total);
+    stats->size_in_use     = (size_t)(mst.malloc_normal.current + mst.malloc_huge.current);
+    stats->max_size_in_use = (size_t)(mst.malloc_normal.peak + mst.malloc_huge.peak);
+    stats->size_allocated  = (size_t)(mst.reserved.current);
+  }
+  else {
+    stats->blocks_in_use = 0; stats->size_in_use = 0; stats->max_size_in_use = 0; stats->size_allocated = 0;
+  }
 }
 
 static boolean_t intro_zone_locked(malloc_zone_t* zone) {
   MI_UNUSED(zone);
-  return false;
+  return (mi_zone_locked_pid != -1 && mi_zone_locked_pid == getpid());
 }
 
 
@@ -199,6 +220,15 @@ static malloc_introspection_t mi_introspect = {
 #if defined(MAC_OS_X_VERSION_10_6) && (MAC_OS_X_VERSION_MAX_ALLOWED >= MAC_OS_X_VERSION_10_6) && !defined(__ppc__)
   .statistics = &intro_statistics,
   .zone_locked = &intro_zone_locked,
+  .enable_discharge_checking = NULL,
+  .disable_discharge_checking = NULL,
+  .discharge = NULL,
+  #ifdef __BLOCKS__
+  .enumerate_discharged_pointers = NULL,
+  #else
+  .enumerate_unavailable_without_blocks = NULL,
+  #endif
+  .reinit_lock = &intro_reinit_lock,
 #endif
 };
 
@@ -309,13 +339,13 @@ static int mi_malloc_jumpstart(uintptr_t cookie) {
 }
 
 static void mi__malloc_fork_prepare(void) {
-  // nothing
+  _mi_process_fork_prepare();
 }
 static void mi__malloc_fork_parent(void) {
-  // nothing
+  _mi_process_fork_parent();
 }
 static void mi__malloc_fork_child(void) {
-  // nothing
+  _mi_process_fork_child();
 }
 
 static void mi_malloc_printf(const char* fmt, ...) {
@@ -328,7 +358,7 @@ static bool zone_check(malloc_zone_t* zone) {
 }
 
 static malloc_zone_t* zone_from_ptr(const void* p) {
-  MI_UNUSED(p);
+  if (p == NULL || !mi_is_in_heap_region(p)) return NULL;
   return mi_get_default_zone();
 }
 

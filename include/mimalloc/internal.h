@@ -169,6 +169,12 @@ void          _mi_thread_done(mi_theap_t* theap);
 
 mi_subproc_t* _mi_subproc(void);
 mi_subproc_t* _mi_subproc_main(void);
+void          _mi_process_fork_prepare(void);
+void          _mi_process_fork_parent(void);
+void          _mi_process_fork_child(void);
+void          _mi_thread_locals_fork_prepare(void);
+void          _mi_thread_locals_fork_parent(void);
+void          _mi_thread_locals_fork_child(void);
 mi_heap_t*    _mi_subproc_heap_main(mi_subproc_t* subproc);
 mi_subproc_t* _mi_subproc_from_id(mi_subproc_id_t subproc_id);
 

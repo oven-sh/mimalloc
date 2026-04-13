@@ -996,6 +996,10 @@ void mi_process_init(void) mi_attr_noexcept {
   mi_thread_init();
   _mi_process_is_initialized = true;
 
+  #if !defined(_WIN32) && !defined(__wasi__)
+  pthread_atfork(&_mi_process_fork_prepare, &_mi_process_fork_parent, &_mi_process_fork_child);
+  #endif
+
   #if defined(_WIN32) && defined(MI_WIN_USE_FLS)
   // On windows, when building as a static lib the FLS cleanup happens to early for the main thread.
   // To avoid this, set the FLS value for the main thread to NULL so the fls cleanup
@@ -1020,6 +1024,66 @@ void mi_process_init(void) mi_attr_noexcept {
       mi_reserve_os_memory((size_t)ksize*MI_KiB, true, true);
     }
   }
+}
+
+/* -----------------------------------------------------------
+  Fork handling (POSIX). Acquire process-wide locks before fork
+  so the child inherits consistent shared state, then either
+  release (parent) or reinitialize (child) afterwards. The child
+  has only the calling thread, so per-heap and per-tld locks held
+  by other threads must be reinitialized rather than released.
+----------------------------------------------------------- */
+
+static _Atomic(uintptr_t) mi_fork_depth;  // allow nested prepare/parent calls (e.g., zone hooks + pthread_atfork)
+
+void _mi_process_fork_prepare(void) {
+  if (!_mi_process_is_initialized) return;
+  if (mi_atomic_increment_acq_rel(&mi_fork_depth) != 0) return;
+  mi_subproc_t* const subproc = _mi_subproc_main();
+  // Acquire outermost-first: locks that can be held across an allocation (and so may
+  // nest into arena_reserve_lock) must be taken before arena_reserve_lock.
+  mi_lock_acquire(&subprocs_lock);
+  _mi_thread_locals_fork_prepare();              // held across mi_rezalloc_aligned
+  mi_lock_acquire(&heap_main.arena_pages_lock);  // held across mi_malloc in mi_heap_ensure_arena_pages
+  mi_lock_acquire(&subproc->heaps_lock);
+  mi_lock_acquire(&heap_main.theaps_lock);
+  mi_lock_acquire(&heap_main.os_abandoned_pages_lock);
+  mi_lock_acquire(&subproc->arena_reserve_lock);
+}
+
+void _mi_process_fork_parent(void) {
+  if (!_mi_process_is_initialized) return;
+  if (mi_atomic_decrement_acq_rel(&mi_fork_depth) != 1) return;
+  mi_subproc_t* const subproc = _mi_subproc_main();
+  mi_lock_release(&subproc->arena_reserve_lock);
+  mi_lock_release(&heap_main.os_abandoned_pages_lock);
+  mi_lock_release(&heap_main.theaps_lock);
+  mi_lock_release(&subproc->heaps_lock);
+  mi_lock_release(&heap_main.arena_pages_lock);
+  _mi_thread_locals_fork_parent();
+  mi_lock_release(&subprocs_lock);
+}
+
+void _mi_process_fork_child(void) {
+  if (!_mi_process_is_initialized) return;
+  if (mi_atomic_exchange_acq_rel(&mi_fork_depth, 0) == 0) return;
+  // single-threaded here: just reinitialize every lock we know about
+  mi_lock_init(&subprocs_lock);
+  for (mi_subproc_t* sp = subprocs; sp != NULL; sp = sp->next) {
+    mi_lock_init(&sp->arena_reserve_lock);
+    mi_lock_init(&sp->heaps_lock);
+    for (mi_heap_t* h = sp->heaps; h != NULL; h = h->next) {
+      mi_lock_init(&h->theaps_lock);
+      mi_lock_init(&h->arena_pages_lock);
+      mi_lock_init(&h->os_abandoned_pages_lock);
+    }
+  }
+  mi_lock_init(&tld_main.theaps_lock);
+  mi_theap_t* const theap = _mi_theap_default();
+  if (theap != NULL && mi_theap_is_initialized(theap) && theap->tld != &tld_main) {
+    mi_lock_init(&theap->tld->theaps_lock);
+  }
+  _mi_thread_locals_fork_child();
 }
 
 // Called when the process is done (cdecl as it is used with `at_exit` on some platforms)

@@ -138,7 +138,10 @@ void* _mi_os_get_aligned_hint(size_t try_alignment, size_t size)
   if (hint == 0 || hint > MI_HINT_MAX) {   // wrap or initialize
     uintptr_t init = MI_HINT_BASE;
     #if (MI_SECURE>=1 || defined(NDEBUG))  // security: randomize start of aligned allocations unless in debug mode
-    const uintptr_t r = _mi_theap_random_next(mi_theap_get_default());
+    // note: this can run during `mi_thread_init` (via arena reservation), so it must not call
+    // `mi_theap_get_default()` which would recurse into `mi_thread_init` and self-deadlock on
+    // `arena_reserve_lock`.
+    const uintptr_t r = _mi_os_random_weak((uintptr_t)&aligned_base);
     init = init + ((MI_HINT_ALIGN * ((r>>17) & 0xFFFFF)) % MI_HINT_AREA);  // (randomly 20 bits)*4MiB == 0 to 4TiB
     #endif
     uintptr_t expected = hint + size;
