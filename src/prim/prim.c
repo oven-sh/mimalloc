@@ -41,9 +41,11 @@ terms of the MIT license. A copy of the license can be found in the file
   static void mi_attr_constructor mi_process_attach(void) {
     _mi_auto_process_init();
   }
+  #ifndef MI_NO_PROCESS_DETACH
   static void mi_attr_destructor mi_process_detach(void) {
     _mi_auto_process_done();
   }
+  #endif
 #elif defined(__cplusplus)
   // C++: use static initialization to detect process start/end
   // This is not guaranteed to be first/last but the best we can generally do?
