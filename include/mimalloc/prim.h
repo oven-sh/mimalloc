@@ -366,8 +366,13 @@ static inline mi_theap_t* _mi_theap_cached(void);
 #elif defined(__APPLE__)  // macOS
   // #define MI_TLS_MODEL_DYNAMIC_PTHREADS  1    // also works but a bit slower
   #define MI_TLS_MODEL_FIXED_SLOT           1
-  #define MI_TLS_MODEL_FIXED_SLOT_DEFAULT   175  // 108-109 are __PTK_FRAMEWORK_SWIFT_KEY8/KEY9 and clash with the Swift runtime
-  #define MI_TLS_MODEL_FIXED_SLOT_CACHED    176  // 175-176 are in the unassigned 125-209 range
+  // Slots 125-209 are NOT free: dyld uses them for shared-cache dylib __thread storage and
+  // registers `&::free` as the destructor (see dyld/libdyld/ThreadLocalVariables.cpp), so
+  // squatting there causes free(&_mi_theap_empty) on thread exit once AppKit/ImageIO load.
+  // 96-97 sit in the gap between __PTK_FRAMEWORK_CORETEXT_KEY0 (95) and
+  // __PTK_FRAMEWORK_SWIFT_KEY0 (100) and have never been assigned. Alt: 241-242.
+  #define MI_TLS_MODEL_FIXED_SLOT_DEFAULT   96
+  #define MI_TLS_MODEL_FIXED_SLOT_CACHED    97
   // see <https://github.com/apple-oss-distributions/libpthread/blob/main/private/pthread/tsd_private.h>
 #elif defined(__OpenBSD__) || defined(__ANDROID__)
   #define MI_TLS_MODEL_DYNAMIC_PTHREADS     1
