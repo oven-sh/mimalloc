@@ -11,6 +11,10 @@ terms of the MIT license. A copy of the license can be found in the file
 #include <string.h>  // memcpy, memset
 #include <stdlib.h>  // atexit
 
+#if MI_DEBUG > 0
+mi_decl_export volatile int mi_debug_stall_in_thread_theaps_done = 0;
+#endif
+
 #define MI_MEMID_INIT(kind)   {{{NULL,0}}, kind, true /* pinned */, true /* committed */, false /* zero */ }
 #define MI_MEMID_STATIC       MI_MEMID_INIT(MI_MEM_STATIC)
 
@@ -622,6 +626,12 @@ static void mi_thread_theaps_done(mi_tld_t* tld)
   
   // abandon the pages of all theaps in this thread
   mi_lock(&tld->theaps_lock) {
+    #if MI_DEBUG > 0
+    if (mi_debug_stall_in_thread_theaps_done) {
+      mi_debug_stall_in_thread_theaps_done = 2; // signal: tld->theaps_lock held
+      while (mi_debug_stall_in_thread_theaps_done) { mi_atomic_yield(); }
+    }
+    #endif
     mi_theap_t* theap = tld->theaps;
     while (theap != NULL) {
       mi_theap_t* next = theap->tnext; 

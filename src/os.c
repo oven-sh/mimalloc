@@ -104,6 +104,10 @@ void _mi_os_init(void) {
   Util
 -------------------------------------------------------------- */
 bool _mi_os_decommit(void* addr, size_t size);
+
+#if MI_DEBUG > 0
+mi_decl_export volatile long mi_debug_fail_os_commit_after = 0;
+#endif
 bool _mi_os_commit(void* addr, size_t size, bool* is_zero);
 
 // On systems with enough virtual address bits, we can do efficient aligned allocation by using
@@ -542,6 +546,12 @@ bool _mi_os_commit_ex(void* addr, size_t size, bool* is_zero, size_t stat_size) 
 
   // commit
   bool os_is_zero = false;
+  #if MI_DEBUG > 0
+  if (mi_debug_fail_os_commit_after > 0 && --mi_debug_fail_os_commit_after == 0) {
+    _mi_warning_message("mi_debug_fail_os_commit_after: injecting commit failure at %p, size 0x%zx\n", start, csize);
+    return false;
+  }
+  #endif
   int err = _mi_prim_commit(start, csize, &os_is_zero);
   if (err != 0) {
     _mi_warning_message("cannot commit OS memory (error: %d (0x%x), address: %p, size: 0x%zx bytes)\n", err, err, start, csize);
