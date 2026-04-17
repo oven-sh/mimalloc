@@ -109,8 +109,11 @@ static bool mi_theap_page_collect(mi_theap_t* theap, mi_page_queue_t* pq, mi_pag
 }
 
 static void mi_theap_merge_stats(mi_theap_t* theap) {
-  mi_assert_internal(mi_theap_is_initialized(theap));
-  _mi_stats_merge_into(&_mi_theap_heap(theap)->stats, &theap->stats);
+  // theap->heap can be NULLed concurrently by _mi_theap_free (theap.c:304) between
+  // mi_theap_collect_ex's entry check and here; _mi_theap_free will merge stats itself.
+  mi_heap_t* const heap = _mi_theap_heap(theap);
+  if (heap == NULL) return;
+  _mi_stats_merge_into(&heap->stats, &theap->stats);
 }
 
 static void mi_theap_collect_ex(mi_theap_t* theap, mi_collect_t collect)
