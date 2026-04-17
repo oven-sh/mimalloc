@@ -743,6 +743,18 @@ static mi_page_t* mi_arenas_page_try_find_abandoned(mi_theap_t* theap, size_t sl
   return NULL;
 }
 
+// Undo the arena_pages->pages bit set by mi_arenas_page_alloc_fresh_area when a later
+// step (commit, page-map register, _mi_page_init) fails. _mi_arenas_free does not clear
+// this bit, so without this the next fresh alloc of the slice trips the :772 assert and
+// mi_heap_visit_blocks / _mi_ptr_page treat the freed slice as a live page.
+static void mi_arena_pages_clear_for_memid(mi_heap_t* heap, mi_memid_t memid) {
+  if (memid.memkind != MI_MEM_ARENA || heap == NULL) return;
+  mi_arena_pages_t* const arena_pages = mi_heap_arena_pages(heap, memid.mem.arena.arena);
+  if (arena_pages != NULL) {
+    mi_bitmap_clearN(arena_pages->pages, memid.mem.arena.slice_index, 1);
+  }
+}
+
 static uint8_t* mi_arenas_page_alloc_fresh_area(mi_theap_t* theap, size_t slice_count, size_t block_size, size_t block_alignment, bool os_align, bool commit, mi_memid_t* memid) {
   MI_UNUSED_RELEASE(block_size);
   const bool allow_large = (MI_SECURE < 5); // 5 = guard page at end of each arena page
@@ -887,6 +899,7 @@ static mi_page_t* mi_arenas_page_alloc_fresh(mi_theap_t* theap, size_t slice_cou
     if (commit_size > page_noguard_size) { commit_size = page_noguard_size; }
     bool is_zero = false;
     if mi_unlikely(!mi_arena_commit( mi_memid_arena(memid), slice_start, commit_size, &is_zero, 0)) {
+      mi_arena_pages_clear_for_memid(_mi_theap_heap(theap), memid);
       _mi_arenas_free(slice_start, alloc_size, memid);
       return NULL;
     }
@@ -930,6 +943,7 @@ static mi_page_t* mi_arenas_page_alloc_fresh(mi_theap_t* theap, size_t slice_cou
 
   // register in the page map
   if mi_unlikely(!_mi_page_map_register(page)) {
+    mi_arena_pages_clear_for_memid(_mi_theap_heap(theap), memid);
     _mi_arenas_free( slice_start, alloc_size, memid );
     return NULL;
   }
@@ -965,6 +979,8 @@ static mi_page_t* mi_arenas_page_regular_alloc(mi_theap_t* theap, size_t slice_c
 
   mi_assert_internal(page->memid.memkind != MI_MEM_ARENA || page->memid.mem.arena.slice_count == slice_count);
   if (!_mi_page_init(theap, page)) {
+    mi_arena_pages_clear_for_memid(_mi_theap_heap(theap), page->memid);
+    _mi_page_map_unregister(page);
     _mi_arenas_free( page, mi_page_full_size(page), page->memid);
     return NULL;
   }
@@ -988,6 +1004,8 @@ static mi_page_t* mi_arenas_page_singleton_alloc(mi_theap_t* theap, size_t block
 
   mi_assert(page->reserved == 1);
   if (!_mi_page_init(theap, page)) {
+    mi_arena_pages_clear_for_memid(_mi_theap_heap(theap), page->memid);
+    _mi_page_map_unregister(page);
     _mi_arenas_free( page, mi_page_full_size(page), page->memid);
     return NULL;
   }
