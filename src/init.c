@@ -634,11 +634,14 @@ static void mi_thread_theaps_done(mi_tld_t* tld)
     #endif
     mi_theap_t* theap = tld->theaps;
     while (theap != NULL) {
-      mi_theap_t* next = theap->tnext; 
+      mi_theap_t* next = theap->tnext;
       // never destroy theaps; if a dll is linked statically with mimalloc,
       // there may still be delete/free calls after the mi_fls_done is called. Issue #207
       _mi_theap_collect_abandon(theap);
-      mi_assert_internal(theap->page_count==0);
+      // _mi_theap_free (via mi_heap_free_theaps) may have NULL'd theap->heap before
+      // blocking on our tld->theaps_lock; collect_abandon then no-ops and that path
+      // owns the cleanup, so the page_count invariant doesn't hold for us here.
+      mi_assert_internal(!mi_theap_is_initialized(theap) || theap->page_count==0);
       theap = next;
     }
   }
@@ -654,7 +657,7 @@ static void mi_thread_theaps_done(mi_tld_t* tld)
       mi_theap_t* theap = tld->theaps;
       while (theap != NULL) {
         mi_theap_t* next = theap->tnext;
-        mi_assert_internal(theap->page_count==0);
+        mi_assert_internal(!mi_theap_is_initialized(theap) || theap->page_count==0);
         if (!_mi_theap_free(theap, true /* acquire heap->theaps_lock */, false /* dont re-acquire the tld->theaps_lock*/ )) {
           all_freed = false;
         }
@@ -1142,6 +1145,14 @@ void _mi_process_fork_prepare(void) {
   _mi_thread_locals_fork_prepare();              // held across mi_rezalloc_aligned
   mi_lock_acquire(&heap_main.arena_pages_lock);  // held across mi_malloc in mi_heap_ensure_arena_pages
   mi_lock_acquire(&subproc->heaps_lock);
+  // Quiesce every heap's list locks, not just heap_main: _mi_theap_init/_mi_theap_free
+  // mutate heap->theaps under heap->theaps_lock without taking subproc->heaps_lock.
+  for (mi_heap_t* h = subproc->heaps; h != NULL; h = h->next) {
+    if (h == &heap_main) continue; // heap_main handled explicitly for ordering
+    mi_lock_acquire(&h->arena_pages_lock);
+    mi_lock_acquire(&h->theaps_lock);
+    mi_lock_acquire(&h->os_abandoned_pages_lock);
+  }
   mi_lock_acquire(&heap_main.theaps_lock);
   mi_lock_acquire(&heap_main.os_abandoned_pages_lock);
   mi_lock_acquire(&subproc->arena_reserve_lock);
@@ -1154,6 +1165,12 @@ void _mi_process_fork_parent(void) {
   mi_lock_release(&subproc->arena_reserve_lock);
   mi_lock_release(&heap_main.os_abandoned_pages_lock);
   mi_lock_release(&heap_main.theaps_lock);
+  for (mi_heap_t* h = subproc->heaps; h != NULL; h = h->next) {
+    if (h == &heap_main) continue;
+    mi_lock_release(&h->os_abandoned_pages_lock);
+    mi_lock_release(&h->theaps_lock);
+    mi_lock_release(&h->arena_pages_lock);
+  }
   mi_lock_release(&subproc->heaps_lock);
   mi_lock_release(&heap_main.arena_pages_lock);
   _mi_thread_locals_fork_parent();
@@ -1178,6 +1195,16 @@ void _mi_process_fork_child(void) {
   mi_theap_t* const theap = _mi_theap_default();
   if (theap != NULL && mi_theap_is_initialized(theap) && theap->tld != &tld_main) {
     mi_lock_init(&theap->tld->theaps_lock);
+  }
+  // Re-init tld->theaps_lock for every theap still on a heap list: those tlds belong to
+  // threads that vanished at fork() and may have held the lock (e.g. inside _mi_theap_init
+  // or mi_thread_theaps_done). _mi_theap_free in the child takes that lock at theap.c:322.
+  for (mi_subproc_t* sp = subprocs; sp != NULL; sp = sp->next) {
+    for (mi_heap_t* h = sp->heaps; h != NULL; h = h->next) {
+      for (mi_theap_t* t = h->theaps; t != NULL; t = t->hnext) {
+        if (t->tld != NULL) { mi_lock_init(&t->tld->theaps_lock); }
+      }
+    }
   }
   _mi_thread_locals_fork_child();
 }
