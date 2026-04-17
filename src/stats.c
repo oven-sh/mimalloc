@@ -790,7 +790,7 @@ static char* mi_stats_get_json_from(mi_stats_t* stats, size_t output_size, char*
 char* mi_subproc_stats_get_json(mi_subproc_id_t subproc_id, size_t buf_size, char* buf) mi_attr_noexcept {
   mi_stats_t_decl(stats);
   if (!mi_subproc_stats_get(subproc_id,&stats)) return NULL;
-  return mi_stats_get_json_from(&subproc->stats, buf_size, buf);
+  return mi_stats_get_json_from(&stats, buf_size, buf);
 }
 
 char* mi_heap_stats_get_json(mi_heap_t* heap, size_t buf_size, char* buf) mi_attr_noexcept {
