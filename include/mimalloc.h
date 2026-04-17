@@ -8,7 +8,7 @@ terms of the MIT license. A copy of the license can be found in the file
 #ifndef MIMALLOC_H
 #define MIMALLOC_H
 
-#define MI_MALLOC_VERSION 3208   // major + minor + 2 digits patch
+#define MI_MALLOC_VERSION 30300   // major + 2 digits minor + 2 digits patch
 
 // ------------------------------------------------------
 // Compiler specific attributes
@@ -407,6 +407,8 @@ mi_decl_export bool  mi_manage_memory(void* start, size_t size, bool is_committe
 //mi_decl_export bool  mi_theap_reload(mi_theap_t* theap, mi_arena_id_t arena);
 //mi_decl_export void  mi_theap_unload(mi_theap_t* theap);
 
+// unsafe: assumes the page belonging to `p` is only accessed by the calling thread.
+mi_decl_export bool mi_unsafe_heap_page_is_under_utilized(mi_heap_t* heap, void* p, size_t perc_threshold) mi_attr_noexcept;
 
 // ------------------------------------------------------
 // Deprecated

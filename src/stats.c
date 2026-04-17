@@ -246,11 +246,11 @@ static void mi_stat_counter_print_size(const mi_stat_counter_t* stat, const char
   _mi_fprintf(out, arg, "\n");
 }
 
-static void mi_stat_average_print(size_t count, size_t total, const char* msg, mi_output_fun* out, void* arg) {
+static void mi_stat_average_print(int64_t count, int64_t total, const char* msg, mi_output_fun* out, void* arg) {
   const int64_t avg_tens = (count == 0 ? 0 : (total*10 / count));
-  const long avg_whole = (long)(avg_tens/10);
-  const long avg_frac1 = (long)(avg_tens%10);
-  _mi_fprintf(out, arg, "  %-10s: %5ld.%ld avg\n", msg, avg_whole, avg_frac1);
+  const int64_t avg_whole = avg_tens/10;
+  const int64_t avg_frac1 = avg_tens%10;
+  _mi_fprintf(out, arg, "  %-10s: %5lld.%lld avg\n", msg, avg_whole, avg_frac1);
 }
 
 
@@ -488,7 +488,7 @@ void mi_subproc_heap_stats_print_out(mi_subproc_id_t subproc_id, mi_output_fun* 
 void mi_subproc_stats_print_out(mi_subproc_id_t subproc_id, mi_output_fun* out, void* arg) mi_attr_noexcept {
   mi_subproc_t* subproc = _mi_subproc_from_id(subproc_id);
   if (subproc==NULL) return;
-  mi_stats_t_decl(stats); 
+  mi_stats_t_decl(stats);
   if (mi_subproc_stats_get(subproc_id, &stats)) {
     _mi_stats_print("subproc", subproc->subproc_seq, &stats, out, arg);
   }
@@ -606,9 +606,7 @@ static bool mi_cdecl mi_heap_aggregate_visitor(mi_heap_t* heap, void* arg) {
 bool mi_subproc_stats_get(mi_subproc_id_t subproc_id, mi_stats_t* stats) mi_attr_noexcept {
   mi_subproc_t* subproc = _mi_subproc_from_id(subproc_id);
   if (stats == NULL || stats->size != sizeof(mi_stats_t) || stats->version != MI_STAT_VERSION) return false;
-  const size_t sz = stats->size; const int ver = stats->version;
-  _mi_memzero(stats, sz);
-  stats->size = sz; stats->version = ver;
+  _mi_memzero(stats,stats->size);
   mi_subproc_visit_heaps(subproc, &mi_heap_aggregate_visitor, stats);
   mi_stats_add_into(stats, &subproc->stats);
   return true;
@@ -777,7 +775,7 @@ static char* mi_stats_get_json_from(mi_stats_t* stats, size_t output_size, char*
   for (size_t i = 0; i < MI_CBIN_COUNT; i++) {
     mi_json_buf_print_count_cbin(&hbuf, "    ", &stats->chunk_bins[i], (mi_chunkbin_t)i, i!=MI_CBIN_COUNT-1);
   }
-  mi_json_buf_print(&hbuf, "  ]\n");  
+  mi_json_buf_print(&hbuf, "  ]\n");
   mi_json_buf_print(&hbuf, "}\n");
   if (hbuf.used >= hbuf.size) {
     // failed
@@ -792,7 +790,7 @@ static char* mi_stats_get_json_from(mi_stats_t* stats, size_t output_size, char*
 char* mi_subproc_stats_get_json(mi_subproc_id_t subproc_id, size_t buf_size, char* buf) mi_attr_noexcept {
   mi_stats_t_decl(stats);
   if (!mi_subproc_stats_get(subproc_id,&stats)) return NULL;
-  return mi_stats_get_json_from(&stats, buf_size, buf);
+  return mi_stats_get_json_from(&subproc->stats, buf_size, buf);
 }
 
 char* mi_heap_stats_get_json(mi_heap_t* heap, size_t buf_size, char* buf) mi_attr_noexcept {

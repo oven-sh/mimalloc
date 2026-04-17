@@ -181,10 +181,12 @@ mi_subproc_t* _mi_subproc_from_id(mi_subproc_id_t subproc_id);
 mi_threadid_t _mi_thread_id(void) mi_attr_noexcept;
 size_t        _mi_thread_seq_id(void) mi_attr_noexcept;
 bool          _mi_is_heap_main(const mi_heap_t* heap);
+bool          _mi_is_theap_main(const mi_theap_t* theap);
 void          _mi_theap_guarded_init(mi_theap_t* theap);
 void          _mi_theap_options_init(mi_theap_t* theap);
 mi_theap_t*   _mi_theap_default_safe(void);             // ensure the returned theap is initialized
-
+mi_theap_t*   _mi_theap_main_safe(void);
+   
 // os.c
 void          _mi_os_init(void);                                            // called from process init
 void*         _mi_os_alloc(size_t size, mi_memid_t* memid);
@@ -307,7 +309,7 @@ mi_decl_cold  mi_theap_t* _mi_heap_theap_get_or_init(const mi_heap_t* heap);  //
 mi_decl_cold  mi_theap_t* _mi_heap_theap_get_peek(const mi_heap_t* heap);     // get the theap for a heap without initializing (and return NULL in that case)
 void          _mi_heap_move_pages(mi_heap_t* heap_from, mi_heap_t* heap_to);  // in "arena.c"
 void          _mi_heap_destroy_pages(mi_heap_t* heap_from);                   // in "arena.c"
-
+void          _mi_heap_force_destroy(mi_heap_t* heap);                        // allow destroying the main heap
 
 // "stats.c"
 void          _mi_stats_init(void);
@@ -776,7 +778,7 @@ static inline bool mi_page_is_expandable(const mi_page_t* page) {
 }
 
 
-static inline bool mi_page_is_full(mi_page_t* page) {
+static inline bool mi_page_is_full(const mi_page_t* page) {
   const bool full = (page->reserved == page->used);
   mi_assert_internal(!full || page->free == NULL);
   return full;

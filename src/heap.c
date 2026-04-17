@@ -33,16 +33,16 @@ void mi_heap_stats_merge_to_main(mi_heap_t* heap) {
   _mi_stats_merge_into(&mi_heap_main()->stats, &heap->stats);
 }
 
-static mi_theap_t* mi_heap_init_theap(const mi_heap_t* const_heap)
+static mi_decl_noinline mi_theap_t* mi_heap_init_theap(const mi_heap_t* const_heap)
 {
   mi_heap_t* heap = (mi_heap_t*)const_heap;
   mi_assert_internal(heap!=NULL);
 
   if (_mi_is_heap_main(heap)) {
     // this can be called if the (main) thread is not yet initialized (as no allocation happened)
-    mi_thread_init();
-    mi_theap_t* theap = __mi_theap_main; // _mi_heap_theap(heap);
-    mi_assert_internal(theap!=NULL);
+    // but `theap_main_init_get()` will call `mi_thread_init()`
+    mi_theap_t* const theap = _mi_theap_main_safe();
+    mi_assert_internal(theap!=NULL && _mi_is_heap_main(_mi_theap_heap(theap)));
     return theap;
   }
 
@@ -73,18 +73,8 @@ static mi_theap_t* mi_heap_init_theap(const mi_heap_t* const_heap)
 
 // get the theap for a heap without initializing (and return NULL in that case)
 mi_theap_t* _mi_heap_theap_get_peek(const mi_heap_t* heap) {
-  #if __APPLE__
-  // ensure initialization of thread local storage
-  // this will call thread_init if needed and set __mi_theap_main
-  // if the tls allocates itself, this will set __mi_theap_main to NULL again and we need to re-initialize in that case.
-  if mi_unlikely(__mi_theap_main==NULL) { 
-    mi_theap_t* const theap = _mi_theap_default_safe(); 
-    mi_assert_internal(_mi_is_heap_main(_mi_theap_heap(theap))); 
-    _mi_theap_default_set(theap); 
-  }
-  #endif
   if (heap==NULL || _mi_is_heap_main(heap)) {
-    return __mi_theap_main;  // don't call _mi_theap_main() as it may still be NULL
+    return _mi_theap_main_safe(); 
   }
   else {
     return (mi_theap_t*)_mi_thread_local_get(heap->theap);
@@ -216,15 +206,20 @@ void mi_heap_delete(mi_heap_t* heap) {
   mi_heap_free(heap);
 }
 
+void _mi_heap_force_destroy(mi_heap_t* heap) {
+  if (heap==NULL) return;
+  mi_heap_free_theaps(heap);
+  _mi_heap_destroy_pages(heap);
+  if (!_mi_is_heap_main(heap)) { mi_heap_free(heap); }
+}
+
 void mi_heap_destroy(mi_heap_t* heap) {
   if (heap==NULL) return;
   if (_mi_is_heap_main(heap)) {
     _mi_warning_message("cannot destroy the main heap\n");
     return;
   }
-  mi_heap_free_theaps(heap);
-  _mi_heap_destroy_pages(heap);
-  mi_heap_free(heap);
+  _mi_heap_force_destroy(heap);
 }
 
 mi_heap_t* mi_heap_of(const void* p) {
@@ -245,4 +240,26 @@ bool mi_heap_contains(const mi_heap_t* heap, const void* p) {
 // deprecated
 bool mi_check_owned(const void* p) {
   return mi_any_heap_contains(p);
+}
+
+// unsafe heap utilization function for DragonFly (see issue #1258)
+// If the page of pointer `p` belongs to `heap` (or `heap==NULL`) and has less than `perc_threshold` used blocks in its used area return `true`.
+// This function is unsafe in general as it assumes we are the only thread accessing the page of `p`.
+bool mi_unsafe_heap_page_is_under_utilized(mi_heap_t* heap, void* p, size_t perc_threshold) mi_attr_noexcept {
+  if (p==NULL) return false;
+  const mi_page_t* const page = _mi_safe_ptr_page(p);   // Get the page containing this pointer
+  if (page==NULL || page->used==page->capacity || page->capacity < page->reserved) return false;
+  // If the page is the head of the queue, it is currently being used for 
+  // allocations; we skip it to avoid immediate thrashing.
+  if (page->prev == NULL)  return false;
+
+  // match heap?
+  const mi_heap_t* const page_heap = mi_page_heap(page);
+  if (page_heap==NULL) return false;
+  if (heap!=NULL && page_heap!=heap) return false;
+    
+  // check utilization
+  if (page->capacity==0)   return false;
+  if (perc_threshold>=100) return true;
+  return (perc_threshold >= ((100UL*page->used) / page->capacity));
 }

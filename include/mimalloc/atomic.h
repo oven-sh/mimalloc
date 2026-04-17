@@ -364,14 +364,9 @@ typedef _Atomic(uintptr_t) mi_atomic_guard_t;
 // Yield
 // ----------------------------------------------------------------------
 
-#if defined(__cplusplus)
-#include <thread>
+#if defined(_WIN32)
 static inline void mi_atomic_yield(void) {
-  std::this_thread::yield();
-}
-#elif defined(_WIN32)
-static inline void mi_atomic_yield(void) {
-  YieldProcessor();
+  YieldProcessor();  // see issue #1215 and #1225 why this is preferred over __yield or SwitchToThread
 }
 #elif defined(__SSE2__)
 #include <emmintrin.h>
@@ -412,7 +407,6 @@ static inline void mi_atomic_yield(void) {
 #endif
 #endif
 #elif defined(__sun)
-// Fallback for other archs
 #include <synch.h>
 static inline void mi_atomic_yield(void) {
   smt_pause();
@@ -421,6 +415,12 @@ static inline void mi_atomic_yield(void) {
 #include <sched.h>
 static inline void mi_atomic_yield(void) {
   sched_yield();
+}
+// Fallback for other archs
+#elif defined(__cplusplus)  
+#include <thread>
+static inline void mi_atomic_yield(void) {
+  std::this_thread::yield();
 }
 #else
 #include <unistd.h>
@@ -553,6 +553,7 @@ static inline void mi_lock_done(mi_lock_t* lock) {
 
 // fall back to poor man's locks.
 // this should only be the case in a single-threaded environment (like __wasi__)
+void _mi_error_message(int err, const char* fmt, ...);
 
 typedef union mi_lock_u {
   size_t             _init;    // for static initialization
@@ -564,16 +565,17 @@ static inline bool mi_lock_try_acquire(mi_lock_t* lock) {
   return mi_atomic_cas_strong_acq_rel(&lock->mutex, &expected, (uintptr_t)1);
 }
 static inline void mi_lock_acquire(mi_lock_t* lock) {
-  for (int i = 0; i < 1000; i++) {  // for at most 1000 tries?
-    if (mi_lock_try_acquire(&lock->mutex)) return;
+  for (int i = 0; i < 10000; i++) {  // for at most 10000 tries?
+    if (mi_lock_try_acquire(lock)) return;
     mi_atomic_yield();
   }
+  _mi_error_message(EFAULT, "internal error: lock cannot be acquired (due to lack of native lock primitives)\n");
 }
 static inline void mi_lock_release(mi_lock_t* lock) {
   mi_atomic_store_release(&lock->mutex, (uintptr_t)0);
 }
 static inline void mi_lock_init(mi_lock_t* lock) {
-  mi_lock_release(&lock->mutex);
+  mi_lock_release(lock);
 }
 static inline void mi_lock_done(mi_lock_t* lock) {
   (void)(lock);
