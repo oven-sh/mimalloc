@@ -1255,6 +1255,12 @@ void mi_cdecl mi_process_done(void) mi_attr_noexcept {
 }
 
 void mi_cdecl _mi_auto_process_done(void) mi_attr_noexcept {
+  #ifdef MI_NO_PROCESS_DETACH
+  // Embedder opted out of automatic exit-time teardown entirely. The process is going
+  // away; skipping mi_process_done avoids touching allocator state after other static
+  // destructors may have already run. mi_process_done() can still be called manually.
+  return;
+  #endif
   if (_mi_option_get_fast(mi_option_destroy_on_exit)>1) return;
   mi_process_done();
 }
