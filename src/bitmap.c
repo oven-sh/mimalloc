@@ -1072,7 +1072,6 @@ static void mi_bchunks_unsafe_setN(mi_bchunk_t* chunks, mi_bchunkmap_t* cmap, si
   // last chunk
   if (n > 0) {
     mi_assert_internal(n < MI_BCHUNK_BITS);
-    mi_assert_internal(chunk_idx < MI_BCHUNK_FIELDS);
     mi_bchunk_setN(&chunks[chunk_idx], 0, n, NULL);
   }
 }
@@ -1442,21 +1441,27 @@ bool _mi_bitmap_forall_setc_ranges(mi_bitmap_t* bitmap, mi_forall_set_fun_t* vis
       for (size_t j = 0; j < MI_BCHUNK_FIELDS; j++) {
         const size_t base_idx = (chunk_idx*MI_BCHUNK_BITS) + (j*MI_BFIELD_BITS);
         mi_bfield_t b = mi_atomic_exchange_relaxed(&chunk->bfields[j], (mi_bfield_t)0);
-#if MI_DEBUG > 1
+        #if MI_DEBUG > 1
         const size_t bpopcount = mi_popcount(b);
         size_t rngcount = 0;
-#endif
+        #endif
         size_t bidx;
         while (mi_bfield_find_least_bit(b, &bidx)) {
           size_t rng = mi_ctz(~(b>>bidx)); // all the set bits from bidx
-#if MI_DEBUG > 1
+          #if MI_DEBUG > 1
           rngcount += rng;
-#endif
+          #endif
           const size_t idx = base_idx + bidx;
           mi_assert_internal(rng>=1 && rng<=MI_BFIELD_BITS);
           mi_assert_internal((idx % MI_BFIELD_BITS) + rng <= MI_BFIELD_BITS);
           mi_assert_internal((idx / MI_BCHUNK_BITS) < mi_bitmap_chunk_count(bitmap));
-          if (!visit(idx, rng, arena, arg)) return false;
+          if (!visit(idx, rng, arena, arg)) {
+            // break early: reset the non-visited bits
+            if (b!=0) {
+              mi_atomic_or_relaxed(&chunk->bfields[j], b);
+            }
+            return false;
+          }
           // clear rng bits in b
           b = b & ~mi_bfield_mask(rng, bidx);
         }
@@ -1501,11 +1506,16 @@ bool _mi_bitmap_forall_setc_rangesn(mi_bitmap_t* bitmap, size_t rngslices, mi_fo
           if ((b & rngmask) == rngmask) {
             const size_t idx = base_idx + shift;
             if (!visit(idx, rngslices, arena, arg)) {
-              // break early
-              if (skipped != 0) {
-                mi_atomic_or_relaxed(&chunk->bfields[j], skipped);
-                return false;
+              // break early: restore non-visited entries
+              mi_bfield_t notyet_visited = 0;
+              if (shift + rngslices < MI_BFIELD_BITS) {
+                notyet_visited = (b & (~(mi_bfield_t)0 << (shift + rngslices)));
               }
+              mi_assert_internal((notyet_visited & skipped) == 0);
+              if ((notyet_visited | skipped) != 0) {
+                mi_atomic_or_relaxed(&chunk->bfields[j], notyet_visited | skipped);
+              }
+              return false;
             }
           }
           else {

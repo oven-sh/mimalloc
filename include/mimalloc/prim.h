@@ -365,7 +365,7 @@ static inline mi_theap_t* _mi_theap_cached(void);
 
 #if defined(_WIN32)
   #define MI_TLS_MODEL_DYNAMIC_WIN32        1    
-#elif defined(__APPLE__)  // macOS
+#elif defined(__APPLE__) && !defined(__POWERPC__)  // macOS on arm64 or x64
   // #define MI_TLS_MODEL_DYNAMIC_PTHREADS  1    // also works but a bit slower
   #define MI_TLS_MODEL_FIXED_SLOT           1
   // Slots 125-209 are NOT free: dyld uses them for shared-cache dylib __thread storage and

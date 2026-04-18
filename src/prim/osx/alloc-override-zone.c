@@ -483,9 +483,8 @@ static malloc_zone_t mi_malloc_zone = {
 
 static inline malloc_zone_t* mi_get_default_zone(void)
 {
-  static bool init;
-  if mi_unlikely(!init) {
-    init = true;
+  static mi_atomic_once_t init;
+  if (mi_atomic_once(&init)) {
     mi_malloc_zone.reserved1 = _mi_subproc_main();   // root for out-of-process introspection
     malloc_zone_register(&mi_malloc_zone);  // by calling register we avoid a zone error on free (see <http://eatmyrandom.blogspot.com/2010/03/mallocfree-interception-on-mac-os-x.html>)
   }
