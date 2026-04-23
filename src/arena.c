@@ -216,7 +216,7 @@ static mi_decl_noinline void* mi_arena_try_alloc_at(
   mi_arena_t* arena, size_t slice_count, bool commit, size_t tseq, mi_memid_t* memid)
 {
   size_t slice_index;
-  if (!mi_bbitmap_try_find_and_clearN(arena->slices_free, slice_count, tseq, &slice_index)) return NULL;
+  if (!mi_bbitmap_try_find_and_clearN(arena->slices_free, tseq, slice_count, &slice_index)) return NULL;
 
   // claimed it!
   void* p = mi_arena_slice_start(arena, slice_index);
@@ -239,7 +239,7 @@ static mi_decl_noinline void* mi_arena_try_alloc_at(
     if (already_committed < slice_count) {
       // not all committed, try to commit now
       bool commit_zero = false;
-      if (!_mi_os_commit_ex(p, mi_size_of_slices(slice_count), &commit_zero, mi_size_of_slices(slice_count - already_committed))) {
+      if (!mi_arena_commit(arena, p, mi_size_of_slices(slice_count), &commit_zero, mi_size_of_slices(slice_count - already_committed))) {
         // if the commit fails, release ownership, and return NULL;
         // note: this does not roll back dirty bits but that is ok.
         mi_bbitmap_setN(arena->slices_free, slice_index, slice_count);
@@ -646,7 +646,7 @@ static mi_arena_pages_t* mi_heap_arena_pages(mi_heap_t* heap, mi_arena_t* arena)
   mi_assert_internal(arena!=NULL);
   mi_assert_internal(heap!=NULL);
   mi_assert(arena->arena_idx < MI_MAX_ARENAS);
-  return mi_atomic_load_ptr_relaxed(mi_arena_pages_t, &heap->arena_pages[arena->arena_idx]);
+  return mi_atomic_load_ptr_acquire(mi_arena_pages_t, &heap->arena_pages[arena->arena_idx]);
 }
 
 static mi_arena_t* mi_page_arena_pages(mi_page_t* page, size_t* slice_index, size_t* slice_count, mi_arena_pages_t** parena_pages) {
@@ -743,10 +743,10 @@ static mi_page_t* mi_arenas_page_try_find_abandoned(mi_theap_t* theap, size_t sl
   return NULL;
 }
 
-// Undo the arena_pages->pages bit set by mi_arenas_page_alloc_fresh_area when a later
-// step (commit, page-map register, _mi_page_init) fails. _mi_arenas_free does not clear
-// this bit, so without this the next fresh alloc of the slice trips the :772 assert and
-// mi_heap_visit_blocks / _mi_ptr_page treat the freed slice as a live page.
+// Undo the arena_pages->pages bit set in mi_arenas_page_alloc_fresh when a later step
+// (_mi_page_init) fails. _mi_arenas_free does not clear this bit, so without this the next
+// fresh alloc of the slice trips the is_clear assert and mi_heap_visit_blocks / _mi_ptr_page
+// treat the freed slice as a live page.
 static void mi_arena_pages_clear_for_memid(mi_heap_t* heap, mi_memid_t memid) {
   if (memid.memkind != MI_MEM_ARENA || heap == NULL) return;
   mi_arena_pages_t* const arena_pages = mi_heap_arena_pages(heap, memid.mem.arena.arena);
@@ -781,8 +781,12 @@ static uint8_t* mi_arenas_page_alloc_fresh_area(mi_theap_t* theap, size_t slice_
         start = NULL;
       }
       else {
-        mi_assert_internal(mi_bitmap_is_clearN(arena_pages->pages, memid->mem.arena.slice_index, memid->mem.arena.slice_count));
-        mi_bitmap_set(arena_pages->pages, memid->mem.arena.slice_index);
+        // note: the following assert should hold if we could check it atomically, but in a concurrent setting we may already allocate in slice_count
+        // mi_assert_internal(mi_bitmap_is_clearN(arena_pages->pages, memid->mem.arena.slice_index, memid->mem.arena.slice_count));
+        mi_assert_internal(mi_bitmap_is_clear(arena_pages->pages, memid->mem.arena.slice_index));
+        // do NOT set arena_pages->pages here: defer until after the page struct is initialized and the
+        // page-map is registered (in mi_arenas_page_alloc_fresh). Setting it earlier publishes the page
+        // to mi_heap_visit_page_at while _mi_ptr_page would still return NULL, which a fork() can freeze.
       }
     }
   }
@@ -899,7 +903,6 @@ static mi_page_t* mi_arenas_page_alloc_fresh(mi_theap_t* theap, size_t slice_cou
     if (commit_size > page_noguard_size) { commit_size = page_noguard_size; }
     bool is_zero = false;
     if mi_unlikely(!mi_arena_commit( mi_memid_arena(memid), slice_start, commit_size, &is_zero, 0)) {
-      mi_arena_pages_clear_for_memid(_mi_theap_heap(theap), memid);
       _mi_arenas_free(slice_start, alloc_size, memid);
       return NULL;
     }
@@ -943,9 +946,16 @@ static mi_page_t* mi_arenas_page_alloc_fresh(mi_theap_t* theap, size_t slice_cou
 
   // register in the page map
   if mi_unlikely(!_mi_page_map_register(page)) {
-    mi_arena_pages_clear_for_memid(_mi_theap_heap(theap), memid);
     _mi_arenas_free( slice_start, alloc_size, memid );
     return NULL;
+  }
+
+  // publish in the heap's arena_pages bitmap only now that the page struct and page-map entry are
+  // both in place; mi_heap_visit_page_at walks this bitmap and dereferences the page.
+  if (memid.memkind == MI_MEM_ARENA) {
+    mi_arena_pages_t* const arena_pages = mi_heap_arena_pages(_mi_theap_heap(theap), memid.mem.arena.arena);
+    mi_assert_internal(arena_pages != NULL);  // mi_arenas_page_alloc_fresh_area ensured it
+    if (arena_pages != NULL) { mi_bitmap_set(arena_pages->pages, memid.mem.arena.slice_index); }
   }
 
   // stats
@@ -1089,8 +1099,9 @@ void _mi_arenas_page_free(mi_page_t* page, mi_theap_t* current_theapx) {
   }
   #endif
 
-  // unregister page
-  _mi_page_map_unregister(page);
+  // unpublish from the heap's arena_pages bitmap before unregistering the page-map: visitors
+  // (mi_heap_visit_page_at) walk this bitmap and call _mi_ptr_page on the result, and a fork()
+  // between page-map-unregister and bitmap-clear would freeze that inconsistency in the child.
   if (page->memid.memkind == MI_MEM_ARENA) {
     mi_arena_pages_t* arena_pages;
     size_t slice_index;
@@ -1118,8 +1129,9 @@ void _mi_arenas_page_free(mi_page_t* page, mi_theap_t* current_theapx) {
       mi_assert_internal(mi_bitmap_is_setN(arena->slices_committed, slice_index, slice_count));
     }
   }
+  _mi_page_map_unregister(page);
   if (mi_page_meta_is_separated(page)) { page->block_size = 0; }  // for assertion checking
-  _mi_arenas_free( mi_page_slice_start(page), mi_page_full_size(page), page->memid);  
+  _mi_arenas_free( mi_page_slice_start(page), mi_page_full_size(page), page->memid);
 }
 
 /* -----------------------------------------------------------
@@ -1284,7 +1296,7 @@ void _mi_arenas_free(void* p, size_t size, mi_memid_t memid) {
     }
     mi_assert_internal(slice_index < arena->slice_count);
     mi_assert_internal(slice_index >= mi_arena_info_slices(arena));
-    if (slice_index < mi_arena_info_slices(arena) || slice_index > arena->slice_count) {
+    if (slice_index < mi_arena_info_slices(arena) || slice_index >= arena->slice_count) {
       _mi_error_message(EINVAL, "trying to free from an invalid arena block: %p, size %zu, memid: 0x%zx\n", p, size, memid);
       return;
     }
@@ -2252,6 +2264,23 @@ static bool mi_heap_visit_page_at(size_t slice_index, size_t slice_count, mi_are
   mi_heap_visit_info_t* vinfo = (mi_heap_visit_info_t*)arg;
   mi_page_t* page = mi_arena_page_at_slice(arena, slice_index);
   if (vinfo->claim_pages) {
+    if mi_unlikely(_mi_process_is_forked_child) {
+      // After a multithreaded fork() the child may inherit a torn snapshot of pages that another
+      // thread was allocating: the arena_pages bit (atomic) propagated but earlier plain stores
+      // (page-map entry, page->xthread_free owned bit) did not, and that thread is now gone so the
+      // state will never converge. Re-derive the page-map entry from `page` and force ownership.
+      if (page->page_start == NULL) {  // page struct itself never made it across; unpublish and skip
+        mi_bitmap_clear(vinfo->arena_pages->pages, slice_index);
+        return true;
+      }
+      if (_mi_safe_ptr_page(page->page_start) != page) {
+        if (!_mi_page_map_register(page)) {
+          mi_bitmap_clear(vinfo->arena_pages->pages, slice_index);
+          return true;
+        }
+      }
+      mi_page_claim_ownership(page);  // either succeeds, or the dead thread held it — both end with owned=1
+    }
     // Invariant: during heap delete/destroy, no theaps remain on this heap, so no new pages are
     // allocated into it. `arena_pages->pages` bits therefore only ever clear (via `_mi_arenas_page_free`
     // from a concurrent `mi_free`). While the bit is set the page at this slice has been continuously
@@ -2261,7 +2290,8 @@ static bool mi_heap_visit_page_at(size_t slice_index, size_t slice_count, mi_are
     while (mi_bitmap_is_set(vinfo->arena_pages->pages, slice_index)) {
       if (mi_page_claim_ownership(page)) break;      // we transitioned the owned bit 0->1
       if (!mi_page_is_abandoned(page)) break;        // theap-owned: bit was set at alloc, no concurrent claimer
-      mi_atomic_yield();                             // abandoned and a concurrent `mi_free` owns it: wait
+      if (_mi_process_is_forked_child) break;        // owner thread is dead; we already hold owned=1 from above
+      _mi_prim_thread_yield();                       // abandoned and a concurrent `mi_free` owns it: wait
     }
     if (!mi_bitmap_is_set(vinfo->arena_pages->pages, slice_index)) return true;
     mi_assert_internal(mi_page_is_owned(page));

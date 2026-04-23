@@ -11,6 +11,7 @@ terms of the MIT license. A copy of the license can be found in the file
 #include "mimalloc/internal.h"
 #include "mimalloc/prim.h"
 #include <stdio.h>   // fputs, stderr
+#include <stdlib.h>  // atexit
 
 // xbox has no console IO
 #if !defined(WINAPI_FAMILY_PARTITION) || WINAPI_FAMILY_PARTITION(WINAPI_PARTITION_APP | WINAPI_PARTITION_SYSTEM)
@@ -86,17 +87,13 @@ typedef BOOL (__stdcall *PGetPhysicallyInstalledSystemMemory)( PULONGLONG TotalM
 typedef BOOL (__stdcall* PGetVersionExW)(LPOSVERSIONINFOW lpVersionInformation);
 
 
+
 //---------------------------------------------
 // Enable large page support dynamically (if possible)
 //---------------------------------------------
 
-static bool win_enable_large_os_pages(size_t* large_page_size)
+static bool win_enable_large_os_pages_once(size_t* large_page_size)
 {
-  static mi_atomic_once_t large_initialized;
-  if (!mi_atomic_once(&large_initialized)) {     
-    return (_mi_os_large_page_size() > 0);
-  }
-
   if (pGetLargePageMinimum==NULL) return false;  // no large page support (xbox etc.)
 
   // Try to see if large OS pages are supported
@@ -128,6 +125,13 @@ static bool win_enable_large_os_pages(size_t* large_page_size)
     _mi_warning_message("cannot enable large OS page support, error %lu\n", err);
   }
   return (ok!=0);
+}
+
+static bool win_enable_large_os_pages(size_t* large_page_size) {
+  mi_atomic_do_once {
+    win_enable_large_os_pages_once(large_page_size);
+  }
+  return (_mi_os_large_page_size() > 0);
 }
 
 
@@ -419,7 +423,7 @@ static void* _mi_prim_alloc_huge_os_pagesx(void* hint_addr, size_t size, int num
 
   MI_MEM_EXTENDED_PARAMETER params[3] = { {{0,0},{0}},{{0,0},{0}},{{0,0},{0}} };
   // on modern Windows try use NtAllocateVirtualMemoryEx for 1GiB huge pages
-  static _Atomic(size_t) mi_huge_pages_available = ATOMIC_VAR_INIT(1);
+  static _Atomic(size_t) mi_huge_pages_available = MI_ATOMIC_VAR_INIT(1);
   if (pNtAllocateVirtualMemoryEx != NULL && mi_atomic_load_acquire(&mi_huge_pages_available) != 0) {
     params[0].Type.Type = MiMemExtendedParameterAttributeFlags;
     params[0].Arg.ULong64 = MI_MEM_EXTENDED_PARAMETER_NONPAGED_HUGE;
@@ -563,10 +567,11 @@ void _mi_prim_process_info(mi_process_info_t* pinfo)
   pinfo->stime = filetime_msecs(&st);
 
   // load psapi on demand
-  if (pGetProcessMemoryInfo == NULL) {
+  mi_atomic_do_once {
     HINSTANCE hDll = LoadLibrary(TEXT("psapi.dll"));
     if (hDll != NULL) {
       pGetProcessMemoryInfo = (PGetProcessMemoryInfo)(void (*)(void))GetProcAddress(hDll, "GetProcessMemoryInfo");
+      // FreeLibrary(hDll);  // don't free
     }
   }
 
@@ -632,7 +637,7 @@ void _mi_prim_out_stderr( const char* msg )
 // Note: on windows, environment names are not case sensitive.
 bool _mi_prim_getenv(const char* name, char* result, size_t result_size) {
   result[0] = 0;
-  size_t len = GetEnvironmentVariableA(name, result, (DWORD)result_size);
+  const size_t len = GetEnvironmentVariableA(name, result, (DWORD)result_size);
   return (len > 0 && len < result_size);
 }
 
@@ -665,13 +670,16 @@ typedef LONG (NTAPI *PBCryptGenRandom)(HANDLE, PUCHAR, ULONG, ULONG);
 static  PBCryptGenRandom pBCryptGenRandom = NULL;
 
 bool _mi_prim_random_buf(void* buf, size_t buf_len) {
-  if (pBCryptGenRandom == NULL) {
+  mi_assert(buf_len <= ULONG_MAX);
+  if (buf_len > ULONG_MAX) return false;
+  mi_atomic_do_once {
     HINSTANCE hDll = LoadLibrary(TEXT("bcrypt.dll"));
     if (hDll != NULL) {
       pBCryptGenRandom = (PBCryptGenRandom)(void (*)(void))GetProcAddress(hDll, "BCryptGenRandom");
+      // FreeLibrary(hDll);  // don't free
     }
-    if (pBCryptGenRandom == NULL) return false;
   }
+  if (pBCryptGenRandom == NULL) return false;
   return (pBCryptGenRandom(NULL, (PUCHAR)buf, (ULONG)buf_len, BCRYPT_USE_SYSTEM_PREFERRED_RNG) >= 0);
 }
 
@@ -695,6 +703,9 @@ bool _mi_prim_thread_is_in_threadpool(void) {
   return false;
 }
 
+void _mi_prim_thread_yield(void) {
+  SwitchToThread();
+}
 
 //----------------------------------------------------------------
 // Process & Thread Init/Done
@@ -725,9 +736,11 @@ static void NTAPI mi_win_main(PVOID module, DWORD reason, LPVOID reserved) {
    By default we use a combination of CRT init and TLS sections for
    both static and dynamic linkage (`MI_WIN_INIT_USE_CRT_TLS`).
 ------------------------------------------------------------------------- */
-#ifndef MI_WIN_INIT_USE_CRT_TLS
-  #if !defined(MI_WIN_INIT_USE_RAW_DLLMAIN) && !defined(MI_WIN_INIT_USE_TLS_DLLMAIN) && !defined(MI_WIN_INIT_USE_FLS)
-    #define MI_WIN_INIT_USE_CRT_TLS 1
+#if !defined(MI_WIN_INIT_USE_CRT_TLS) && !defined(MI_WIN_INIT_USE_RAW_DLLMAIN) && !defined(MI_WIN_INIT_USE_TLS_DLLMAIN) && !defined(MI_WIN_INIT_USE_FLS)
+  #if !defined(__INTEL_LLVM_COMPILER) && !defined(__INTEL_COMPILER)
+    #define MI_WIN_INIT_USE_CRT_TLS      1  
+  #else
+    #define MI_WIN_INIT_USE_TLS_DLLMAIN  1  /* default for Intel ICX, see issue #1268 */  
   #endif
 #endif
 
@@ -749,7 +762,7 @@ static void NTAPI mi_win_main(PVOID module, DWORD reason, LPVOID reserved) {
 
   static bool mi_current_module_is_dll(void) {
     HMODULE mod = NULL;
-    const BOOL ok = GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCTSTR)mi_current_module_is_dll, &mod);
+    const BOOL ok = GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR)mi_current_module_is_dll, &mod);
     return (ok && mi_module_is_dll(mod));
   }
 

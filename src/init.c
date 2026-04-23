@@ -115,7 +115,7 @@ static mi_decl_cache_align mi_tld_t tld_empty = {
   0,                      // default numa node
   &subproc_main,          // subproc
   NULL,                   // theaps list
-  {0},                    // theaps lock
+  MI_LOCK_INITIALIZER,    // theaps lock
   false,                  // recurse
   false,                  // is_in_threadpool
   MI_MEMID_STATIC         // memid
@@ -182,7 +182,7 @@ static mi_decl_cache_align mi_tld_t tld_main = {
   0,                      // numa node
   &subproc_main,          // subproc
   &theap_main,            // theaps list
-  {0},                    // theaps lock
+  MI_LOCK_INITIALIZER,    // theaps lock
   false,                  // recurse
   false,                  // is_in_threadpool
   MI_MEMID_STATIC         // memid
@@ -629,7 +629,7 @@ static void mi_thread_theaps_done(mi_tld_t* tld)
     #if MI_DEBUG > 0
     if (mi_debug_stall_in_thread_theaps_done) {
       mi_debug_stall_in_thread_theaps_done = 2; // signal: tld->theaps_lock held
-      while (mi_debug_stall_in_thread_theaps_done) { mi_atomic_yield(); }
+      while (mi_debug_stall_in_thread_theaps_done) { _mi_prim_thread_yield(); }
     }
     #endif
     mi_theap_t* theap = tld->theaps;
@@ -664,8 +664,13 @@ static void mi_thread_theaps_done(mi_tld_t* tld)
         theap = next;
       }
     }
-    if (!all_freed) { mi_subproc_stat_counter_increase(tld->subproc,heaps_delete_wait,1); mi_atomic_yield(); }
-               else { mi_assert_internal(tld->theaps==NULL); }       
+    if (!all_freed) { 
+      mi_subproc_stat_counter_increase(tld->subproc,heaps_delete_wait,1); 
+      _mi_prim_thread_yield(); 
+    }
+    else { 
+      mi_assert_internal(tld->theaps==NULL); 
+    }
   } while (!all_freed);
 
   mi_assert(_mi_theap_default()==(mi_theap_t*)&_mi_theap_empty); // careful to not re-initialize the default theap during theap_delete
@@ -692,11 +697,10 @@ static void mi_thread_theaps_done(mi_tld_t* tld)
 
 // Set up handlers so `mi_thread_done` is called automatically
 static void mi_process_setup_auto_thread_done(void) {
-  static bool tls_initialized = false; // fine if it races
-  if (tls_initialized) return;
-  tls_initialized = true;
-  _mi_prim_thread_init_auto_done();
-  _mi_theap_default_set(&theap_main);
+  mi_atomic_do_once {
+    _mi_prim_thread_init_auto_done();
+    _mi_theap_default_set(&theap_main);
+  }
 }
 
 
@@ -835,8 +839,7 @@ static void mi_win_tls_slot_free(DWORD* raw_index) {
 }
 
 static void mi_tls_slots_init(void) {
-  static mi_atomic_once_t tls_slots_init;
-  if (mi_atomic_once(&tls_slots_init)) {
+  mi_atomic_do_once {
     bool ok = mi_win_tls_slot_alloc(&_mi_theap_default_slot, &_mi_theap_default_expansion_slot, &mi_tls_raw_index_default);
     if (ok) {
       ok = mi_win_tls_slot_alloc(&_mi_theap_cached_slot, &_mi_theap_cached_expansion_slot, &mi_tls_raw_index_cached);
@@ -869,12 +872,29 @@ static void mi_win_tls_slot_set(size_t slot, size_t extended_slot, void* value) 
 mi_decl_hidden pthread_key_t _mi_theap_default_key = 0;
 mi_decl_hidden pthread_key_t _mi_theap_cached_key = 0;
 
+// create a non-zero pthread key
+static int mi_pthread_key_create( pthread_key_t* pkey ) {
+  pthread_key_t key;
+  int err = pthread_key_create(&key, NULL);
+  if (err!=0) return err;
+  if (key==0) {
+    // if we get a zero key, create another one as we use 0 for an invalid key
+    pthread_key_t key2;
+    err = pthread_key_create(&key2, NULL);
+    pthread_key_delete(key);  // delete the old key
+    if (err!=0) return err;
+    key = key2;
+  }
+  mi_assert_internal(key!=0);    
+  *pkey = key;
+  return 0;
+}
+
 static void mi_tls_slots_init(void) {
-  static mi_atomic_once_t tls_keys_init;
-  if (mi_atomic_once(&tls_keys_init)) {
-    int err = pthread_key_create(&_mi_theap_default_key, NULL);
+  mi_atomic_do_once {
+    int err = mi_pthread_key_create(&_mi_theap_default_key);
     if (err==0) {
-      err = pthread_key_create(&_mi_theap_cached_key, NULL);
+      err = mi_pthread_key_create(&_mi_theap_cached_key);
     }
     if (err!=0) {
       _mi_error_message(EFAULT, "unable to allocate pthread keys (error %d)\n", err);
@@ -1075,13 +1095,8 @@ static void mi_detect_cpu_features(void) {
 
 
 // Initialize the process; called by thread_init or the process loader
-void mi_process_init(void) mi_attr_noexcept {
-  // ensure we are called once
-  static mi_atomic_once_t process_init;
-	// #if _MSC_VER < 1920
-	// mi_heap_main_init(); // vs2017 can dynamically re-initialize theap_main
-	// #endif
-  if (!mi_atomic_once(&process_init)) return;
+static void mi_process_init_once(void) mi_attr_noexcept {
+  _mi_process_is_initialized = true;  
   _mi_verbose_message("process init: 0x%zx\n", _mi_thread_id());
 
   mi_detect_cpu_features();
@@ -1134,6 +1149,7 @@ void mi_process_init(void) mi_attr_noexcept {
 ----------------------------------------------------------- */
 
 static _Atomic(uintptr_t) mi_fork_depth;  // allow nested prepare/parent calls (e.g., zone hooks + pthread_atfork)
+bool _mi_process_is_forked_child;          // set once in fork_child, never cleared; lets visitors avoid waiting on dead-thread state
 
 void _mi_process_fork_prepare(void) {
   if (!_mi_process_is_initialized) return;
@@ -1180,6 +1196,7 @@ void _mi_process_fork_parent(void) {
 void _mi_process_fork_child(void) {
   if (!_mi_process_is_initialized) return;
   if (mi_atomic_exchange_acq_rel(&mi_fork_depth, 0) == 0) return;
+  _mi_process_is_forked_child = true;
   // single-threaded here: just reinitialize every lock we know about
   mi_lock_init(&subprocs_lock);
   for (mi_subproc_t* sp = subprocs; sp != NULL; sp = sp->next) {
@@ -1207,6 +1224,16 @@ void _mi_process_fork_child(void) {
     }
   }
   _mi_thread_locals_fork_child();
+}
+
+// Initialize the process; called by thread_init or the process loader
+void mi_process_init(void) mi_attr_noexcept {
+  // #if _MSC_VER < 1920
+	// mi_heap_main_init(); // vs2017 can dynamically re-initialize _mi_heap_main
+	// #endif
+  mi_atomic_do_once {
+    mi_process_init_once();
+  }
 }
 
 // Called when the process is done (cdecl as it is used with `at_exit` on some platforms)

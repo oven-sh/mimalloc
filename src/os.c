@@ -486,6 +486,7 @@ void* _mi_os_alloc_aligned_at_offset(size_t size, size_t alignment, size_t offse
   mi_assert(offset <= size);
   mi_assert((alignment % _mi_os_page_size()) == 0);
   *memid = _mi_memid_none();
+  if (offset > size) return NULL;
   if (offset == 0) {
     // regular aligned allocation
     return _mi_os_alloc_aligned(size, alignment, commit, allow_large, memid);
@@ -493,6 +494,7 @@ void* _mi_os_alloc_aligned_at_offset(size_t size, size_t alignment, size_t offse
   else {
     // overallocate to align at an offset
     const size_t extra = _mi_align_up(offset, alignment) - offset;
+    if (size >= SIZE_MAX - extra) return NULL;  // too large
     const size_t oversize = size + extra;
     void* const start = _mi_os_alloc_aligned(oversize, alignment, commit, allow_large, memid);
     if (start == NULL) return NULL;
@@ -500,7 +502,7 @@ void* _mi_os_alloc_aligned_at_offset(size_t size, size_t alignment, size_t offse
     void* const p = (uint8_t*)start + extra;
     mi_assert(_mi_is_aligned((uint8_t*)p + offset, alignment));
     // decommit the overallocation at the start
-    if (commit && extra > _mi_os_page_size()) {
+    if (commit && extra >= _mi_os_page_size()) {
       _mi_os_decommit(start, extra);
     }
     return p;

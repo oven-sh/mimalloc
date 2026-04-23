@@ -12,6 +12,7 @@ Concurrent bitmap that can set/reset sequences of bits atomically
 #include "mimalloc.h"
 #include "mimalloc/internal.h"
 #include "mimalloc/bits.h"
+#include "mimalloc/prim.h"  // _mi_prim_thread_yield
 #include "bitmap.h"
 
 #ifndef MI_OPT_SIMD
@@ -119,7 +120,7 @@ static inline void mi_bfield_atomic_clear_once_set(_Atomic(mi_bfield_t)*b, size_
         mi_subproc_stat_counter_increase(_mi_subproc(), pages_unabandon_busy_wait, 1);
       }
       while ((old&mask)==0) { // busy wait
-        mi_atomic_yield();
+        _mi_prim_thread_yield(); 
         old = mi_atomic_load_acquire(b);
       }
     }
@@ -1571,11 +1572,19 @@ void mi_bbitmap_unsafe_setN(mi_bbitmap_t* bbitmap, size_t idx, size_t n) {
 }
 
 bool mi_bbitmap_bsr_inv(mi_bbitmap_t* bbitmap, size_t* idx) {
-  const size_t chunkmap_max = _mi_divide_up(mi_bbitmap_chunk_count(bbitmap), MI_BFIELD_BITS);
+  const size_t chunk_count = mi_bbitmap_chunk_count(bbitmap);
+  const size_t chunkmap_max = _mi_divide_up(chunk_count, MI_BFIELD_BITS);
+  size_t skip_at_top = chunk_count % MI_BFIELD_BITS;
   for (size_t i = chunkmap_max; i > 0; ) {
     i--;
     mi_bfield_t cmap = mi_atomic_load_relaxed(&bbitmap->chunkmap.bfields[i]);
     size_t cmap_idx;
+    // don't consider top 0 bits; set those to 1 here
+    if (skip_at_top > 0) {
+      const size_t mask_top = (~mi_bfield_zero()) << (MI_BFIELD_BITS - skip_at_top);
+      skip_at_top = 0;   // only for the first iteration
+      cmap |= mask_top;
+    }
     if (mi_bsr(~cmap, &cmap_idx)) {
       // highest chunk
       const size_t chunk_idx = i*MI_BFIELD_BITS + cmap_idx;

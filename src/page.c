@@ -154,8 +154,13 @@ static void mi_page_thread_collect_to_local(mi_page_t* page, mi_block_t* head)
   }
 
   // if `count > max_count` there was a memory corruption (possibly infinite list due to double multi-threaded free)
-  if (count > max_count) {
+  if mi_unlikely(count > max_count) {
     _mi_error_message(EFAULT, "corrupted thread-free list\n");
+    return; // the thread-free items cannot be freed
+  }
+  // if `count > page->used` there was another kind memory corruption (either in the page meta-data or in the linked list)
+  else if mi_unlikely(count > page->used) {
+    _mi_error_message(EFAULT, "corrupted meta-data in thread-free list\n");
     return; // the thread-free items cannot be freed
   }
 
@@ -880,21 +885,24 @@ static mi_page_t* mi_find_free_page(mi_theap_t* theap, mi_page_queue_t* pq) {
   a certain number of allocations.
 ----------------------------------------------------------- */
 
-static mi_deferred_free_fun* volatile deferred_free = NULL;
-static _Atomic(void*) deferred_arg; // = NULL
+// The program should only install a single deferred free handler before doing allocation.
+static _Atomic(void*) deferred_free; // is `mi_deferred_free_fun*` (but some platforms don't support atomic function pointers)
+static _Atomic(void*) deferred_arg;   
 
 void _mi_deferred_free(mi_theap_t* theap, bool force) {
   theap->heartbeat++;
-  if (deferred_free != NULL && !theap->tld->recurse) {
+  mi_deferred_free_fun* const fun = (mi_deferred_free_fun*)mi_atomic_load_ptr_acquire(void,&deferred_free);
+  if (fun != NULL && !theap->tld->recurse) {
     theap->tld->recurse = true;
-    deferred_free(force, theap->heartbeat, mi_atomic_load_ptr_relaxed(void,&deferred_arg));
+    void* const arg = mi_atomic_load_ptr_acquire(void,&deferred_arg);  
+    fun(force, theap->heartbeat, arg);
     theap->tld->recurse = false;
   }
 }
 
 void mi_register_deferred_free(mi_deferred_free_fun* fn, void* arg) mi_attr_noexcept {
-  deferred_free = fn;
   mi_atomic_store_ptr_release(void,&deferred_arg, arg);
+  mi_atomic_store_ptr_release(void,&deferred_free, (void*)fn);  
 }
 
 

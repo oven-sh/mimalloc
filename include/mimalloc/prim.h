@@ -126,6 +126,9 @@ void _mi_prim_thread_associate_default_theap(mi_theap_t* theap);
 // Is this thread part of a thread pool?
 bool _mi_prim_thread_is_in_threadpool(void);
 
+// Yield to other threads. Should be similar to `sleep(0)`. 
+// Is called only in rare situations and does not have to be lightning fast.
+void _mi_prim_thread_yield(void);
 
 //-------------------------------------------------------------------
 // Access to TLS (thread local storage) slots.
@@ -365,7 +368,7 @@ static inline mi_theap_t* _mi_theap_cached(void);
 
 #if defined(_WIN32)
   #define MI_TLS_MODEL_DYNAMIC_WIN32        1    
-#elif defined(__APPLE__) && !defined(__POWERPC__)  // macOS on arm64 or x64
+#elif defined(__APPLE__) && MI_HAS_TLS_SLOT && !defined(__POWERPC__)  // macOS on arm64 or x64
   // #define MI_TLS_MODEL_DYNAMIC_PTHREADS  1    // also works but a bit slower
   #define MI_TLS_MODEL_FIXED_SLOT           1
   // Slots 125-209 are NOT free: dyld uses them for shared-cache dylib __thread storage and
@@ -376,7 +379,7 @@ static inline mi_theap_t* _mi_theap_cached(void);
   #define MI_TLS_MODEL_FIXED_SLOT_DEFAULT   96
   #define MI_TLS_MODEL_FIXED_SLOT_CACHED    97
   // see <https://github.com/apple-oss-distributions/libpthread/blob/main/private/pthread/tsd_private.h>
-#elif defined(__OpenBSD__) || defined(__ANDROID__)
+#elif defined(__APPLE__) || defined(__OpenBSD__) || defined(__ANDROID__)
   #define MI_TLS_MODEL_DYNAMIC_PTHREADS     1
   // #define MI_TLS_MODEL_DYNAMIC_PTHREADS_DEFAULT_ENTRY_IS_NULL  1
 #else

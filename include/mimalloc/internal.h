@@ -171,6 +171,7 @@ void          _mi_thread_done(mi_theap_t* theap);
 mi_subproc_t* _mi_subproc(void);
 mi_subproc_t* _mi_subproc_main(void);
 void          _mi_process_fork_prepare(void);
+extern mi_decl_hidden bool _mi_process_is_forked_child;
 void          _mi_process_fork_parent(void);
 void          _mi_process_fork_child(void);
 void          _mi_thread_locals_fork_prepare(void);
@@ -453,8 +454,7 @@ static inline bool _mi_is_power_of_two(uintptr_t x) {
 
 // Is a pointer aligned?
 static inline bool _mi_is_aligned(const void* p, size_t alignment) {
-  mi_assert_internal(alignment != 0);
-  return (((uintptr_t)p % alignment) == 0);
+  return (alignment==0 || ((uintptr_t)p % alignment) == 0);
 }
 
 // Align upwards

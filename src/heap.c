@@ -57,15 +57,18 @@ static mi_decl_noinline mi_theap_t* mi_heap_init_theap(const mi_heap_t* const_he
 
   // create a fresh theap?
   if (theap==NULL) {
+    // set first an invalid value to ensure the thread local storage is allocated
+    if (!_mi_thread_local_set(heap->theap, (mi_theap_t*)1)) {
+      _mi_error_message(EFAULT, "unable to allocate memory for thread local storage\n");
+      return NULL;
+    }    
+    // then allocate the theap
     theap = _mi_theap_create(heap, _mi_theap_default_safe()->tld);
+    _mi_thread_local_set(heap->theap, theap);  // Cannot fail now as it was set before. Always set so the local is valid or NULL (and not 1)
     if (theap==NULL) {
       _mi_error_message(EFAULT, "unable to allocate memory for a thread local heap\n");
       return NULL;
-    }
-    if (!_mi_thread_local_set(heap->theap, theap)) {
-      _mi_error_message(EFAULT, "unable to allocate memory for a thread local storage\n");
-      return NULL;
-    }
+    }    
   }
   return theap;
 }
@@ -157,8 +160,13 @@ static void mi_heap_free_theaps(mi_heap_t* heap) {
         theap = next;
       }      
     }
-    if (!all_freed) { mi_heap_stat_counter_increase(heap,heaps_delete_wait,1); mi_atomic_yield(); }
-               else { mi_assert_internal(heap->theaps==NULL); }               
+    if (!all_freed) { 
+      mi_heap_stat_counter_increase(heap,heaps_delete_wait,1); 
+      _mi_prim_thread_yield();
+    }
+    else { 
+      mi_assert_internal(heap->theaps==NULL); 
+    }               
   }
   while(!all_freed);
 }
@@ -210,7 +218,7 @@ void _mi_heap_force_destroy(mi_heap_t* heap) {
   if (heap==NULL) return;
   mi_heap_free_theaps(heap);
   _mi_heap_destroy_pages(heap);
-  if (!_mi_is_heap_main(heap)) { mi_heap_free(heap); }
+  if (!_mi_is_heap_main(heap)) { mi_heap_free(heap); }  // todo: release locks of the main heap?
 }
 
 void mi_heap_destroy(mi_heap_t* heap) {
