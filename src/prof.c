@@ -34,8 +34,10 @@ terms of the MIT license. A copy of the license can be found in the file
 #else
   #include <unistd.h>
   #include <fcntl.h>
-  #if defined(__linux__)
+  #if defined(__linux__) || defined(__FreeBSD__)
     #include <stdio.h>
+    #include <link.h>
+    #include <elf.h>
   #endif
   #if defined(__APPLE__)
     #include <mach-o/dyld.h>
@@ -393,19 +395,21 @@ static void pb_location(mi_pb_t* w, uint64_t id, uint64_t mapping_id, uint64_t a
   pb_tag(w, 3, 0); pb_varint(w, addr);
 }
 
-// Mapping { id=1, memory_start=2, memory_limit=3, file_offset=4, filename=5 }
-static void pb_mapping(mi_pb_t* w, uint64_t id, uint64_t start, uint64_t end, uint64_t off, int64_t name_str) {
+// Mapping { id=1, memory_start=2, memory_limit=3, file_offset=4, filename=5, build_id=6 }
+static void pb_mapping(mi_pb_t* w, uint64_t id, uint64_t start, uint64_t end, uint64_t off, int64_t name_str, int64_t bid_str) {
   size_t len = pb_varint_len(1<<3)+pb_varint_len(id)
              + pb_varint_len(2<<3)+pb_varint_len(start)
              + pb_varint_len(3<<3)+pb_varint_len(end)
              + pb_varint_len(4<<3)+pb_varint_len(off)
-             + pb_varint_len(5<<3)+pb_varint_len((uint64_t)name_str);
+             + pb_varint_len(5<<3)+pb_varint_len((uint64_t)name_str)
+             + pb_varint_len(6<<3)+pb_varint_len((uint64_t)bid_str);
   pb_tag(w, 3, 2); pb_varint(w, len);
   pb_tag(w, 1, 0); pb_varint(w, id);
   pb_tag(w, 2, 0); pb_varint(w, start);
   pb_tag(w, 3, 0); pb_varint(w, end);
   pb_tag(w, 4, 0); pb_varint(w, off);
   pb_tag(w, 5, 0); pb_varint(w, (uint64_t)name_str);
+  pb_tag(w, 6, 0); pb_varint(w, (uint64_t)bid_str);
 }
 
 // String table entry (field 6)
@@ -421,7 +425,13 @@ static void pb_string(mi_pb_t* w, const char* s) {
 // ---------------------------------------------------------------------------
 
 typedef struct mi_prof_loc_s { uintptr_t addr; uint64_t id; uint64_t mapping_id; } mi_prof_loc_t;
-typedef struct mi_prof_map_s { uint64_t start, end, off; const char* name; } mi_prof_map_t;
+typedef struct mi_prof_map_s { uint64_t start, end, off; const char* name; char build_id[48]; } mi_prof_map_t;
+
+static void mi_prof_hex(char* dst, const uint8_t* src, size_t n) {
+  static const char hx[] = "0123456789abcdef";
+  for (size_t i = 0; i < n; i++) { dst[2*i] = hx[src[i]>>4]; dst[2*i+1] = hx[src[i]&0xf]; }
+  dst[2*n] = 0;
+}
 
 static inline size_t mi_prof_loc_find(mi_prof_loc_t* locs, size_t cap, uintptr_t a) {
   size_t h = (size_t)(a * 0x9E3779B97F4A7C15ull) & (cap - 1);
@@ -429,34 +439,70 @@ static inline size_t mi_prof_loc_find(mi_prof_loc_t* locs, size_t cap, uintptr_t
   return h;
 }
 
+#if defined(__linux__) || defined(__FreeBSD__)
+typedef struct { mi_prof_map_t* maps; size_t* n; size_t cap; char* strbuf; size_t strcap; size_t soff; } mi_prof_dlctx_t;
+
+static int mi_prof_dl_cb(struct dl_phdr_info* info, size_t sz, void* arg) {
+  MI_UNUSED(sz);
+  mi_prof_dlctx_t* c = (mi_prof_dlctx_t*)arg;
+  if (*c->n >= c->cap) return 0;
+  uint64_t start = 0, end = 0, off = 0;
+  const uint8_t* bid = NULL; size_t bid_len = 0;
+  for (int i = 0; i < info->dlpi_phnum; i++) {
+    const ElfW(Phdr)* ph = &info->dlpi_phdr[i];
+    if (ph->p_type == PT_LOAD && (ph->p_flags & PF_X)) {
+      uint64_t s = info->dlpi_addr + ph->p_vaddr;
+      if (start == 0) { start = s; off = ph->p_offset; }
+      if (s + ph->p_memsz > end) end = s + ph->p_memsz;
+    }
+    else if (ph->p_type == PT_NOTE) {
+      const uint8_t* p = (const uint8_t*)(info->dlpi_addr + ph->p_vaddr);
+      const uint8_t* e = p + ph->p_memsz;
+      while (p + 12 <= e) {
+        uint32_t namesz = *(const uint32_t*)p, descsz = *(const uint32_t*)(p+4), type = *(const uint32_t*)(p+8);
+        const uint8_t* name = p + 12; const uint8_t* desc = name + ((namesz+3)&~3u);
+        if (type == 3 /*NT_GNU_BUILD_ID*/ && namesz == 4 && name[0]=='G'&&name[1]=='N'&&name[2]=='U') {
+          bid = desc; bid_len = descsz; break;
+        }
+        p = desc + ((descsz+3)&~3u);
+      }
+    }
+  }
+  if (start == 0) return 0;
+  mi_prof_map_t* m = &c->maps[(*c->n)++];
+  m->start = start; m->end = end; m->off = off;
+  m->build_id[0] = 0;
+  if (bid != NULL && bid_len > 0 && bid_len <= 20) mi_prof_hex(m->build_id, bid, bid_len);
+  const char* nm = (info->dlpi_name && info->dlpi_name[0]) ? info->dlpi_name : "";
+  size_t plen = _mi_strlen(nm)+1;
+  if (c->soff + plen <= c->strcap) { _mi_memcpy(c->strbuf+c->soff, nm, plen); m->name = c->strbuf+c->soff; c->soff += plen; }
+  else m->name = "";
+  return 0;
+}
+#endif
+
 static void mi_prof_collect_mappings(mi_prof_map_t* maps, size_t* nmaps, size_t cap, char* strbuf, size_t strbuf_cap) {
   size_t n = 0;
   size_t soff = 0;
-  #if defined(__linux__)
-    FILE* f = fopen("/proc/self/maps", "r");
-    if (f != NULL) {
-      char line[512];
-      while (n < cap && fgets(line, sizeof(line), f)) {
-        unsigned long s,e,off; char perm[8]; char path[256] = "";
-        if (sscanf(line, "%lx-%lx %7s %lx %*x:%*x %*u %255s", &s,&e,perm,&off,path) >= 4) {
-          if (perm[2] == 'x') {
-            maps[n].start = s; maps[n].end = e; maps[n].off = off;
-            size_t plen = _mi_strlen(path)+1;
-            if (soff + plen <= strbuf_cap) { _mi_memcpy(strbuf+soff, path, plen); maps[n].name = strbuf+soff; soff += plen; }
-            else maps[n].name = "";
-            n++;
-          }
-        }
-      }
-      fclose(f);
+  #if defined(__linux__) || defined(__FreeBSD__)
+    // dl_iterate_phdr gives us PT_LOAD + PT_NOTE for every loaded object,
+    // including the main executable, so we get build-id without opening files.
+    mi_prof_dlctx_t ctx = { maps, &n, cap, strbuf, strbuf_cap, 0 };
+    dl_iterate_phdr(mi_prof_dl_cb, &ctx);
+    soff = ctx.soff;
+    // dl_iterate_phdr reports the main exe with empty name; fill from /proc/self/exe
+    if (n > 0 && maps[0].name[0] == 0) {
+      ssize_t r = readlink("/proc/self/exe", strbuf + soff, strbuf_cap - soff - 1);
+      if (r > 0) { strbuf[soff+r] = 0; maps[0].name = strbuf+soff; soff += (size_t)r+1; }
     }
   #elif defined(__APPLE__)
     uint32_t cnt = _dyld_image_count();
     for (uint32_t i = 0; i < cnt && n < cap; i++) {
       const struct mach_header_64* mh = (const struct mach_header_64*)_dyld_get_image_header(i);
       if (mh == NULL || mh->magic != MH_MAGIC_64) continue;
-      // walk load commands to find the __TEXT segment extent
+      // walk load commands to find __TEXT extent and LC_UUID
       uint64_t start = (uint64_t)(uintptr_t)mh, end = start;
+      maps[n].build_id[0] = 0;
       const struct load_command* lc = (const struct load_command*)((const uint8_t*)mh + sizeof(*mh));
       for (uint32_t c = 0; c < mh->ncmds; c++) {
         if (lc->cmd == LC_SEGMENT_64) {
@@ -467,6 +513,10 @@ static void mi_prof_collect_mappings(mi_prof_map_t* maps, size_t* nmaps, size_t 
             if (end == start) start = s;
             if (s + sc->vmsize > end) end = s + sc->vmsize;
           }
+        }
+        else if (lc->cmd == LC_UUID) {
+          const struct uuid_command* uc = (const struct uuid_command*)lc;
+          mi_prof_hex(maps[n].build_id, uc->uuid, 16);
         }
         lc = (const struct load_command*)((const uint8_t*)lc + lc->cmdsize);
       }
@@ -567,7 +617,8 @@ static int mi_prof_dump_pb(mi_pb_t* wp) {
 
   // mappings (field 3) — string indices start after fixed strings
   for (size_t i = 0; i < nmaps; i++) {
-    pb_mapping(&w, (uint64_t)(i+1), maps[i].start, maps[i].end, maps[i].off, (int64_t)(STR_FIXED_N + i));
+    int64_t bid_str = (maps[i].build_id[0] != 0 ? (int64_t)(STR_FIXED_N + nmaps + i) : 0);
+    pb_mapping(&w, (uint64_t)(i+1), maps[i].start, maps[i].end, maps[i].off, (int64_t)(STR_FIXED_N + i), bid_str);
   }
 
   // locations (field 4)
@@ -578,6 +629,7 @@ static int mi_prof_dump_pb(mi_pb_t* wp) {
   // string_table (field 6)
   for (size_t i = 0; i < STR_FIXED_N; i++) pb_string(&w, fixed_strs[i]);
   for (size_t i = 0; i < nmaps; i++) pb_string(&w, maps[i].name);
+  for (size_t i = 0; i < nmaps; i++) pb_string(&w, maps[i].build_id);
 
   // period_type (field 11), period (field 12), default_sample_type (field 14)
   pb_value_type(&w, 11, STR_SPACE, STR_BYTES);
