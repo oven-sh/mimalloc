@@ -43,7 +43,9 @@ terms of the MIT license. A copy of the license can be found in the file
     #include <mach-o/dyld.h>
     #include <mach-o/loader.h>
   #endif
-  #include <execinfo.h>
+  #if defined(__GLIBC__) || defined(__APPLE__)
+    #include <execinfo.h>   // backtrace() fallback; musl/bionic don't ship this (FP walk is primary)
+  #endif
   #define mi_prof_write(fd,buf,n)  write(fd,buf,n)
   #define mi_prof_open(p)          open(p, O_WRONLY|O_CREAT|O_TRUNC, 0644)
   #define mi_prof_close(fd)        close(fd)
