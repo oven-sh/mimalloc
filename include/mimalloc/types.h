@@ -334,7 +334,8 @@ typedef struct mi_block_s {
 // `in_full_queue` is true if the page is full and resides in the full queue (so we move it to a regular queue on free-ing)
 #define MI_PAGE_IN_FULL_QUEUE           MI_ZU(0x01)
 #define MI_PAGE_HAS_INTERIOR_POINTERS   MI_ZU(0x02)
-#define MI_PAGE_FLAG_MASK               MI_ZU(0x03)
+#define MI_PAGE_HAS_PROF_SAMPLES        MI_ZU(0x04)   // page contains at least one profiled allocation; routes free to the generic path
+#define MI_PAGE_FLAG_MASK               MI_ZU(0x07)
 typedef size_t mi_page_flags_t;
 
 // There are two special threadid's: 0 for pages that are abandoned (and not in a theap queue),
@@ -523,6 +524,8 @@ struct mi_theap_s {
   long                  page_full_retain;                    // how many full pages can be retained per queue (before abandoning them)
   bool                  allow_page_reclaim;                  // `true` if this theap should not reclaim abandoned pages
   bool                  allow_page_abandon;                  // `true` if this theap can abandon pages to reduce memory footprint
+  bool                  prof_force_slow;                     // if profiling is enabled: keep `pages_free_direct` poisoned so every malloc routes through `_mi_malloc_generic`
+  intptr_t              prof_countdown;                      // bytes until next profiling sample (only consulted in `_mi_malloc_generic`; 0 if profiling is off)
   #if MI_GUARDED
   size_t                guarded_size_min;                    // minimal size for guarded objects
   size_t                guarded_size_max;                    // maximal size for guarded objects

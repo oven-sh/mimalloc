@@ -71,6 +71,8 @@ set(mi_sources
     src/arena-meta.c
     src/bitmap.c
     src/heap.c
+    src/heap-snapshot.c
+    src/prof.c
     src/init.c
     src/libc.c
     src/options.c
@@ -792,7 +794,7 @@ if (MI_BUILD_TESTS)
   enable_testing()
 
   # static link tests
-  foreach(TEST_NAME api api-fill stress heap-mt heap-delete-race fork-user-heap commit-fail)
+  foreach(TEST_NAME api api-fill stress heap-mt heap-delete-race fork-user-heap commit-fail snapshot prof prof-adversarial)
     add_executable(mimalloc-test-${TEST_NAME} test/test-${TEST_NAME}.c)
     target_compile_definitions(mimalloc-test-${TEST_NAME} PRIVATE ${mi_defines})
     target_compile_options(mimalloc-test-${TEST_NAME} PRIVATE ${mi_cflags})
@@ -806,6 +808,10 @@ if (MI_BUILD_TESTS)
     endif()
     add_test(NAME test-${TEST_NAME} COMMAND mimalloc-test-${TEST_NAME})
   endforeach()
+
+  # heap snapshot reader CLI (standalone, no mimalloc dependency)
+  add_executable(mi-heapview tools/mi-heapview.c)
+  target_compile_options(mi-heapview PRIVATE ${mi_cflags})
 
   # dynamic override test
   if(MI_BUILD_SHARED AND NOT (MI_TRACK_ASAN OR MI_DEBUG_TSAN OR MI_DEBUG_UBSAN))

@@ -2334,18 +2334,34 @@ bool _mi_heap_visit_blocks(mi_heap_t* heap, bool abandoned_only, bool visit_bloc
   if (!ok) return false;
 
   // visit abandoned pages in OS allocated memory
-  // (technically we don't need the initial lock as we assume we are the only thread running in this subproc)
-  mi_page_t* page = NULL;
+  // Other threads can still mi_free() into these abandoned pages and, on the
+  // last free, win the owned-bit, unlink under the lock, and unmap the page.
+  // Hold the list lock while we read `next` and (when claiming) only proceed
+  // if we actually win ownership; otherwise skip — the freeing thread will
+  // dispose of the page.
   mi_lock(&heap->os_abandoned_pages_lock) {
-    page = heap->os_abandoned_pages;
-  }
-  while (ok && page != NULL) {
-    mi_page_t* next = page->next;  // read upfront in case the visitor frees the page
-    if (claim_pages) {
-      mi_page_claim_ownership(page);
+    mi_page_t* page = heap->os_abandoned_pages;
+    while (ok && page != NULL) {
+      mi_page_t* next = page->next;  // safe under lock
+      if (claim_pages && !mi_page_claim_ownership(page)) {
+        page = next;
+        continue;  // a concurrent free owns it; it will unlink/free the page
+      }
+      // release the list lock around the visitor (which may take it again to unlink)
+      mi_lock_release(&heap->os_abandoned_pages_lock);
+      ok = mi_heap_visit_page(page, &visit_info);
+      mi_lock_acquire(&heap->os_abandoned_pages_lock);
+      // `next` may have been unlinked while we were unlocked; re-read from head
+      // if it no longer appears (cheap: list is short, OS pages are rare)
+      if (next != NULL) {
+        bool found = false;
+        for (mi_page_t* p = heap->os_abandoned_pages; p != NULL; p = p->next) {
+          if (p == next) { found = true; break; }
+        }
+        if (!found) next = heap->os_abandoned_pages;
+      }
+      page = next;
     }
-    ok = mi_heap_visit_page(page, &visit_info);
-    page = next;
   }
 
   return ok;
@@ -2392,6 +2408,18 @@ static bool mi_heap_delete_page(const mi_heap_t* heap, const mi_heap_area_t* are
     // destroy the page
     page->used=0;                        // note: invariant `|local_free| + |free| == reserved - used`  does not hold in this case
     _mi_arenas_page_free(page, theap);
+  }
+  else if (page->memid.memkind != MI_MEM_ARENA) {
+    // OS/external page: no arena bitmaps to update. Re-home and re-abandon it
+    // into the target heap's `os_abandoned_pages` list via the normal path.
+    const size_t sbin = _mi_page_stats_bin(page);
+    if (theap != NULL) { mi_theap_stat_decrease(theap, page_bins[sbin], 1); mi_theap_stat_decrease(theap, pages, 1); }
+    else               { mi_heap_stat_decrease((mi_heap_t*)heap, page_bins[sbin], 1); mi_heap_stat_decrease((mi_heap_t*)heap, pages, 1); }
+    mi_theap_t* theap_target = info->theap_target;
+    page->heap = heap_target;
+    mi_theap_stat_increase(theap_target, page_bins[sbin], 1);
+    mi_theap_stat_increase(theap_target, pages, 1);
+    _mi_arenas_page_abandon(page, theap_target);
   }
   else {
     // move the page to `heap_target` as an abandoned page

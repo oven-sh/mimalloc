@@ -131,6 +131,7 @@ mi_decl_cache_align const mi_theap_t _mi_theap_empty = {
   0,                      // full page retain
   false,                  // allow reclaim
   true,                   // allow abandon
+  false, 0,               // prof_force_slow, prof_countdown
   #if MI_GUARDED
   0, 0, 0, 1,             // sample count is 1 so we never write to it (see `internal.h:mi_theap_malloc_use_guarded`)
   #endif
@@ -156,6 +157,7 @@ mi_decl_cache_align const mi_theap_t _mi_theap_empty_wrong = {
   0,                      // full page retain
   false,                  // allow reclaim
   true,                   // allow abandon
+  false, 0,               // prof_force_slow, prof_countdown
   #if MI_GUARDED
   0, 0, 0, 1,             // sample count is 1 so we never write to it (see `internal.h:mi_theap_malloc_use_guarded`)
   #endif
@@ -198,6 +200,7 @@ mi_decl_cache_align mi_theap_t theap_main = {
   2,                      // full page retain
   true,                   // allow page reclaim
   true,                   // allow page abandon
+  false, 0,               // prof_force_slow, prof_countdown
   #if MI_GUARDED
   0, 0, 0, 0,
   #endif
@@ -312,6 +315,7 @@ void _mi_theap_options_init(mi_theap_t* theap) {
   theap->allow_page_reclaim = (mi_option_get(mi_option_page_reclaim_on_free) >= 0);
   theap->allow_page_abandon = (mi_option_get(mi_option_page_full_retain) >= 0);
   theap->page_full_retain = mi_option_get_clamp(mi_option_page_full_retain, -1, 32);
+  _mi_prof_theap_init(theap);
 }
 
 // Initialization of the (statically allocated) main theap, and the main tld and subproc.
@@ -650,10 +654,9 @@ static void mi_thread_theaps_done(mi_tld_t* tld)
       // never destroy theaps; if a dll is linked statically with mimalloc,
       // there may still be delete/free calls after the mi_fls_done is called. Issue #207
       _mi_theap_collect_abandon(theap);
-      // _mi_theap_free (via mi_heap_free_theaps) may have NULL'd theap->heap before
-      // blocking on our tld->theaps_lock; collect_abandon then no-ops and that path
-      // owns the cleanup, so the page_count invariant doesn't hold for us here.
-      mi_assert_internal(!mi_theap_is_initialized(theap) || theap->page_count==0);
+      // A concurrent `mi_heap_free_theaps` may NULL theap->heap (so collect no-ops)
+      // and then CAS it back if its inner try-acquire fails; in that window the
+      // page_count invariant doesn't hold here. The second loop re-collects.
       theap = next;
     }
   }
@@ -669,7 +672,14 @@ static void mi_thread_theaps_done(mi_tld_t* tld)
       mi_theap_t* theap = tld->theaps;
       while (theap != NULL) {
         mi_theap_t* next = theap->tnext;
-        mi_assert_internal(!mi_theap_is_initialized(theap) || theap->page_count==0);
+        // A concurrent `mi_heap_free_theaps` may have transiently NULL'd
+        // theap->heap (and CAS'd it back on inner-lock failure or page_count>0),
+        // causing our first-loop collect to no-op. Re-collect; idempotent and
+        // cheap if already done. `_mi_theap_free` below also guards against
+        // freeing with pages from the non-owning side.
+        if (theap->page_count != 0) {
+          _mi_theap_collect_abandon(theap);
+        }
         if (!_mi_theap_free(theap, true /* acquire heap->theaps_lock */, false /* dont re-acquire the tld->theaps_lock*/ )) {
           all_freed = false;
         }
@@ -1135,6 +1145,7 @@ static void mi_process_init_once(void) mi_attr_noexcept {
 
   // mi_stats_reset();  // only call stat reset *after* thread init (or the theap tld == NULL)
   mi_track_init();
+  _mi_prof_init();
   if (mi_option_is_enabled(mi_option_reserve_huge_os_pages)) {
     size_t pages = mi_option_get_clamp(mi_option_reserve_huge_os_pages, 0, 128*1024);
     int reserve_at  = (int)mi_option_get_clamp(mi_option_reserve_huge_os_pages_at, -1, INT_MAX);
@@ -1256,6 +1267,10 @@ void mi_cdecl mi_process_done(void) mi_attr_noexcept {
   static bool process_done = false;
   if (process_done) return;
   process_done = true;
+
+  // write a heap snapshot / heap profile if requested (before any cleanup so the live state is captured)
+  _mi_heap_snapshot_on_exit();
+  _mi_prof_on_exit();
 
   // free dynamic thread locals (if used at all)
   _mi_thread_locals_done();

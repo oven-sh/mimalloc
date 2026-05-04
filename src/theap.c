@@ -311,24 +311,39 @@ bool _mi_theap_free(mi_theap_t* theap, bool acquire_heap_theaps_lock, bool acqui
     return false;
   }
   else {
+    // We won the exchange. Before doing any blocking work, secure both inner locks with try-acquire
+    // so the caller's retry loop can fire under contention. (Blocking here
+    // while the caller still holds its outer lock can complete a wait-for
+    // cycle with another `mi_heap_delete`, thread exit, or `_mi_process_fork_prepare`.)
+    bool got_hlock = !acquire_heap_theaps_lock;
+    bool got_tlock = !acquire_tld_theaps_lock;
+    if (acquire_heap_theaps_lock) { got_hlock = mi_lock_try_acquire(&heap->theaps_lock); }
+    if (got_hlock && acquire_tld_theaps_lock) { got_tlock = mi_lock_try_acquire(&theap->tld->theaps_lock); }
+    if (!got_hlock || !got_tlock) {
+      // back out: restore the heap pointer (it must still be NULL since we hold ownership)
+      if (got_hlock && acquire_heap_theaps_lock) { mi_lock_release(&heap->theaps_lock); }
+      mi_heap_t* expected = NULL;
+      const bool restored = mi_atomic_cas_ptr_strong_acq_rel(mi_heap_t, &theap->heap, &expected, heap);
+      mi_assert_internal(restored); MI_UNUSED(restored);
+      return false;  // caller releases its outer lock, yields, and retries
+    }
+
     // merge stats to the owning heap
     _mi_stats_merge_into(&heap->stats, &theap->stats);
 
-    // remove ourselves from the heap theaps list
-    mi_lock_maybe(&heap->theaps_lock, acquire_heap_theaps_lock) {
-      if (theap->hnext != NULL) { theap->hnext->hprev = theap->hprev; }
-      if (theap->hprev != NULL) { theap->hprev->hnext = theap->hnext; }
-                          else { mi_assert_internal(heap->theaps == theap); heap->theaps = theap->hnext; }
-      theap->hnext = theap->hprev = NULL;
-    }
+    // remove ourselves from the heap theaps list (lock already held if needed)
+    if (theap->hnext != NULL) { theap->hnext->hprev = theap->hprev; }
+    if (theap->hprev != NULL) { theap->hprev->hnext = theap->hnext; }
+                        else { mi_assert_internal(heap->theaps == theap); heap->theaps = theap->hnext; }
+    theap->hnext = theap->hprev = NULL;
+    if (acquire_heap_theaps_lock) { mi_lock_release(&heap->theaps_lock); }
 
-    // remove ourselves from the thread local theaps list
-    mi_lock_maybe(&theap->tld->theaps_lock, acquire_tld_theaps_lock) {
-      if (theap->tnext != NULL) { theap->tnext->tprev = theap->tprev;  }
-      if (theap->tprev != NULL) { theap->tprev->tnext = theap->tnext;  }
-                          else { mi_assert_internal(theap->tld->theaps == theap); theap->tld->theaps = theap->tnext; }
-      theap->tnext = theap->tprev = NULL;                        
-    }
+    // remove ourselves from the thread local theaps list (lock already held if needed)
+    if (theap->tnext != NULL) { theap->tnext->tprev = theap->tprev;  }
+    if (theap->tprev != NULL) { theap->tprev->tnext = theap->tnext;  }
+                        else { mi_assert_internal(theap->tld->theaps == theap); theap->tld->theaps = theap->tnext; }
+    theap->tnext = theap->tprev = NULL;
+    if (acquire_tld_theaps_lock) { mi_lock_release(&theap->tld->theaps_lock); }
     theap->tld = NULL;
     // clear the per-thread cached theap if it is this one (this only catches the case where
     // the *current* thread is the one freeing; cross-thread callers cannot reach the owning

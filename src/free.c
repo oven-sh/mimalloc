@@ -131,9 +131,25 @@ static inline mi_block_t* mi_validate_block_from_ptr( const mi_page_t* page, voi
 }
 
 
+// outlined slow paths for pages with profiled samples; tail-called so the
+// common generic_local/generic_mt remain leaf functions (no frame, no spills).
+static mi_decl_noinline void mi_free_generic_local_prof(mi_page_t* page, void* p) mi_attr_noexcept {
+  mi_block_t* const block = (mi_page_has_interior_pointers(page) ? _mi_page_ptr_unalign(page, p) : mi_validate_block_from_ptr(page,p));
+  _mi_prof_free(block);
+  const bool was_guarded = mi_block_check_unguard(page, block, p);
+  mi_free_block_local(page, block, was_guarded, true, true);
+}
+static mi_decl_noinline void mi_free_generic_mt_prof(mi_page_t* page, void* p) mi_attr_noexcept {
+  mi_block_t* const block = (mi_page_has_interior_pointers(page) ? _mi_page_ptr_unalign(page, p) : mi_validate_block_from_ptr(page,p));
+  _mi_prof_free(block);
+  const bool was_guarded = mi_block_check_unguard(page, block, p);
+  mi_free_block_mt(page, block, was_guarded);
+}
+
 // free a local pointer  (page parameter comes first for better codegen)
 static void mi_decl_noinline mi_free_generic_local(mi_page_t* page, void* p) mi_attr_noexcept {
   mi_assert_internal(p!=NULL && page != NULL);
+  if mi_unlikely(mi_page_flags(page) & MI_PAGE_HAS_PROF_SAMPLES) { mi_free_generic_local_prof(page, p); return; }
   mi_block_t* const block = (mi_page_has_interior_pointers(page) ? _mi_page_ptr_unalign(page, p) : mi_validate_block_from_ptr(page,p));
   const bool was_guarded = mi_block_check_unguard(page, block, p);
   mi_free_block_local(page, block, was_guarded, true /* track stats */, true /* check for a full page */);
@@ -142,6 +158,7 @@ static void mi_decl_noinline mi_free_generic_local(mi_page_t* page, void* p) mi_
 // free a pointer owned by another thread (page parameter comes first for better codegen)
 static void mi_decl_noinline mi_free_generic_mt(mi_page_t* page, void* p) mi_attr_noexcept {
   mi_assert_internal(p!=NULL && page != NULL);
+  if mi_unlikely(mi_page_flags(page) & MI_PAGE_HAS_PROF_SAMPLES) { mi_free_generic_mt_prof(page, p); return; }
   mi_block_t* const block = (mi_page_has_interior_pointers(page) ? _mi_page_ptr_unalign(page, p) : mi_validate_block_from_ptr(page,p));
   const bool was_guarded = mi_block_check_unguard(page, block, p);
   mi_free_block_mt(page, block, was_guarded);

@@ -327,6 +327,21 @@ mi_decl_export bool   mi_manage_os_memory(void* start, size_t size, bool is_comm
 
 mi_decl_export void   mi_debug_show_arenas(void) mi_attr_noexcept;
 mi_decl_export void   mi_arenas_print(void) mi_attr_noexcept;
+
+// Write a binary heap snapshot to `fd` for offline analysis (see tools/mi-heapview.c).
+// Returns 0 on success, -1 on write error.
+#define MI_SNAPSHOT_BLOCKS  0x01    // include per-block free bitmaps for pages owned by the calling thread
+mi_decl_export int    mi_heap_snapshot(int fd, unsigned flags) mi_attr_noexcept;
+mi_decl_export int    mi_heap_snapshot_to_file(const char* path, unsigned flags) mi_attr_noexcept;
+
+// Sampling heap profiler (pprof-compatible). Zero overhead on the malloc/free
+// fast paths when disabled (sample_rate_bytes == 0). Output is a profile.proto
+// readable by `go tool pprof`.
+mi_decl_export void   mi_prof_enable(size_t sample_rate_bytes) mi_attr_noexcept;
+mi_decl_export void   mi_prof_reset(void) mi_attr_noexcept;
+mi_decl_export int    mi_prof_dump(int fd) mi_attr_noexcept;
+mi_decl_export size_t mi_prof_dump_buf(void* buf, size_t cap) mi_attr_noexcept;  // returns total size; buf=NULL to query
+mi_decl_export int    mi_prof_dump_to_file(const char* path) mi_attr_noexcept;
 mi_decl_export size_t mi_arena_min_alignment(void);
 mi_decl_export size_t mi_arena_min_size(void);
 
@@ -484,6 +499,8 @@ typedef enum mi_option_e {
   mi_option_minimal_purge_size,         // set minimal purge size (in KiB) (=0). By default set to either 64 or 2048 if THP is enabled.
   mi_option_arena_max_object_size,      // set maximal object size that can be allocated in an arena (in KiB) (=2GiB on 64-bit). 
   mi_option_arena_is_numa_local,        // experimental
+  mi_option_snapshot_on_exit,           // write a heap snapshot on process exit (=0). 1=on, 2=on with per-block freemaps. Path from MIMALLOC_SNAPSHOT_PATH or "mimalloc-snapshot.<pid>.bin".
+  mi_option_prof_sample_rate,           // bytes per heap-profile sample (=0, off). Typical: 524288. Dumps profile.proto on exit to MIMALLOC_PROF_PATH.
   _mi_option_last,
   // legacy option names
   mi_option_large_os_pages = mi_option_allow_large_os_pages,

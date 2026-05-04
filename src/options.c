@@ -179,6 +179,8 @@ static mi_option_desc_t mi_options[_mi_option_last] =
   { MI_DEFAULT_ARENA_MAX_OBJECT_SIZE,   
          MI_OPTION_UNINIT, MI_OPTION(arena_max_object_size) },    // set maximal object size that can be allocated in an arena (in KiB) (=2GiB on 64-bit). 
   { 0,   MI_OPTION_UNINIT, MI_OPTION(arena_is_numa_local) },      // associate local numa node with an initial arena allocation
+  { 0,   MI_OPTION_UNINIT, MI_OPTION(snapshot_on_exit) },         // write a heap snapshot on process exit (=0). 1=on, 2=on+blocks.
+  { 0,   MI_OPTION_UNINIT, MI_OPTION(prof_sample_rate) },         // bytes per heap-profile sample (=0, off). Typical: 524288.
 };
 
 static void mi_option_init(mi_option_desc_t* desc);

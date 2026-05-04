@@ -258,6 +258,18 @@ void          _mi_arenas_page_free(mi_page_t* page, mi_theap_t* current_theapx /
 void          _mi_arenas_page_abandon(mi_page_t* page, mi_theap_t* current_theap);
 void          _mi_arenas_page_unabandon(mi_page_t* page, mi_theap_t* current_theapx /* can be NULL */);
 bool          _mi_arenas_page_try_reabandon_to_mapped(mi_page_t* page);
+size_t        mi_arenas_get_count(mi_subproc_t* subproc);
+uint8_t*      mi_arena_slice_start(mi_arena_t* arena, size_t slice_index);
+
+// heap-snapshot.c
+void          _mi_heap_snapshot_on_exit(void);
+
+// prof.c
+void          _mi_prof_sample(mi_theap_t* theap, mi_page_t* page, void* p, size_t req_size);
+void          _mi_prof_free(const void* p);
+void          _mi_prof_init(void);
+void          _mi_prof_theap_init(mi_theap_t* theap);
+void          _mi_prof_on_exit(void);
 
 // arena-meta.c
 void*         _mi_meta_zalloc( size_t size, mi_memid_t* memid );

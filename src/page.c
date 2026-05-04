@@ -1031,6 +1031,15 @@ void* _mi_malloc_generic(mi_theap_t* theap, size_t size, size_t zero_huge_alignm
   void* const p = _mi_page_malloc_zero(theap,page,size,zero);
   mi_assert_internal(p != NULL);
 
+  // heap profiling: only checked here (slow path); zero overhead on the fast path.
+  // when off, prof_countdown==0 and the first compare short-circuits.
+  if mi_unlikely(theap->prof_countdown != 0) {
+    const size_t bsize = mi_page_block_size(page);
+    if ((theap->prof_countdown -= (intptr_t)bsize) <= 0) {
+      _mi_prof_sample(theap, page, p, bsize);
+    }
+  }
+
   // move full pages to the full queue
   if (mi_page_block_size(page) > MI_SMALL_MAX_OBJ_SIZE && mi_page_is_full(page)) {
     mi_page_to_full(page, mi_page_queue_of(page));

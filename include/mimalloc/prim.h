@@ -274,7 +274,7 @@ static inline mi_threadid_t __mi_prim_thread_id(void) mi_attr_noexcept;
 static inline mi_threadid_t _mi_prim_thread_id(void) mi_attr_noexcept {
   const mi_threadid_t tid = __mi_prim_thread_id();
   mi_assert_internal(tid > 1);
-  mi_assert_internal((tid & MI_PAGE_FLAG_MASK) == 0);  // bottom 2 bits are clear?
+  mi_assert_internal((tid & MI_PAGE_FLAG_MASK) == 0);  // bottom 3 bits are clear?
   return tid;
 }
 

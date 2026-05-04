@@ -1890,6 +1890,10 @@ rollback:
     count--;
     mi_bchunk_t* chunk = &bbitmap->chunks[chunk_idx + count];
     mi_bchunk_setN(chunk, 0, MI_BCHUNK_BITS, NULL);
+    // restore the chunkmap bit too (a concurrent clear may have observed the
+    // all-zero chunk between our clear and this set and dropped the cmap bit;
+    // without this the chunk's free slices become invisible to non-huge searches)
+    mi_bbitmap_chunkmap_set(bbitmap, chunk_idx + count, true /* check_all_set */);
   }
   return false;
 }
