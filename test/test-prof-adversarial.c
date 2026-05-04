@@ -304,6 +304,39 @@ static void case_bad_fd(void) {
 }
 
 // ---------------------------------------------------------------------------
+// Case: process-wide enable — main calls start(), a worker thread that was
+// already running (and had already allocated) must start sampling.
+// ---------------------------------------------------------------------------
+
+static atomic_int g_pw_phase; // 0=warmup, 1=profile, 2=stop
+static NOINLINE void* pw_worker(void* _) {
+  // warmup: allocate before profiling is on so this thread has a populated theap
+  for (int i = 0; i < 1000; i++) { void* p = mi_malloc(256); mi_free(p); }
+  atomic_store(&g_pw_phase, 1);
+  while (atomic_load(&g_pw_phase) == 1) sched_yield();
+  // now main has called mi_prof_enable; allocate — these must be sampled
+  for (int i = 0; i < 5000; i++) { void* p = mi_malloc(256); mi_free(p); }
+  return NULL;
+}
+
+static void case_process_wide(void) {
+  mi_prof_reset();
+  atomic_store(&g_pw_phase, 0);
+  pthread_t t; pthread_create(&t, NULL, pw_worker, NULL);
+  while (atomic_load(&g_pw_phase) == 0) sched_yield();  // wait for worker warmup
+  mi_prof_enable(128);  // ON: must reach the worker's already-existing theap
+  atomic_store(&g_pw_phase, 2);
+  pthread_join(t, NULL);
+  mi_prof_enable(0);
+  mi_prof_dump_to_file("/tmp/prof-pw.pb");
+  pb_stats_t st; CHECK(pb_validate("/tmp/prof-pw.pb", &st) == 0, "process-wide: parses");
+  // worker allocated 5000*256 = 1.28MB at rate=128 -> ~10000 samples expected;
+  // even if a few fast-path allocs slip through before lazy-enable, should be >>100
+  CHECK(st.nsamples > 1000, "process-wide: worker thread sampled after main enabled");
+  OK("process-wide enable");
+}
+
+// ---------------------------------------------------------------------------
 // Case: dump_buf — two-call size query, then fill; bytes match dump_to_file.
 // ---------------------------------------------------------------------------
 
@@ -340,6 +373,7 @@ int main(void) {
   case_rate1_hammer();
   case_enable_cycle();
   case_dump_buf();
+  case_process_wide();
   case_mt_stress();
   if (g_fail) { fprintf(stderr, "FAILED\n"); return 1; }
   fprintf(stderr, "all cases passed\n");

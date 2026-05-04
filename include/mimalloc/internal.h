@@ -269,6 +269,8 @@ void          _mi_prof_sample(mi_theap_t* theap, mi_page_t* page, void* p, size_
 void          _mi_prof_free(const void* p);
 void          _mi_prof_init(void);
 void          _mi_prof_theap_init(mi_theap_t* theap);
+void          _mi_prof_theap_lazy_enable(mi_theap_t* theap);
+size_t        _mi_prof_rate(void);
 void          _mi_prof_on_exit(void);
 
 // arena-meta.c

@@ -1032,8 +1032,9 @@ void* _mi_malloc_generic(mi_theap_t* theap, size_t size, size_t zero_huge_alignm
   mi_assert_internal(p != NULL);
 
   // heap profiling: only checked here (slow path); zero overhead on the fast path.
-  // when off, prof_countdown==0 and the first compare short-circuits.
-  if mi_unlikely(theap->prof_countdown != 0) {
+  // gate on the global rate so any thread picks up profiling enabled elsewhere.
+  if mi_unlikely(_mi_prof_rate() != 0) {
+    if (theap->prof_countdown == 0) { _mi_prof_theap_lazy_enable(theap); }
     const size_t bsize = mi_page_block_size(page);
     if ((theap->prof_countdown -= (intptr_t)bsize) <= 0) {
       _mi_prof_sample(theap, page, p, bsize);

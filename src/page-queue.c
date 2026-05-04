@@ -213,7 +213,12 @@ static inline void mi_theap_queue_first_update(mi_theap_t* theap, const mi_page_
 
   mi_page_t* page = pq->first;
   if (pq->first == NULL) page = (mi_page_t*)&_mi_page_empty;
-  if mi_unlikely(theap->prof_force_slow) page = (mi_page_t*)&_mi_page_empty;  // profiling: route all allocs through _mi_malloc_generic
+  if mi_unlikely(theap->prof_force_slow) {
+    // profiling: route all allocs through _mi_malloc_generic; lazy-disable here
+    // (cold path) if the global rate has since gone to 0.
+    if (_mi_prof_rate() == 0) { theap->prof_force_slow = false; theap->prof_countdown = 0; }
+    else { page = (mi_page_t*)&_mi_page_empty; }
+  }
 
   // find index in the right direct page array
   const size_t idx = _mi_wsize_from_size(size);

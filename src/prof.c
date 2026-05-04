@@ -59,7 +59,7 @@ typedef struct mi_prof_sample_s {
 
 typedef struct mi_prof_state_s {
   mi_lock_t          lock;
-  size_t             rate;        // bytes per sample (0 = disabled)
+  _Atomic(size_t)    rate;        // bytes per sample (0 = disabled); read in _mi_malloc_generic
   // samples (grow-only)
   mi_prof_sample_t*  samples;
   size_t             sample_count;
@@ -258,20 +258,48 @@ static void mi_prof_set_theap(mi_theap_t* theap, bool on) {
 }
 
 void _mi_prof_theap_init(mi_theap_t* theap) {
-  if (mi_prof.rate > 0) mi_prof_set_theap(theap, true);
+  if (mi_atomic_load_relaxed(&mi_prof.rate) > 0) mi_prof_set_theap(theap, true);
+}
+
+// Called from _mi_malloc_generic when the global rate is on but this theap
+// hasn't been enabled yet (e.g., another thread called mi_prof_enable).
+void _mi_prof_theap_lazy_enable(mi_theap_t* theap) {
+  if (theap->prof_countdown == 0 && mi_atomic_load_relaxed(&mi_prof.rate) > 0) {
+    mi_prof_set_theap(theap, true);
+  }
+}
+
+// Read by _mi_malloc_generic's hot-path gate.
+size_t _mi_prof_rate(void) {
+  return mi_atomic_load_relaxed(&mi_prof.rate);
+}
+
+// Walk every theap in the process (all subprocs -> heaps -> theaps) and toggle.
+// Writes to other threads' theap fields are aligned word stores; the worst case
+// is a few fast-path allocs slip through before the target thread observes the
+// poisoned slot, after which queue_first_update keeps it poisoned.
+static void mi_prof_set_all_theaps(bool on) {
+  mi_subproc_t* sp = _mi_subproc_main();
+  for (; sp != NULL; sp = sp->next) {
+    mi_lock(&sp->heaps_lock) {
+      for (mi_heap_t* h = sp->heaps; h != NULL; h = h->next) {
+        mi_lock(&h->theaps_lock) {
+          for (mi_theap_t* t = h->theaps; t != NULL; t = t->hnext) {
+            mi_prof_set_theap(t, on);
+          }
+        }
+      }
+    }
+  }
 }
 
 void _mi_prof_init(void) {
   long rate = mi_option_get(mi_option_prof_sample_rate);
   if (rate <= 0) return;
   mi_lock_init(&mi_prof.lock);
-  mi_prof.rate = (size_t)rate;
+  mi_atomic_store_release(&mi_prof.rate, (size_t)rate);
   mi_prof_ht_grow(1024);
-  // enable on the current (main) thread; later theaps pick it up via _mi_prof_theap_init
-  mi_theap_t* th = _mi_theap_default();
-  if (th != NULL && th->tld != NULL) {
-    for (mi_theap_t* t = th->tld->theaps; t != NULL; t = t->tnext) mi_prof_set_theap(t, true);
-  }
+  mi_prof_set_all_theaps(true);
 }
 
 void mi_prof_reset(void) mi_attr_noexcept {
@@ -288,24 +316,14 @@ void mi_prof_reset(void) mi_attr_noexcept {
 
 void mi_prof_enable(size_t sample_rate_bytes) mi_attr_noexcept {
   if (sample_rate_bytes == 0) {
-    // disable: existing theaps lazily restore on next queue update
-    mi_prof.rate = 0;
-    mi_theap_t* th = _mi_theap_default();
-    if (th != NULL && th->tld != NULL) {
-      for (mi_theap_t* t = th->tld->theaps; t != NULL; t = t->tnext) {
-        t->prof_force_slow = false;
-        t->prof_countdown  = 0;
-      }
-    }
+    mi_atomic_store_release(&mi_prof.rate, 0);
+    mi_prof_set_all_theaps(false);
     return;
   }
-  if (mi_prof.rate == 0) mi_lock_init(&mi_prof.lock);
-  mi_prof.rate = sample_rate_bytes;
+  if (mi_atomic_load_relaxed(&mi_prof.rate) == 0) mi_lock_init(&mi_prof.lock);
+  mi_atomic_store_release(&mi_prof.rate, sample_rate_bytes);
   if (mi_prof.ht_cap == 0) mi_prof_ht_grow(1024);
-  mi_theap_t* th = _mi_theap_default();
-  if (th != NULL && th->tld != NULL) {
-    for (mi_theap_t* t = th->tld->theaps; t != NULL; t = t->tnext) mi_prof_set_theap(t, true);
-  }
+  mi_prof_set_all_theaps(true);
 }
 
 // ---------------------------------------------------------------------------
