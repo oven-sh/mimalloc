@@ -161,12 +161,37 @@ static uint8_t mi_prof_backtrace(uintptr_t* frames) {
     for (USHORT i = 0; i < n; i++) frames[i] = (uintptr_t)stack[i];
     return (uint8_t)n;
   #else
-    void* stack[MI_PROF_MAX_FRAMES + MI_PROF_SKIP_FRAMES];
-    int n = backtrace(stack, MI_PROF_MAX_FRAMES + MI_PROF_SKIP_FRAMES);
-    int skip = (n > MI_PROF_SKIP_FRAMES ? MI_PROF_SKIP_FRAMES : 0);
-    int take = n - skip; if (take > MI_PROF_MAX_FRAMES) take = MI_PROF_MAX_FRAMES;
-    for (int i = 0; i < take; i++) frames[i] = (uintptr_t)stack[i + skip];
-    return (uint8_t)take;
+    // Frame-pointer walk. Works on stripped binaries without .eh_frame as long
+    // as the program is built with -fno-omit-frame-pointer (Bun does; macOS arm64
+    // mandates it by ABI). ~10x faster than _Unwind_Backtrace.
+    // Layout (SysV x86_64 / AAPCS64): fp[0] = prev_fp, fp[1] = return_addr.
+    uintptr_t* fp = (uintptr_t*)__builtin_frame_address(0);
+    uintptr_t lo = (uintptr_t)fp;
+    uintptr_t hi = lo + (8 * 1024 * 1024);  // conservative upper bound on remaining stack
+    uint8_t n = 0, skip = MI_PROF_SKIP_FRAMES;
+    while (fp != NULL && (uintptr_t)fp >= lo && (uintptr_t)fp < hi
+           && ((uintptr_t)fp & (sizeof(void*)-1)) == 0
+           && n < MI_PROF_MAX_FRAMES)
+    {
+      uintptr_t ret = fp[1];
+      uintptr_t* prev = (uintptr_t*)fp[0];
+      if (ret == 0) break;
+      if (skip > 0) { skip--; }
+      else { frames[n++] = ret; }
+      if (prev <= fp) break;  // not strictly ascending -> end of chain or corrupt
+      fp = prev;
+    }
+    #if defined(__GLIBC__) || defined(__APPLE__)
+    // Fallback if FP chain yielded nothing (caller compiled with -fomit-frame-pointer):
+    // try DWARF/compact-unwind. Harmless if .eh_frame is stripped (returns ~0).
+    if (n == 0) {
+      void* stack[MI_PROF_MAX_FRAMES + MI_PROF_SKIP_FRAMES];
+      int bn = backtrace(stack, MI_PROF_MAX_FRAMES + MI_PROF_SKIP_FRAMES);
+      int sk = (bn > MI_PROF_SKIP_FRAMES ? MI_PROF_SKIP_FRAMES : 0);
+      for (int i = sk; i < bn && n < MI_PROF_MAX_FRAMES; i++) frames[n++] = (uintptr_t)stack[i];
+    }
+    #endif
+    return n;
   #endif
 }
 
