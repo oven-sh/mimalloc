@@ -794,7 +794,11 @@ if (MI_BUILD_TESTS)
   enable_testing()
 
   # static link tests
-  foreach(TEST_NAME api api-fill stress heap-mt heap-delete-race fork-user-heap commit-fail snapshot prof prof-adversarial theap-sentinel)
+  set(mi_static_tests api api-fill stress heap-mt heap-delete-race fork-user-heap snapshot prof prof-adversarial theap-sentinel)
+  if (MI_DEBUG_FULL OR CMAKE_BUILD_TYPE MATCHES "Debug")
+    list(APPEND mi_static_tests commit-fail)  # uses mi_debug_fail_os_commit_after (MI_DEBUG>0 only)
+  endif()
+  foreach(TEST_NAME ${mi_static_tests})
     add_executable(mimalloc-test-${TEST_NAME} test/test-${TEST_NAME}.c)
     target_compile_definitions(mimalloc-test-${TEST_NAME} PRIVATE ${mi_defines})
     target_compile_options(mimalloc-test-${TEST_NAME} PRIVATE ${mi_cflags})
