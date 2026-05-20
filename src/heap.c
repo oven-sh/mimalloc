@@ -57,18 +57,26 @@ static mi_decl_noinline mi_theap_t* mi_heap_init_theap(const mi_heap_t* const_he
 
   // create a fresh theap?
   if (theap==NULL) {
-    // set first an invalid value to ensure the thread local storage is allocated
-    if (!_mi_thread_local_set(heap->theap, (mi_theap_t*)1)) {
+    // Set first a non-NULL placeholder to ensure the thread-local storage is allocated.
+    // Use `&_mi_theap_empty_wrong` (not `(mi_theap_t*)1`): if `_mi_theap_create` /
+    // `_mi_theap_default_safe` re-enter `mi_heap_malloc(heap, ..)` on this thread,
+    // `_mi_heap_theap_get_or_init` will read this slot, treat it as initialized
+    // (≠NULL), and pass it to `_mi_theap_cached_set` → `_mi_theap_incref`, which
+    // dereferences `theap->memid.memkind`. `_mi_theap_empty_wrong` is a real
+    // static `mi_theap_t` with `memid.memkind == MI_MEM_STATIC`, so incref/decref
+    // no-op and `_mi_malloc_generic` returns NULL for it — whereas `(mi_theap_t*)1`
+    // faults at `1 + offsetof(memid.memkind)`.
+    if (!_mi_thread_local_set(heap->theap, (mi_theap_t*)&_mi_theap_empty_wrong)) {
       _mi_error_message(EFAULT, "unable to allocate memory for thread local storage\n");
       return NULL;
-    }    
+    }
     // then allocate the theap
     theap = _mi_theap_create(heap, _mi_theap_default_safe()->tld);
-    _mi_thread_local_set(heap->theap, theap);  // Cannot fail now as it was set before. Always set so the local is valid or NULL (and not 1)
+    _mi_thread_local_set(heap->theap, theap);  // Cannot fail now as it was set before. Always set so the local is valid or NULL (and not the placeholder)
     if (theap==NULL) {
       _mi_error_message(EFAULT, "unable to allocate memory for a thread local heap\n");
       return NULL;
-    }    
+    }
   }
   return theap;
 }
@@ -77,10 +85,18 @@ static mi_decl_noinline mi_theap_t* mi_heap_init_theap(const mi_heap_t* const_he
 // get the theap for a heap without initializing (and return NULL in that case)
 mi_theap_t* _mi_heap_theap_get_peek(const mi_heap_t* heap) {
   if (heap==NULL || _mi_is_heap_main(heap)) {
-    return _mi_theap_main_safe(); 
+    return _mi_theap_main_safe();
   }
   else {
-    return (mi_theap_t*)_mi_thread_local_get(heap->theap);
+    mi_theap_t* const theap = (mi_theap_t*)_mi_thread_local_get(heap->theap);
+    // Re-entered while `mi_heap_init_theap(heap)` is creating the theap on this
+    // thread — the slot still holds the reservation placeholder it wrote. Report
+    // "not yet initialized"; `_mi_heap_theap_get_or_init` will then call
+    // `mi_heap_init_theap`, which reads the slot directly, sees the (non-NULL)
+    // placeholder, and returns it without recursing — and `_mi_malloc_generic`
+    // returns NULL for `&_mi_theap_empty_wrong`.
+    if mi_unlikely(theap == (mi_theap_t*)&_mi_theap_empty_wrong) { return NULL; }
+    return theap;
   }
 }
 
