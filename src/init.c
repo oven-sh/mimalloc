@@ -169,6 +169,8 @@ mi_decl_cache_align const mi_theap_t _mi_theap_empty_wrong = {
 
 // Heap for the main thread
 
+#define MI_THREADID_INVALID ((mi_threadid_t)(~0))
+
 extern mi_decl_hidden mi_decl_cache_align mi_theap_t theap_main;
 extern mi_decl_hidden mi_decl_cache_align mi_heap_t  heap_main;
 
@@ -221,7 +223,7 @@ mi_decl_cache_align mi_heap_t heap_main
 mi_decl_hidden mi_decl_thread mi_theap_t* __mi_theap_main = NULL;
 
 mi_threadid_t _mi_thread_id(void) mi_attr_noexcept {
-  mi_threadid_t tid = _mi_prim_thread_id();
+  const mi_threadid_t tid = _mi_prim_thread_id();
   mi_assert_internal( (tid & 0x03) == 0 ); // mimalloc reserves the bottom 2 bits
   return tid;
 }
@@ -387,17 +389,11 @@ static mi_tld_t* mi_tld_alloc(void) {
 #define MI_TLD_INVALID  ((mi_tld_t*)1)
 
 mi_decl_noinline static void mi_tld_free(mi_tld_t* tld) {
-  mi_lock_done(&tld->theaps_lock);
-  if (tld != NULL && tld != MI_TLD_INVALID) {
-    mi_atomic_decrement_relaxed(&tld->subproc->thread_count);
-    _mi_meta_free(tld, sizeof(mi_tld_t), tld->memid);
-  }
-  #if 0
-  // do not read/write to `thread_tld` on older macOS <= 14 as that will re-initialize the thread local storage
-  // (since we are calling this during pthread shutdown)
-  // (and this could happen on other systems as well, so let's never do it)
-  thread_tld = MI_TLD_INVALID;
-  #endif
+  if (tld==NULL || tld==MI_TLD_INVALID) return; 
+  mi_atomic_decrement_relaxed(&tld->subproc->thread_count);
+  tld->thread_id = MI_THREADID_INVALID;              // note: not 0 as that would re-initialize tld_main
+  mi_lock_done(&tld->theaps_lock);  
+  _mi_meta_free(tld, sizeof(mi_tld_t), tld->memid);  // note: safe for static tld_main
 }
 
 // return the thread local heap ensuring it is initialized (and not `NULL` or `&_mi_theap_empty`);
@@ -969,6 +965,7 @@ void _mi_theap_cached_set(mi_theap_t* theap) {
 void _mi_theap_default_set(mi_theap_t* theap)  {
   mi_theap_t* const theap_old = _mi_theap_default();
   mi_assert_internal(theap != NULL);
+  mi_assert_internal(theap->tld != NULL);
   mi_assert_internal(theap->tld->thread_id==0 || theap->tld->thread_id==_mi_thread_id());
   mi_tls_slots_init();
   #if MI_TLS_MODEL_THREAD_LOCAL

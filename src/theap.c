@@ -178,6 +178,7 @@ void _mi_theap_init(mi_theap_t* theap, mi_heap_t* heap, mi_tld_t* tld)
 {
   mi_assert_internal(theap!=NULL);
   mi_assert_internal(heap!=NULL);
+  mi_assert_internal(tld!=NULL);
   mi_memid_t memid = theap->memid;
   _mi_memcpy_aligned(theap, &_mi_theap_empty, sizeof(mi_theap_t));
   theap->memid = memid;
@@ -292,7 +293,7 @@ void _mi_theap_incref(mi_theap_t* theap) {
 }
 
 void _mi_theap_decref(mi_theap_t* theap) {
-  if (theap!=NULL && theap->memid.memkind > MI_MEM_STATIC) {
+  if (theap!=NULL && !mi_memid_needs_no_free(theap->memid)) {
     if (mi_atomic_decrement_acq_rel(&theap->refcount) == 1) {
       mi_theap_free_mem(theap);
     }
@@ -344,6 +345,7 @@ bool _mi_theap_free(mi_theap_t* theap, bool acquire_heap_theaps_lock, bool acqui
                         else { mi_assert_internal(theap->tld->theaps == theap); theap->tld->theaps = theap->tnext; }
     theap->tnext = theap->tprev = NULL;
     if (acquire_tld_theaps_lock) { mi_lock_release(&theap->tld->theaps_lock); }
+
     theap->tld = NULL;
     // clear the per-thread cached theap if it is this one (this only catches the case where
     // the *current* thread is the one freeing; cross-thread callers cannot reach the owning
