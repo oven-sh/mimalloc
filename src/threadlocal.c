@@ -89,6 +89,18 @@ static mi_thread_locals_t* mi_thread_locals_expand(size_t least_idx) {
   if (count > MI_TLS_IDX_MAX) { return NULL; }  // too large
   mi_thread_locals_t* tls = (mi_thread_locals_t*)mi_rezalloc(tls_old, sizeof(mi_thread_locals_t) + count*sizeof(mi_tls_slot_t));
   if mi_unlikely(tls==NULL) return NULL;
+  // `mi_rezalloc` copies `mi_usable_size(old)` bytes of the old block — the live
+  // slots *plus* the uninitialized slack between the old requested size and the
+  // old bin size — and only zeroes beyond that. Under heap churn that slack holds
+  // whatever the previous tenant of the recycled page wrote, so without an
+  // explicit clear the new slots [count_old, count) can come up as arbitrary
+  // application bytes. `_mi_thread_local_get` validates a slot only by comparing
+  // its `version` lane against the key's version (a small sequential counter), so
+  // a garbage lane that happens to equal a live key's version makes the adjacent
+  // garbage lane get returned as a cached value — for the heap->theap cache that
+  // means dereferencing application data as a `mi_theap_t*`. Zero the new slot
+  // range explicitly. (See test/test-heap-churn.c for the reproduction.)
+  _mi_memzero(&tls->slots[count_old], (count - count_old)*sizeof(mi_tls_slot_t));
   tls->count = count;
   mi_thread_locals = tls;
   return tls;
