@@ -1179,7 +1179,6 @@ void _mi_process_fork_prepare(void) {
   // nest into arena_reserve_lock) must be taken before arena_reserve_lock.
   mi_lock_acquire(&subprocs_lock);
   _mi_thread_locals_fork_prepare();              // held across mi_rezalloc_aligned
-  mi_lock_acquire(&heap_main.arena_pages_lock);  // held across mi_malloc in mi_heap_ensure_arena_pages
   mi_lock_acquire(&subproc->heaps_lock);
   // Quiesce every heap's list locks, not just heap_main: _mi_theap_init/_mi_theap_free
   // mutate heap->theaps under heap->theaps_lock without taking subproc->heaps_lock.
@@ -1189,6 +1188,9 @@ void _mi_process_fork_prepare(void) {
     mi_lock_acquire(&h->theaps_lock);
     mi_lock_acquire(&h->os_abandoned_pages_lock);
   }
+  // heap_main last: a non-main heap's mi_heap_ensure_arena_pages (holding h->arena_pages_lock)
+  // can recurse into heap_main->arena_pages_lock via mi_heap_zalloc_aligned, so it must come after.
+  mi_lock_acquire(&heap_main.arena_pages_lock);
   mi_lock_acquire(&heap_main.theaps_lock);
   mi_lock_acquire(&heap_main.os_abandoned_pages_lock);
   mi_lock_acquire(&subproc->arena_reserve_lock);
@@ -1201,6 +1203,7 @@ void _mi_process_fork_parent(void) {
   mi_lock_release(&subproc->arena_reserve_lock);
   mi_lock_release(&heap_main.os_abandoned_pages_lock);
   mi_lock_release(&heap_main.theaps_lock);
+  mi_lock_release(&heap_main.arena_pages_lock);
   for (mi_heap_t* h = subproc->heaps; h != NULL; h = h->next) {
     if (h == &heap_main) continue;
     mi_lock_release(&h->os_abandoned_pages_lock);
@@ -1208,7 +1211,6 @@ void _mi_process_fork_parent(void) {
     mi_lock_release(&h->arena_pages_lock);
   }
   mi_lock_release(&subproc->heaps_lock);
-  mi_lock_release(&heap_main.arena_pages_lock);
   _mi_thread_locals_fork_parent();
   mi_lock_release(&subprocs_lock);
 }
