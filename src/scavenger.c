@@ -22,6 +22,7 @@ void _mi_scavenger_wake(mi_subproc_t* subproc) { MI_UNUSED(subproc); }
 #else
 
 #include <pthread.h>
+#include <signal.h>
 #include <time.h>
 
 #if defined(__linux__)
@@ -65,25 +66,37 @@ static void mi_scavenger_futex_wake(_Atomic(uint32_t)* addr) {
 
 static void* mi_scavenger_thread_main(void* arg) {
   MI_UNUSED(arg);
-  mi_subproc_t* const subproc = _mi_subproc();
+  // Use the main subproc directly: this thread never allocates, so don't
+  // initialise a theap/tld via _mi_subproc()'s TLS path.
+  mi_subproc_t* const subproc = _mi_subproc_main();
+  // Minimum spacing between purge attempts. _mi_arenas_try_purge can leave
+  // subproc->purge_expire at a stale past value while per-arena expiries are
+  // still in the future; without a floor this loop would spin until they pass.
+  const long arena_delay = mi_option_get(mi_option_purge_delay) * mi_option_get(mi_option_arena_purge_mult);
+  const mi_msecs_t min_wait_ms = (arena_delay >= 10 ? (mi_msecs_t)(arena_delay / 10) : 1);
   while (mi_atomic_load_acquire(&_mi_scavenger_running) != 0) {
-    const mi_msecs_t expire = mi_atomic_loadi64_acquire(&subproc->purge_expire);
-    if (mi_atomic_load_acquire(&subproc->scavenger_wake) == 0) {
-      mi_msecs_t timeout_ms;
-      if (expire == 0) {
-        timeout_ms = 1000;  // idle: wait for a signal (bounded so stop() takes effect)
+    mi_atomic_store_release(&subproc->scavenger_wake, (uint32_t)0);
+    mi_msecs_t expire = mi_atomic_loadi64_acquire(&subproc->purge_expire);
+    mi_msecs_t timeout_ms;
+    if (expire == 0) {
+      // Nothing scheduled: park until woken (bounded so stop() takes effect).
+      timeout_ms = 1000;
+    }
+    else {
+      const mi_msecs_t now = _mi_clock_now();
+      if (expire <= now) {
+        _mi_arenas_try_purge(false /* force */, true /* visit_all */, subproc, 0 /* tseq */);
+        expire = mi_atomic_loadi64_acquire(&subproc->purge_expire);
+        timeout_ms = (expire == 0 ? 1000 : (expire > now ? expire - now : min_wait_ms));
       }
       else {
-        const mi_msecs_t now = _mi_clock_now();
-        timeout_ms = (expire > now ? expire - now : 0);
-      }
-      if (timeout_ms > 0) {
-        mi_scavenger_futex_wait(&subproc->scavenger_wake, 0, timeout_ms);
+        timeout_ms = expire - now;
       }
     }
     if (mi_atomic_load_acquire(&_mi_scavenger_running) == 0) break;
-    mi_atomic_store_release(&subproc->scavenger_wake, (uint32_t)0);
-    _mi_arenas_try_purge(false /* force */, true /* visit_all */, subproc, 0 /* tseq */);
+    // Always wait: futex_wait(expected=0) returns immediately if a wake was
+    // already posted, and the timeout floor in the helper prevents a hot spin.
+    mi_scavenger_futex_wait(&subproc->scavenger_wake, 0, timeout_ms);
   }
   return NULL;
 }
@@ -99,6 +112,14 @@ void _mi_scavenger_start(void) {
   if (!mi_option_is_enabled(mi_option_scavenger)) return;
   if (mi_option_get(mi_option_purge_delay) <= 0) return;
   mi_atomic_store_release(&_mi_scavenger_running, (uintptr_t)1);
+  // Block all signals on the scavenger thread. It runs before the host has set
+  // up its own signal masking, and a thread that leaves (e.g.) SIGCHLD
+  // unblocked will have process-directed signals dispatched to it and silently
+  // discarded, starving signalfd/kqueue consumers. sigfillset on glibc/musl
+  // already excludes the libc-internal realtime signals used for setxid/cancel.
+  sigset_t all, old;
+  sigfillset(&all);
+  pthread_sigmask(SIG_SETMASK, &all, &old);
   pthread_attr_t attr;
   pthread_attr_init(&attr);
   pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
@@ -106,6 +127,7 @@ void _mi_scavenger_start(void) {
     mi_atomic_store_release(&_mi_scavenger_running, (uintptr_t)0);
   }
   pthread_attr_destroy(&attr);
+  pthread_sigmask(SIG_SETMASK, &old, NULL);
 }
 
 void _mi_scavenger_stop(void) {
