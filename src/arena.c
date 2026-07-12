@@ -2100,14 +2100,16 @@ static void mi_arena_schedule_purge(mi_arena_t* arena, size_t slice_index, size_
       // expiration was not yet set
       // maybe set the global arenas expire as well (if it wasn't set already)
       mi_assert_internal(expire0==0);
-      mi_atomic_casi64_strong_acq_rel(&arena->subproc->purge_expire, &expire0, expire);
+      if (mi_atomic_casi64_strong_acq_rel(&arena->subproc->purge_expire, &expire0, expire)) {
+        // subproc expire went 0 -> set: this is the only transition the scavenger
+        // actually needs to observe, so wake it here instead of on every free.
+        _mi_scavenger_wake(arena->subproc);
+      }
     }
     else {
       // already an expiration was set
     }
     mi_bitmap_setN(arena->slices_purge, slice_index, slice_count, NULL);
-    // signal the scavenger thread so purging happens even without further allocation
-    _mi_scavenger_wake(arena->subproc);
   }
 }
 

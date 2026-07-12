@@ -103,8 +103,12 @@ static void* mi_scavenger_thread_main(void* arg) {
 
 void _mi_scavenger_wake(mi_subproc_t* subproc) {
   if (mi_atomic_load_relaxed(&_mi_scavenger_running) == 0) return;
-  mi_atomic_store_release(&subproc->scavenger_wake, (uint32_t)1);
-  mi_scavenger_futex_wake(&subproc->scavenger_wake);
+  // Coalesce: only issue the futex syscall on the 0->1 edge. Callers sit on
+  // the page-free path and would otherwise turn every arena page free into a
+  // syscall on the freeing thread.
+  if (mi_atomic_exchange_acq_rel(&subproc->scavenger_wake, (uint32_t)1) == 0) {
+    mi_scavenger_futex_wake(&subproc->scavenger_wake);
+  }
 }
 
 void _mi_scavenger_start(void) {
