@@ -1267,7 +1267,6 @@ void _mi_arenas_page_unabandon(mi_page_t* page, mi_theap_t* current_theapx) {
   Arena free
 ----------------------------------------------------------- */
 static void mi_arena_schedule_purge(mi_arena_t* arena, size_t slice_index, size_t slices);
-static void mi_arenas_try_purge(bool force, bool visit_all, mi_subproc_t* subproc, size_t tseq);
 
 void _mi_arenas_free(void* p, size_t size, mi_memid_t memid) {
   if (p==NULL) return;
@@ -1323,12 +1322,12 @@ void _mi_arenas_free(void* p, size_t size, mi_memid_t memid) {
   }
 
   // try to purge expired decommits
-  // mi_arenas_try_purge(false, false, NULL);
+  // _mi_arenas_try_purge(false, false, NULL);
 }
 
 // Purge the arenas; if `force_purge` is true, amenable parts are purged even if not yet expired
 void _mi_arenas_collect(bool force_purge, bool visit_all, mi_tld_t* tld) {
-  mi_arenas_try_purge(force_purge, visit_all, tld->subproc, tld->thread_seq);
+  _mi_arenas_try_purge(force_purge, visit_all, tld->subproc, tld->thread_seq);
 }
 
 
@@ -1399,7 +1398,7 @@ static void mi_arenas_unsafe_destroy(mi_subproc_t* subproc) {
 // for dynamic libraries that are unloaded and need to release all their allocated memory.
 void _mi_arenas_unsafe_destroy_all(mi_subproc_t* subproc) {
   mi_arenas_unsafe_destroy(subproc);
-  // mi_arenas_try_purge(true /* force purge */, true /* visit all*/, subproc, 0 /* thread seq */);  // purge non-owned arenas
+  // _mi_arenas_try_purge(true /* force purge */, true /* visit all*/, subproc, 0 /* thread seq */);  // purge non-owned arenas
 }
 
 
@@ -2107,6 +2106,8 @@ static void mi_arena_schedule_purge(mi_arena_t* arena, size_t slice_index, size_
       // already an expiration was set
     }
     mi_bitmap_setN(arena->slices_purge, slice_index, slice_count, NULL);
+    // signal the scavenger thread so purging happens even without further allocation
+    _mi_scavenger_wake(arena->subproc);
   }
 }
 
@@ -2187,7 +2188,7 @@ static int mi_arena_try_purge(mi_arena_t* arena, mi_msecs_t now, bool force)
 }
 
 
-static void mi_arenas_try_purge(bool force, bool visit_all, mi_subproc_t* subproc, size_t tseq)
+void _mi_arenas_try_purge(bool force, bool visit_all, mi_subproc_t* subproc, size_t tseq)
 {
   // try purge can be called often so try to only run when needed
   const long delay = mi_arena_purge_delay();

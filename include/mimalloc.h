@@ -501,6 +501,7 @@ typedef enum mi_option_e {
   mi_option_arena_is_numa_local,        // experimental
   mi_option_snapshot_on_exit,           // write a heap snapshot on process exit (=0). 1=on, 2=on with per-block freemaps. Path from MIMALLOC_SNAPSHOT_PATH or "mimalloc-snapshot.<pid>.bin".
   mi_option_prof_sample_rate,           // bytes per heap-profile sample (=0, off). Typical: 524288. Dumps profile.proto on exit to MIMALLOC_PROF_PATH.
+  mi_option_scavenger,                  // run a background scavenger thread that purges freed arena memory when due (=1)
   _mi_option_last,
   // legacy option names
   mi_option_large_os_pages = mi_option_allow_large_os_pages,

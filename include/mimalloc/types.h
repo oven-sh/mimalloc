@@ -599,6 +599,7 @@ struct mi_subproc_s {
   mi_lock_t             arena_reserve_lock;             // lock to ensure arena's get reserved one at a time
   mi_decl_align(8)                                      // needed on some 32-bit platforms
   _Atomic(int64_t)      purge_expire;                   // expiration is set if any arenas can be purged
+  _Atomic(uint32_t)     scavenger_wake;                 // futex word signalled when a purge is scheduled (scavenger thread waits on this)
 
   _Atomic(mi_heap_t*)   heap_main;                      // main heap for this sub process
   mi_heap_t*            heaps;                          // heaps belonging to this sub-process

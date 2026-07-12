@@ -80,6 +80,7 @@ set(mi_sources
     src/page.c
     src/page-map.c
     src/random.c
+    src/scavenger.c
     src/stats.c
     src/theap.c
     src/threadlocal.c
