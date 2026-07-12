@@ -2214,6 +2214,7 @@ void _mi_arenas_try_purge(bool force, bool visit_all, mi_subproc_t* subproc, siz
     size_t max_purge_count = (visit_all ? max_arena : (max_arena/4)+1);
     bool all_visited = true;
     bool any_purged = false;
+    mi_msecs_t next_expire = 0;   // earliest still-pending per-arena expire
     for (size_t _i = 0; _i < max_arena; _i++) {
       size_t i = _i + arena_start;
       if (i >= max_arena) { i -= max_arena; }
@@ -2230,10 +2231,16 @@ void _mi_arenas_try_purge(bool force, bool visit_all, mi_subproc_t* subproc, siz
             max_purge_count--;
           }
         }
+        const mi_msecs_t aexpire = mi_atomic_loadi64_relaxed(&arena->purge_expire);
+        if (aexpire != 0 && (next_expire == 0 || aexpire < next_expire)) { next_expire = aexpire; }
       }
     }
-    if (all_visited && !any_purged) {
-      mi_atomic_storei64_release(&subproc->purge_expire, (mi_msecs_t)0);
+    MI_UNUSED(any_purged);
+    if (all_visited) {
+      // we saw every arena: subproc->purge_expire becomes the earliest pending
+      // per-arena expire (0 if none) so the scavenger's next wait is exact.
+      mi_msecs_t expected = arenas_expire;
+      mi_atomic_casi64_strong_acq_rel(&subproc->purge_expire, &expected, next_expire);
     }
   }
 }

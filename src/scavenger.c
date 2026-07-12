@@ -43,8 +43,7 @@ static _Atomic(uintptr_t) _mi_scavenger_running;  // 0 = not running, 1 = runnin
 #include <unistd.h>
 
 static void mi_scav_wait(_Atomic(uint32_t)* addr, mi_msecs_t timeout_ms) {
-  if (timeout_ms > 1000) timeout_ms = 1000;
-  if (timeout_ms <= 0)   timeout_ms = 1;
+  if (timeout_ms <= 0) timeout_ms = 1;
   struct timespec ts;
   ts.tv_sec  = (time_t)(timeout_ms / 1000);
   ts.tv_nsec = (long)((timeout_ms % 1000) * 1000000L);
@@ -78,8 +77,7 @@ extern int __ulock_wake(uint32_t operation, void* addr, uint64_t wake_value);
 #define MI_ULF_NO_ERRNO         0x01000000
 
 static void mi_scav_wait(_Atomic(uint32_t)* addr, mi_msecs_t timeout_ms) {
-  if (timeout_ms > 1000) timeout_ms = 1000;
-  if (timeout_ms <= 0)   timeout_ms = 1;
+  if (timeout_ms <= 0) timeout_ms = 1;
   const uint32_t timeout_us = (uint32_t)timeout_ms * 1000u;
   while (mi_atomic_load_acquire(addr) == 0) {
     const int rc = __ulock_wait(MI_UL_COMPARE_AND_WAIT | MI_ULF_NO_ERRNO, (void*)addr, 0, timeout_us);
@@ -111,8 +109,7 @@ VOID WINAPI WakeByAddressSingle(PVOID Address);
 #endif
 
 static void mi_scav_wait(_Atomic(uint32_t)* addr, mi_msecs_t timeout_ms) {
-  if (timeout_ms > 1000) timeout_ms = 1000;
-  if (timeout_ms <= 0)   timeout_ms = 1;
+  if (timeout_ms <= 0) timeout_ms = 1;
   uint32_t expected = 0;
   while (mi_atomic_load_acquire(addr) == 0) {
     if (!WaitOnAddress((volatile VOID*)addr, &expected, sizeof(uint32_t), (DWORD)timeout_ms)) {
@@ -137,8 +134,7 @@ static pthread_mutex_t _mi_scav_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t  _mi_scav_cond  = PTHREAD_COND_INITIALIZER;
 
 static void mi_scav_wait(_Atomic(uint32_t)* addr, mi_msecs_t timeout_ms) {
-  if (timeout_ms > 1000) timeout_ms = 1000;
-  if (timeout_ms <= 0)   timeout_ms = 1;
+  if (timeout_ms <= 0) timeout_ms = 1;
   struct timespec ts;
   #if defined(CLOCK_REALTIME)
   clock_gettime(CLOCK_REALTIME, &ts);
@@ -173,33 +169,34 @@ static void mi_scavenger_run(void) {
   // Use the main subproc directly: this thread never allocates, so don't
   // initialise a theap/tld via _mi_subproc()'s TLS path.
   mi_subproc_t* const subproc = _mi_subproc_main();
-  // Minimum spacing between purge attempts. _mi_arenas_try_purge can leave
-  // subproc->purge_expire at a stale past value while per-arena expiries are
-  // still in the future; without a floor this loop would spin until they pass.
-  const long arena_delay = mi_option_get(mi_option_purge_delay) * mi_option_get(mi_option_arena_purge_mult);
-  const mi_msecs_t min_wait_ms = (arena_delay >= 10 ? (mi_msecs_t)(arena_delay / 10) : 1);
   while (mi_atomic_load_acquire(&_mi_scavenger_running) != 0) {
     mi_atomic_store_release(&subproc->scavenger_wake, (uint32_t)0);
     mi_msecs_t expire = mi_atomic_loadi64_acquire(&subproc->purge_expire);
     mi_msecs_t timeout_ms;
     if (expire == 0) {
-      // Nothing scheduled: park until woken (bounded so stop() takes effect).
-      timeout_ms = 1000;
+      // Nothing scheduled: park until woken. The 30s bound is a pure safety
+      // net so stop() is guaranteed to take effect and any per-arena expiry
+      // that did not propagate to subproc is still eventually purged.
+      timeout_ms = 30000;
     }
     else {
       const mi_msecs_t now = _mi_clock_now();
-      if (expire <= now) {
-        _mi_arenas_try_purge(false /* force */, true /* visit_all */, subproc, 0 /* tseq */);
-        expire = mi_atomic_loadi64_acquire(&subproc->purge_expire);
-        timeout_ms = (expire == 0 ? 1000 : (expire > now ? expire - now : min_wait_ms));
+      if (expire > now) {
+        timeout_ms = expire - now;
+        if (timeout_ms > 30000) timeout_ms = 30000;
       }
       else {
-        timeout_ms = expire - now;
+        _mi_arenas_try_purge(false /* force */, true /* visit_all */, subproc, 0 /* tseq */);
+        // _mi_arenas_try_purge clears subproc->purge_expire to 0 once every
+        // arena is done. If it left the stale past value (some arena's own
+        // expire is still in the future), clear it so the next iteration parks
+        // on the 30s safety net instead of spinning. CAS so a concurrently
+        // scheduled future expire is never clobbered.
+        mi_atomic_casi64_strong_acq_rel(&subproc->purge_expire, &expire, (mi_msecs_t)0);
+        continue;
       }
     }
     if (mi_atomic_load_acquire(&_mi_scavenger_running) == 0) break;
-    // Always wait: mi_scav_wait returns immediately if a wake was already
-    // posted (scavenger_wake != 0), and the timeout floor prevents a hot spin.
     mi_scav_wait(&subproc->scavenger_wake, timeout_ms);
   }
 }
