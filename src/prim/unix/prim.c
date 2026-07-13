@@ -41,6 +41,13 @@ terms of the MIT license. A copy of the license can be found in the file
   #else
   #include <sys/mman.h>
   #endif
+  #if defined(__riscv) || defined(_M_RISCV)
+    #if defined(MI_HAS_SYS_HWPROBEH)
+      #include <sys/hwprobe.h>
+    #elif defined(MI_HAS_ASM_HWPROBEH)
+      #include <asm/hwprobe.h>
+    #endif
+  #endif
 #elif defined(__APPLE__)
   #include <AvailabilityMacros.h>
   #include <TargetConditionals.h>
@@ -150,13 +157,14 @@ static bool unix_detect_thp(void) {
   #if defined(__linux__)
   int fd = mi_prim_open("/sys/kernel/mm/transparent_hugepage/enabled", O_RDONLY);
   if (fd >= 0) {
-    char buf[32];
+    char buf[64];
     ssize_t nread = mi_prim_read(fd, &buf, sizeof(buf));
     mi_prim_close(fd);
     // <https://www.kernel.org/doc/html/latest/admin-guide/mm/transhuge.html>
     // between brackets is the current value, for example: always [madvise] never
     if (nread >= 1) {
-      thp_enabled = (_mi_strnstr(buf,32,"[never]") == NULL);
+      if (nread > 64) { nread = 64; }
+      thp_enabled = (_mi_strnstr(buf,nread,"[never]") == NULL);
     }
   }
   #endif
@@ -205,6 +213,40 @@ static void unix_detect_physical_memory( size_t page_size, size_t* physical_memo
   #endif
 }
 
+// Detect the virtual address bits (currently Linux/RISC-V only)
+static size_t unix_detect_virtual_address_bits(void) {
+  #if defined(__riscv) || defined(_M_RISCV)
+    #if defined(RISCV_HWPROBE_KEY_HIGHEST_VIRT_ADDRESS)
+      struct riscv_hwprobe probe = { .key = RISCV_HWPROBE_KEY_HIGHEST_VIRT_ADDRESS, };
+      // Prefer the GNU libc interface if available, as it can also use the VDSO
+      #if defined(MI_HAS_SYS_HWPROBEH)
+      if (__riscv_hwprobe(&probe, 1, 0, NULL, 0) == 0)
+      #else
+      if (syscall(__NR_riscv_hwprobe, &probe, 1, 0, NULL, 0) == 0)
+      #endif
+      {
+        if (probe.key != -1) { // If a key is unknown to the kernel, its key field will be cleared to -1.
+          return (MI_SIZE_BITS - mi_clz((uintptr_t)probe.value));
+        }
+      }
+    #endif
+    // Fallback to checking /proc/cpuinfo for older kernels
+    const int fd = mi_prim_open("/proc/cpuinfo", O_RDONLY);
+    if (fd >= 0) {
+      char buf[2048];
+      const ssize_t nread = mi_prim_read(fd, &buf, sizeof(buf));
+      mi_prim_close(fd);      
+      if ((nread >= 1) && (nread <= (ssize_t)sizeof(buf))) {
+        if (_mi_strnstr(buf, nread, "sv39")) { return 39; }
+        else if (_mi_strnstr(buf, nread, "sv48")) { return 48; }
+        else if (_mi_strnstr(buf, nread, "sv57")) { return 57; }
+      }
+    }
+  #endif // riscv
+  // default
+  return MI_MAX_VABITS;
+}
+
 void _mi_prim_mem_init( mi_os_mem_config_t* config )
 {
   long psize = sysconf(_SC_PAGESIZE);
@@ -218,6 +260,7 @@ void _mi_prim_mem_init( mi_os_mem_config_t* config )
   config->has_partial_free = true;    // mmap can free in parts
   config->has_virtual_reserve = true; // todo: check if this true for NetBSD?  (for anonymous mmap with PROT_NONE)
   config->has_transparent_huge_pages = unix_detect_thp();
+  config->virtual_address_bits = unix_detect_virtual_address_bits();
 
   // disable transparent huge pages for this process?
   #if (defined(__linux__) || defined(__ANDROID__)) && defined(PR_GET_THP_DISABLE)
@@ -603,7 +646,7 @@ int _mi_prim_alloc_huge_os_pages(void* hint_addr, size_t size, int numa_node, bo
     long err = mi_prim_mbind(*addr, size, MPOL_PREFERRED, &numa_mask, 8*MI_INTPTR_SIZE, 0);
     if (err != 0) {
       err = errno;
-      _mi_warning_message("failed to bind huge (1GiB) pages to numa node %d (error: %d (0x%x))\n", numa_node, err, err);
+      _mi_warning_message("failed to bind huge (1GiB) pages to numa node %d (error: %ld (0x%lx))\n", numa_node, err, err);
     }
   }
   return (*addr != NULL ? 0 : errno);
@@ -837,28 +880,28 @@ static char** mi_get_environ(void) {
   return environ;
 }
 #endif
-bool _mi_prim_getenv(const char* name, char* result, size_t result_size) {
-  if (name==NULL) return false;
+int _mi_prim_getenv(const char* name, char* result, size_t result_size) {
+  if (name==NULL) return -1;
   const size_t len = _mi_strlen(name);
-  if (len == 0) return false;
+  if (len == 0) return -1;
   char** env = mi_get_environ();
-  if (env == NULL) return false;
+  if (env == NULL) return -1;
   // compare up to 10000 entries
   for (int i = 0; i < 10000 && env[i] != NULL; i++) {
     const char* s = env[i];
     if (_mi_strnicmp(name, s, len) == 0 && s[len] == '=') { // case insensitive
       // found it
       _mi_strlcpy(result, s + len + 1, result_size);
-      return true;
+      return 1;  // success
     }
   }
-  return false;
+  return 0; // not found
 }
 #else
 // fallback: use standard C `getenv` but this cannot be used while initializing the C runtime
-bool _mi_prim_getenv(const char* name, char* result, size_t result_size) {
+int _mi_prim_getenv(const char* name, char* result, size_t result_size) {
   // cannot call getenv() when still initializing the C runtime.
-  if (_mi_preloading()) return false;
+  if (_mi_preloading()) return -1;  // error, try again later
   const char* s = getenv(name);
   if (s == NULL) {
     // we check the upper case name too.
@@ -870,9 +913,9 @@ bool _mi_prim_getenv(const char* name, char* result, size_t result_size) {
     buf[len] = 0;
     s = getenv(buf);
   }
-  if (s == NULL || _mi_strnlen(s,result_size) >= result_size)  return false;
+  if (s == NULL || _mi_strnlen(s,result_size) >= result_size)  return 0; // not found
   _mi_strlcpy(result, s, result_size);
-  return true;
+  return 1;  // success
 }
 #endif  // !MI_USE_ENVIRON
 

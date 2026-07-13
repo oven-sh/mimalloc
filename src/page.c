@@ -58,13 +58,13 @@ void _mi_page_purged_reset(mi_page_t* page) {
 }
 
 static inline size_t mi_page_block_index(const mi_page_t* page, const mi_block_t* block) {
-  mi_assert_internal((uint8_t*)block >= page->page_start);
-  return ((size_t)((uint8_t*)block - page->page_start)) / page->block_size;
+  mi_assert_internal((uint8_t*)block >= mi_page_start(page));
+  return ((size_t)((uint8_t*)block - mi_page_start(page))) / page->block_size;
 }
 
 static inline mi_block_t* mi_page_block_index_at(const mi_page_t* page, size_t idx) {
   mi_assert_internal(idx < page->capacity);
-  return (mi_block_t*)(page->page_start + (idx * page->block_size));
+  return (mi_block_t*)(mi_page_start(page) + (idx * page->block_size));
 }
 
 static inline void mi_page_purged_clear(mi_page_t* page, size_t k) {
@@ -76,7 +76,7 @@ static inline void mi_page_purged_clear(mi_page_t* page, size_t k) {
 static inline void mi_page_block_os_pages(const mi_page_t* page, size_t idx, size_t* kfirst, size_t* klast) {
   const size_t os_size = _mi_os_page_size();
   const uintptr_t base = mi_page_purge_base(page);
-  const uintptr_t lo = (uintptr_t)page->page_start + (idx * page->block_size);
+  const uintptr_t lo = (uintptr_t)mi_page_start(page) + (idx * page->block_size);
   *kfirst = (size_t)(lo - base) / os_size;
   *klast = (size_t)((lo + page->block_size - 1) - base) / os_size;
 }
@@ -84,7 +84,7 @@ static inline void mi_page_block_os_pages(const mi_page_t* page, size_t idx, siz
 // the blocks that overlap OS page `k`, or `false` if that OS page is not entirely inside
 // the *committed* block area (see `_mi_page_purge_os_page_blocks`)
 static bool mi_page_os_page_blocks(const mi_page_t* page, size_t k, size_t* first, size_t* last) {
-  return _mi_page_purge_os_page_blocks(_mi_os_page_size(), page->block_size, (uintptr_t)page->page_start,
+  return _mi_page_purge_os_page_blocks(_mi_os_page_size(), page->block_size, (uintptr_t)mi_page_start(page),
                                        page->capacity, k, first, last);
 }
 
@@ -109,7 +109,7 @@ size_t _mi_page_purged_count(const mi_page_t* page) {
 
 #if (MI_DEBUG>=3)
 static size_t mi_page_list_count(mi_page_t* page, mi_block_t* head) {
-  mi_assert_internal(_mi_ptr_page(page->page_start) == page);
+  mi_assert_internal(_mi_ptr_page(mi_page_start(page)) == page);
   const uint8_t* slice_start = mi_page_slice_start(page);
   mi_assert_internal(_mi_is_aligned(slice_start,MI_PAGE_ALIGN));
   size_t count = 0;
@@ -534,7 +534,7 @@ static void mi_page_unformed_tail_range(const mi_page_t* page, uintptr_t* lo, ui
   *lo = 0; *hi = 0;
   if (page->capacity >= page->reserved) return;    // no tail
   const size_t os_size = _mi_os_page_size();
-  const uintptr_t pstart = (uintptr_t)page->page_start;
+  const uintptr_t pstart = (uintptr_t)mi_page_start(page);
   const uintptr_t tlo = pstart + ((size_t)page->capacity * page->block_size);
   uintptr_t thi = pstart + ((size_t)page->reserved * page->block_size);
   const uintptr_t climit = pstart + mi_page_committed(page);   // never discard memory that is not committed
@@ -557,7 +557,7 @@ static void mi_page_purge_unformed_tail(mi_page_t* page) {
   uintptr_t lo, hi;
   mi_page_unformed_tail_range(page, &lo, &hi);
   if (lo >= hi) return;
-  const uintptr_t pstart = (uintptr_t)page->page_start;
+  const uintptr_t pstart = (uintptr_t)mi_page_start(page);
   mi_assert_internal(hi - pstart <= UINT32_MAX);   // only a huge page can be that big, and it has no tail
   if (hi - pstart > UINT32_MAX) return;
 
@@ -587,7 +587,7 @@ static void mi_page_purge_unformed_tail(mi_page_t* page) {
 void _mi_page_unpurge_unformed_upto(mi_page_t* page, uintptr_t end) {
   if (_mi_page_unformed_purged_bytes(page) == 0) return;
   const size_t os_size = _mi_os_page_size();
-  const uintptr_t pstart = (uintptr_t)page->page_start;
+  const uintptr_t pstart = (uintptr_t)mi_page_start(page);
   const uintptr_t rlo = pstart + page->unformed_purged_lo;
   const uintptr_t rhi = pstart + page->unformed_purged_hi;
   uintptr_t rend;
@@ -805,7 +805,7 @@ static bool mi_holes_block_is_free(const mi_page_t* page, const uint64_t* freeli
 static void mi_page_holes_granularity_curve(const mi_page_t* page, const uint64_t* freelisted, mi_holes_report_t* rep) {
   const size_t bs = page->block_size;
   const size_t cap = page->capacity;
-  const uintptr_t pstart = (uintptr_t)page->page_start;
+  const uintptr_t pstart = (uintptr_t)mi_page_start(page);
   const uintptr_t pend = pstart + (cap * bs);
   for (size_t g = 0; g < MI_HOLES_GRAN_COUNT; g++) {
     const size_t gran = mi_holes_granularity(g);
@@ -863,7 +863,7 @@ void _mi_page_holes_report_page(const mi_page_t* page, mi_holes_report_t* rep) {
   }
 
   const size_t os_size = _mi_os_page_size();
-  const uintptr_t pstart = (uintptr_t)page->page_start;
+  const uintptr_t pstart = (uintptr_t)mi_page_start(page);
   const uintptr_t pend = pstart + (cap * bs);
   const uintptr_t base = mi_page_purge_base(page);
   const size_t nbits = mi_page_purge_bits(page);
@@ -1548,14 +1548,15 @@ static bool mi_page_extend_free(mi_theap_t* theap, mi_page_t* page) {
       if (!_mi_os_commit(mi_page_slice_start(page) + page->slice_committed, needed_commit - page->slice_committed, NULL)) {
         return false;
       }
-      page->slice_committed = needed_commit;
+      mi_assert_internal(needed_commit < UINT32_MAX);
+      page->slice_committed = (uint32_t)needed_commit;
     }
   }
 
   // The blocks we are about to format may sit in the discarded unformed tail: hand that memory
   // back to the OS *before* the first free-list pointer is written into it (on macOS a discarded
   // page stays reclaimable by the kernel, and stays charged to the process, until it is REUSE'd).
-  _mi_page_unpurge_unformed_upto(page, (uintptr_t)page->page_start + ((size_t)page->capacity + extend) * bsize);
+  _mi_page_unpurge_unformed_upto(page, (uintptr_t)mi_page_start(page) + ((size_t)page->capacity + extend) * bsize);
 
   // and append the extend the free list
   if (extend < MI_MIN_SLICES || MI_SECURE<2) { //!mi_option_is_enabled(mi_option_secure)) {
@@ -1593,7 +1594,7 @@ mi_decl_nodiscard bool _mi_page_init(mi_theap_t* theap, mi_page_t* page) {
   #endif
   #if MI_DEBUG>2
   if (page->memid.initially_zero) {
-    mi_track_mem_defined(page->page_start, mi_page_committed(page));
+    mi_track_mem_defined(mi_page_start(page), mi_page_committed(page));
     mi_assert_expensive(mi_mem_is_zero(page_start, mi_page_committed(page)));
   }
   #endif

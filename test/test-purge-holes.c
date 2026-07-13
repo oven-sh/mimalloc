@@ -650,7 +650,7 @@ static bool test_unformed_tail(void) {
 
   // the discarded range must lie strictly inside the unformed tail: never the page header,
   // never a formed block, never past the end of the page
-  const uintptr_t pstart = (uintptr_t)page->page_start;
+  const uintptr_t pstart = (uintptr_t)mi_page_start(page);
   if (discarded > 0) {
     const uintptr_t lo = pstart + page->unformed_purged_lo;
     const uintptr_t hi = pstart + page->unformed_purged_hi;
@@ -880,7 +880,7 @@ static bool expect_page(mi_page_t* page, const uint64_t* live, expect_t* e) {
   const size_t os = _mi_os_page_size();
   const size_t bs = page->block_size;
   const size_t cap = page->capacity;
-  const uintptr_t pstart = (uintptr_t)page->page_start;
+  const uintptr_t pstart = (uintptr_t)mi_page_start(page);
   const uintptr_t pend = pstart + (cap * bs);
   const uintptr_t base = pstart & ~(uintptr_t)(os - 1);
   const size_t nbits = (size_t)(((pstart + mi_page_size(page)) - base + os - 1) / os);
@@ -981,7 +981,7 @@ static bool test_holes_report(int mode) {
     size_t nmine = 0;
     for (size_t i = 0; i < REPORT_N; i++) {
       if (ptrs[i] == NULL || _mi_ptr_page(ptrs[i]) != page) continue;
-      const size_t idx = (size_t)((uint8_t*)ptrs[i] - page->page_start) / bs;
+      const size_t idx = (size_t)((uint8_t*)ptrs[i] - mi_page_start(page)) / bs;
       live[idx / 64] |= ((uint64_t)1 << (idx % 64));
       nmine++;
     }

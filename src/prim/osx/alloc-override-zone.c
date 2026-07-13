@@ -218,7 +218,10 @@ static kern_return_t mi_zone_enum_remote_page(task_t task, memory_reader_t reade
   const size_t bsize  = lpage.block_size;
   if (bsize == 0 || lpage.capacity == 0) return KERN_SUCCESS;
   const size_t ubsize = bsize - MI_PADDING_SIZE;
-  const vm_address_t pstart = (vm_address_t)lpage.page_start;
+  // `lpage` is a local copy of a page that lives in the TARGET process, so the block start
+  // must be rebuilt from the remote page address -- mi_page_start(&lpage) would offset from
+  // our own copy. (Upstream dropped the cached `page_start` field in favour of `page_woffset`.)
+  const vm_address_t pstart = (vm_address_t)(rpage + ((size_t)lpage.page_woffset * MI_SIZE_SIZE));
 
   if (e->type_mask & MALLOC_PTR_REGION_RANGE_TYPE) {
     mi_zone_enum_flush(e, MALLOC_PTR_IN_USE_RANGE_TYPE);
@@ -411,6 +414,11 @@ static boolean_t intro_zone_locked(malloc_zone_t* zone) {
   MI_UNUSED(zone);
   return (mi_zone_locked_pid != -1 && mi_zone_locked_pid == getpid());
 }
+
+// Required whenever the zone advertises version >= 9: macOS calls this from the
+// atfork_child handler (_malloc_fork_child) without a NULL check. mimalloc keeps
+// no zone-level locks that need reinitializing after fork, so a no-op is safe.
+// Leaving it NULL makes the forked child jump to address 0 and crash in fork().
 
 
 /* ------------------------------------------------------

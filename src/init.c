@@ -30,14 +30,14 @@ const mi_page_t _mi_page_empty = {
   NULL,                   // local_free
   MI_ATOMIC_VAR_INIT(0),  // xthread_free
   0,                      // block_size
-  NULL,                   // page_start
+  0,                      // page_woffset
+  MI_ARENA_SLICE_SIZE,    // page_committed
   #if (MI_PADDING || MI_ENCODE_FREELIST)
   { 0, 0 },               // keys
   #endif
   NULL,                   // theap
   NULL,                   // heap
   NULL, NULL,             // next, prev
-  MI_ARENA_SLICE_SIZE,    // page_committed
   MI_MEMID_STATIC,        // memid
   { 0 },                  // purged
   0,                      // unformed_purged_lo
@@ -122,6 +122,7 @@ mi_decl_cache_align const mi_theap_t _mi_theap_empty = {
   &tld_empty,             // tld
   MI_ATOMIC_VAR_INIT(NULL), // heap
   MI_ATOMIC_VAR_INIT(1),  // refcount
+  MI_ATOMIC_VAR_INIT(0),  // freed
   0,                      // heartbeat
   0,                      // cookie
   { {0}, {0}, 0, true },  // random
@@ -148,6 +149,7 @@ mi_decl_cache_align const mi_theap_t _mi_theap_empty_wrong = {
   &tld_empty,             // tld
   MI_ATOMIC_VAR_INIT(NULL), // heap
   MI_ATOMIC_VAR_INIT(1),  // refcount
+  MI_ATOMIC_VAR_INIT(0),  // freed
   0,                      // heartbeat
   0,                      // cookie
   { {0}, {0}, 0, true },  // random
@@ -193,6 +195,7 @@ mi_decl_cache_align mi_theap_t theap_main = {
   &tld_main,              // thread local data
   MI_ATOMIC_VAR_INIT(&heap_main), // main heap
   MI_ATOMIC_VAR_INIT(1),  // refcount
+  MI_ATOMIC_VAR_INIT(0),  // freed
   0,                      // heartbeat
   0,                      // initial cookie
   { {0x846ca68b}, {0}, 0, true },  // random
@@ -395,6 +398,8 @@ mi_decl_noinline static void mi_tld_free(mi_tld_t* tld) {
   if (tld==NULL || tld==MI_TLD_INVALID) return; 
   mi_atomic_decrement_relaxed(&tld->subproc->thread_count);
   tld->thread_id = MI_THREADID_INVALID;              // note: not 0 as that would re-initialize tld_main
+                                                     // we also need to set an invalid tid for tld_main as sometimes the same thread-id
+                                                     // is reused by the OS after a thread has terminated. (see issue #1287)
   mi_lock_done(&tld->theaps_lock);  
   _mi_meta_free(tld, sizeof(mi_tld_t), tld->memid);  // note: safe for static tld_main
 }
@@ -435,7 +440,7 @@ mi_subproc_t* _mi_subproc(void) {
   //       on such systems we can check for this with the _mi_prim_get_default_theap as those are protected (by being
   //       stored in a TLS slot for example)
   mi_theap_t* theap = _mi_theap_default();
-  if (theap == NULL) {
+  if (theap == NULL || theap->tld == NULL) {  // see issue #1289
     return _mi_subproc_main();
   }
   else {
@@ -444,14 +449,14 @@ mi_subproc_t* _mi_subproc(void) {
 }
 
 mi_heap_t* _mi_subproc_heap_main(mi_subproc_t* subproc) {
-  mi_heap_t* heap = mi_atomic_load_ptr_relaxed(mi_heap_t,&subproc->heap_main);
+  mi_heap_t* heap = mi_atomic_load_ptr_acquire(mi_heap_t,&subproc->heap_main);
   if mi_likely(heap!=NULL) {
     return heap;
   }
   else {
     mi_heap_main_init();
-    mi_assert_internal(mi_atomic_load_relaxed(&subproc->heap_main) != NULL);
-    return mi_atomic_load_ptr_relaxed(mi_heap_t,&subproc->heap_main);
+    mi_assert_internal(mi_atomic_load_ptr_acquire(mi_heap_t,&subproc->heap_main) != NULL);
+    return mi_atomic_load_ptr_acquire(mi_heap_t,&subproc->heap_main);
   }
 }
 
@@ -802,6 +807,8 @@ mi_decl_cold mi_decl_noinline mi_theap_t* _mi_theap_empty_get(void) {
 #define MI_TLS_EXPANSION_SLOTS          (1024)
 
 #if !MI_WIN_DIRECT_TLS
+// we initially use the last of the expansion slots as the default NULL.
+// note: this will fail if the program allocates exactly 1024+64 slots with TlsAlloc :-( (but this is quite unlikely)
 #define MI_TLS_INITIAL_SLOT             MI_TLS_EXPANSION_SLOT
 #define MI_TLS_INITIAL_EXPANSION_SLOT   (MI_TLS_EXPANSION_SLOTS-1)
 #else
@@ -811,8 +818,6 @@ mi_decl_cold mi_decl_noinline mi_theap_t* _mi_theap_empty_get(void) {
 #define MI_TLS_INITIAL_EXPANSION_SLOT   (0)
 #endif
 
-// we initially use the last of the expansion slots as the default NULL.
-// note: this will fail if the program allocates exactly 1024+64 slots with TlsAlloc (which is quite unlikely)
 mi_decl_hidden mi_decl_cache_align size_t _mi_theap_default_slot = MI_TLS_INITIAL_SLOT;
 mi_decl_hidden size_t _mi_theap_default_expansion_slot = MI_TLS_INITIAL_EXPANSION_SLOT;
 mi_decl_hidden size_t _mi_theap_cached_slot            = MI_TLS_INITIAL_SLOT;

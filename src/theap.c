@@ -109,10 +109,8 @@ static bool mi_theap_page_collect(mi_theap_t* theap, mi_page_queue_t* pq, mi_pag
 }
 
 static void mi_theap_merge_stats(mi_theap_t* theap) {
-  // theap->heap can be NULLed concurrently by _mi_theap_free (theap.c:304) between
-  // mi_theap_collect_ex's entry check and here; _mi_theap_free will merge stats itself.
+  mi_assert_internal(mi_theap_is_initialized(theap));
   mi_heap_t* const heap = _mi_theap_heap(theap);
-  if (heap == NULL) return;
   _mi_stats_merge_into(&heap->stats, &theap->stats);
 }
 
@@ -305,6 +303,14 @@ mi_theap_t* mi_theap_get_default(void) {
   return theap;
 }
 
+mi_theap_t* mi_theap_set_default(mi_theap_t* theap) {
+  mi_theap_t* const previous = mi_theap_get_default();
+  if (mi_theap_is_initialized(theap)) {
+    _mi_theap_default_set(theap);
+  }
+  return previous;
+}
+
 // todo: make order of parameters consistent (but would that break compat with CPython?)
 void _mi_theap_init(mi_theap_t* theap, mi_heap_t* heap, mi_tld_t* tld)
 {
@@ -314,8 +320,9 @@ void _mi_theap_init(mi_theap_t* theap, mi_heap_t* heap, mi_tld_t* tld)
   mi_memid_t memid = theap->memid;
   _mi_memcpy_aligned(theap, &_mi_theap_empty, sizeof(mi_theap_t));
   theap->memid = memid;
-  theap->refcount = 1;
   theap->tld   = tld;  // avoid reading the thread-local tld during initialization
+  mi_atomic_store_release(&theap->refcount,1);
+  mi_atomic_store_release(&theap->freed,0);
   mi_atomic_store_ptr_relaxed(mi_heap_t,&theap->heap,heap);
   mi_assert_internal(theap->stats.size == sizeof(mi_stats_t));
   
@@ -418,6 +425,7 @@ static void mi_theap_free_mem(mi_theap_t* theap) {
   }
 }
 
+// we need to reference count theaps due to the _mi_theap_cached thread locals
 void _mi_theap_incref(mi_theap_t* theap) {
   if (theap!=NULL && theap->memid.memkind > MI_MEM_STATIC) {
     mi_atomic_increment_acq_rel(&theap->refcount);
@@ -438,26 +446,27 @@ bool _mi_theap_free(mi_theap_t* theap, bool acquire_heap_theaps_lock, bool acqui
   mi_assert(theap != NULL);
   if (theap==NULL) return true;
 
-  mi_heap_t* const heap = mi_atomic_exchange_ptr_acq_rel(mi_heap_t, &theap->heap, NULL);
-  if (heap==NULL) {
+  // ensure only one thread actually frees the theap
+  const size_t freed = mi_atomic_exchange_acq_rel( &theap->freed, 1 );
+  if (freed!=0) {
     // concurrent interaction, retry in an outer loop (as the other thread may be blocked on our lock)
     return false;
   }
   else {
-    // We won the exchange. Before doing any blocking work, secure both inner locks with try-acquire
-    // so the caller's retry loop can fire under contention. (Blocking here
-    // while the caller still holds its outer lock can complete a wait-for
-    // cycle with another `mi_heap_delete`, thread exit, or `_mi_process_fork_prepare`.)
+    // We won the `freed` exchange, so we own the free. Before doing any blocking work, secure
+    // both inner locks with try-acquire so the caller's retry loop can fire under contention.
+    // (Blocking here while the caller still holds its outer lock can complete a wait-for cycle
+    // with another `mi_heap_delete`, thread exit, or `_mi_process_fork_prepare`.)
+    mi_heap_t* const heap = _mi_theap_heap(theap);
     bool got_hlock = !acquire_heap_theaps_lock;
     bool got_tlock = !acquire_tld_theaps_lock;
     if (acquire_heap_theaps_lock) { got_hlock = mi_lock_try_acquire(&heap->theaps_lock); }
     if (got_hlock && acquire_tld_theaps_lock) { got_tlock = mi_lock_try_acquire(&theap->tld->theaps_lock); }
     if (!got_hlock || !got_tlock) {
-      // back out: restore the heap pointer (it must still be NULL since we hold ownership)
+      // back out: release what we took and give the claim back, so the retry can win it again.
+      // (`theap->heap` is untouched here -- it is only NULLed once the free actually completes.)
       if (got_hlock && acquire_heap_theaps_lock) { mi_lock_release(&heap->theaps_lock); }
-      mi_heap_t* expected = NULL;
-      const bool restored = mi_atomic_cas_ptr_strong_acq_rel(mi_heap_t, &theap->heap, &expected, heap);
-      mi_assert_internal(restored); MI_UNUSED(restored);
+      mi_atomic_store_release(&theap->freed, (size_t)0);
       return false;  // caller releases its outer lock, yields, and retries
     }
 
@@ -478,6 +487,11 @@ bool _mi_theap_free(mi_theap_t* theap, bool acquire_heap_theaps_lock, bool acqui
     theap->tnext = theap->tprev = NULL;
     if (acquire_tld_theaps_lock) { mi_lock_release(&theap->tld->theaps_lock); }
 
+    // Set heap to NULL only after we are removed from the thread local theaps list since
+    // we may concurrently traverse it to collect (in `init.c:mi_thread_theaps_done`)
+    // (We need to set it to NULL to avoid an ABA problem where the _mi_theap_cached
+    // has a heap address that is reused for a newly allocated heap.)
+    mi_atomic_store_ptr_release(mi_heap_t, &theap->heap, NULL);
     theap->tld = NULL;
     // clear the per-thread cached theap if it is this one (this only catches the case where
     // the *current* thread is the one freeing; cross-thread callers cannot reach the owning
@@ -838,6 +852,11 @@ bool _mi_theap_area_visit_blocks(const mi_heap_area_t* area, mi_page_t* page, mi
   return true;
 }
 
+bool _mi_page_visit_blocks( mi_page_t* page, mi_block_visit_fun* visitor, void* arg ) {
+  mi_heap_area_t area;
+  _mi_heap_area_init(&area, page);
+  return _mi_theap_area_visit_blocks(&area, page, visitor, arg);
+}
 
 
 // Separate struct to keep `mi_page_t` out of the public interface
