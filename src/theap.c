@@ -188,6 +188,7 @@ static void mi_theap_purge_holes(mi_theap_t* theap) mi_attr_noexcept {
 
 static void mi_purge_holes(void) mi_attr_noexcept {
   if (!mi_option_is_enabled(mi_option_purge_holes)) return;
+  _mi_page_purge_holes_sweep_begin();  // decides whether this sweep skips unchanged pages
   _mi_page_holes_reset_ineligible();   // the ineligible counters are a gauge over this sweep
   mi_theap_t* const theap0 = _mi_theap_default();
   if (theap0 == NULL || !mi_theap_is_initialized(theap0) || theap0->tld == NULL) return;

@@ -184,6 +184,7 @@ static mi_option_desc_t mi_options[_mi_option_last] =
   { 1,   MI_OPTION_UNINIT, MI_OPTION(scavenger) },                // run a background scavenger thread that purges freed arena memory when due (=1)
   { 1,   MI_OPTION_UNINIT, MI_OPTION(purge_holes) },              // discard free blocks inside a still-used page (=1)
   { 0,   MI_OPTION_UNINIT, MI_OPTION(purge_holes_eager_zero) },   // zero a hole before discarding it (=0; for testing)
+  { 64,  MI_OPTION_UNINIT, MI_OPTION(purge_holes_full_every) },   // every N'th sweep walks every page, not just the changed ones (=64, 0=never)
 };
 
 static void mi_option_init(mi_option_desc_t* desc);

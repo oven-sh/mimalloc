@@ -226,6 +226,7 @@ typedef struct mi_purge_holes_stats_s {
   // skipped without its free list being walked at all (see `_mi_page_purge_holes`).
   size_t pages_skipped;         // pages skipped that way (monotonic)
   size_t blocks_visited;        // free-list blocks the sweep did walk (monotonic): what the skip avoids
+  size_t full_sweeps;           // sweeps that walked every page anyway (`purge_holes_full_every`)
 } mi_purge_holes_stats_t;
 
 mi_decl_export void mi_purge_holes_stats_get(mi_purge_holes_stats_t* stats) mi_attr_noexcept;
@@ -554,6 +555,7 @@ typedef enum mi_option_e {
   mi_option_scavenger,                  // run a background scavenger thread that purges freed arena memory when due (=1)
   mi_option_purge_holes,                // discard the memory of free blocks inside a still-used page (=1)
   mi_option_purge_holes_eager_zero,     // zero a hole before discarding it, so that an over-discard destroys data even on an OS that reclaims lazily (=0; for testing -- always on when MI_DEBUG>1)
+  mi_option_purge_holes_full_every,     // every N'th idle sweep walks every page instead of skipping the unchanged ones (=64, 0=never). See `_mi_page_purge_holes`.
   _mi_option_last,
   // legacy option names
   mi_option_large_os_pages = mi_option_allow_large_os_pages,

@@ -47,6 +47,7 @@ typedef struct hole_stats_s {
   int64_t unformed_reuses;
   int64_t pages_skipped;      // pages the sweep skipped because nothing changed in them
   int64_t visited;            // free-list blocks the sweep walked
+  int64_t full_sweeps;        // sweeps that walked every page regardless
 } hole_stats_t;
 
 static hole_stats_t hole_stats(void) {
@@ -68,6 +69,7 @@ static hole_stats_t hole_stats(void) {
   h.unformed_reuses   = (int64_t)s.unformed_reuse_calls;
   h.pages_skipped     = (int64_t)s.pages_skipped;
   h.visited           = (int64_t)s.blocks_visited;
+  h.full_sweeps       = (int64_t)s.full_sweeps;
   return h;
 }
 
@@ -1256,6 +1258,8 @@ done:
 
 static bool test_sweep_skip(void) {
   const size_t os = _mi_os_page_size();
+  const long full_every = mi_option_get(mi_option_purge_holes_full_every);
+  mi_option_set(mi_option_purge_holes_full_every, 0);   // no periodic full walk: this tests the skip itself
   void** ptrs = (void**)calloc(SKIP_N, sizeof(void*));
   uint64_t* live = NULL;
   expect_t e;
@@ -1399,6 +1403,7 @@ static bool test_sweep_skip(void) {
           (long long)(s3.pages_skipped - s0.pages_skipped));
 
 done:
+  mi_option_set(mi_option_purge_holes_full_every, full_every);
   if (ptrs != NULL) {
     for (size_t i = 0; i < SKIP_N; i++) { if (ptrs[i] != NULL) mi_free(ptrs[i]); }
     free(ptrs);
@@ -1415,10 +1420,12 @@ done:
 static bool test_sweep_no_unpurge_on_collect(void) {
   const size_t os = _mi_os_page_size();
   const size_t n = 256;
+  const long full_every = mi_option_get(mi_option_purge_holes_full_every);
+  mi_option_set(mi_option_purge_holes_full_every, 0);   // a full sweep would legitimately walk again
   void** ptrs = (void**)calloc(n, sizeof(void*));
   hole_stats_t s1, s2;
   bool ok = true;
-  if (ptrs == NULL) return false;
+  if (ptrs == NULL) { mi_option_set(mi_option_purge_holes_full_every, full_every); return false; }
 
   for (size_t i = 0; i < n; i++) {
     ptrs[i] = mi_malloc(os);
@@ -1457,8 +1464,95 @@ static bool test_sweep_no_unpurge_on_collect(void) {
   }
 
 done:
+  mi_option_set(mi_option_purge_holes_full_every, full_every);
   for (size_t i = 0; i < n; i++) { if (ptrs[i] != NULL) mi_free(ptrs[i]); }
   free(ptrs);
+  return ok;
+}
+
+// ---------------------------------------------------------------------------
+// the skip cannot lose memory forever
+//
+// `(capacity,used)` cannot see a page that CHURNED: as many frees as allocs between two sweeps
+// leaves `used` where it was, but the set of free blocks -- and so the set of discardable OS
+// pages -- can be different. A steady-state server can sit at the same `used` at every park, so
+// the miss would never heal on its own. `purge_holes_full_every` bounds it: every N'th sweep
+// walks every page whatever its state says.
+//
+// The churn is built by hand (free a live block, then stamp back the `(capacity,used)` a churned
+// page would have) because we cannot make the allocator hand us a replacement block out of one
+// chosen page. The state it stamps is one a real balanced churn produces.
+// ---------------------------------------------------------------------------
+
+#define BOUND_N       (2048)
+#define BOUND_SZ      (512)
+#define BOUND_EVERY   (8)      // full sweep every 8th
+
+static bool test_sweep_full_every(void) {
+  const long full_every = mi_option_get(mi_option_purge_holes_full_every);
+  void** ptrs = (void**)calloc(BOUND_N, sizeof(void*));
+  mi_page_t* page = NULL;
+  hole_stats_t s0, s1;
+  bool ok = true;
+  int swept = 0;
+  if (ptrs == NULL) { ok = false; goto done; }
+  mi_option_set(mi_option_purge_holes_full_every, 0);
+
+  for (size_t i = 0; i < BOUND_N; i++) {
+    ptrs[i] = mi_malloc(BOUND_SZ);
+    if (ptrs[i] == NULL) { ok = false; goto done; }
+  }
+  for (size_t i = 0; i < BOUND_N; i++) {
+    if ((i % 64) != 0) { mi_free(ptrs[i]); ptrs[i] = NULL; }   // 1 live block per pinned OS page
+  }
+  mi_on_thread_idle();   // sweep: discards what it can, leaves the pinned OS pages alone
+  page = _mi_ptr_page(ptrs[0]);
+
+  // free a live block -- some OS page in this page may now be entirely free -- and then stamp the
+  // page's swept state back to what it is NOW, which is exactly what a balanced churn (this free
+  // plus one allocation elsewhere in the page) would have left behind. The `(capacity,used)` check
+  // is blind to it by construction.
+  for (size_t i = 0; i < BOUND_N; i++) {
+    if (ptrs[i] != NULL && _mi_ptr_page(ptrs[i]) == page) { mi_free(ptrs[i]); ptrs[i] = NULL; break; }
+  }
+  s0 = hole_stats();
+  page->swept_state = (((uint32_t)page->capacity) << 16) | (uint32_t)page->used;
+
+  // with no periodic full sweep the page is now wedged: no amount of parking finds the hole
+  for (int r = 0; r < BOUND_EVERY * 2; r++) { mi_on_thread_idle(); }
+  s1 = hole_stats();
+  if (purging_enabled && (s1.visited != s0.visited || s1.full_sweeps != s0.full_sweeps)) {
+    fprintf(stderr, "\n  the churned page was not actually hidden from the sweep (visited %lld, full %lld)\n",
+            (long long)(s1.visited - s0.visited), (long long)(s1.full_sweeps - s0.full_sweeps));
+    ok = false; goto done;
+  }
+
+  // ...and the periodic full sweep is what unwedges it, within N parks
+  mi_option_set(mi_option_purge_holes_full_every, BOUND_EVERY);
+  s0 = hole_stats();
+  for (swept = 1; swept <= BOUND_EVERY; swept++) {
+    mi_on_thread_idle();
+    s1 = hole_stats();
+    if (s1.full_sweeps > s0.full_sweeps) break;
+  }
+  if (purging_enabled) {
+    if (s1.full_sweeps != s0.full_sweeps + 1 || swept > BOUND_EVERY) {
+      fprintf(stderr, "\n  no full sweep in %d parks with purge_holes_full_every=%d\n", swept, BOUND_EVERY);
+      ok = false; goto done;
+    }
+    if (s1.visited <= s0.visited) {
+      fprintf(stderr, "\n  the full sweep walked no free list, so it cannot have found the hidden hole\n");
+      ok = false; goto done;
+    }
+    fprintf(stderr, "(hidden hole found by the full sweep after %d parks) ", swept);
+  }
+
+done:
+  mi_option_set(mi_option_purge_holes_full_every, full_every);
+  if (ptrs != NULL) {
+    for (size_t i = 0; i < BOUND_N; i++) { if (ptrs[i] != NULL) mi_free(ptrs[i]); }
+    free(ptrs);
+  }
   return ok;
 }
 
@@ -1550,6 +1644,7 @@ int main(void) {
   CHECK("unformed-tail-freed", test_unformed_tail_freed());
   CHECK("sweep-skips-unchanged-pages", test_sweep_skip());
   CHECK("sweep-does-not-unpurge-on-collect", test_sweep_no_unpurge_on_collect());
+  CHECK("sweep-full-every-bounds-a-missed-hole", test_sweep_full_every());
 
   // everything above is freed by now, so every hole must have been handed back
   mi_collect(true);

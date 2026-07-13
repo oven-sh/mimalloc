@@ -814,6 +814,7 @@ void          _mi_page_holes_count_ineligible(const mi_page_t* page);
 void          _mi_page_holes_reset_ineligible(void);
 void          _mi_page_purge_holes_begin(void);
 void          _mi_page_purge_holes_end(void);
+void          _mi_page_purge_holes_sweep_begin(void);   // once per idle sweep, before its passes
 
 // ------------------------------------------------------
 // Hole report  (`mi_purge_holes_report`, see the "Hole report" section in `page.c`)
