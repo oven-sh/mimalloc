@@ -540,6 +540,7 @@ typedef enum mi_option_e {
   mi_option_scavenger,                  // run a background scavenger thread that purges freed arena memory when due (=1)
   mi_option_purge_holes,                // discard the memory of free blocks inside a still-used page (=1)
   mi_option_purge_holes_eager_zero,     // zero a hole before discarding it, so that an over-discard destroys data even on an OS that reclaims lazily (=0; for testing -- always on when MI_DEBUG>1)
+  mi_option_page_drain_sparse,          // don't allocate from a (small) page whose used count fell below 1/N of capacity; let it drain empty and be freed (=0, off; try 8)
   _mi_option_last,
   // legacy option names
   mi_option_large_os_pages = mi_option_allow_large_os_pages,

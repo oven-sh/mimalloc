@@ -1517,6 +1517,11 @@ static mi_decl_noinline mi_page_t* mi_page_queue_find_free_ex(mi_theap_t* theap,
   size_t count = 0;
   long candidate_limit = 0;          // we reset this on the first candidate to limit the search
   long page_full_retain = (pq->block_size > MI_SMALL_MAX_OBJ_SIZE ? 0 : theap->page_full_retain); // only retain small pages
+  // drain-sparse: never re-seed a nearly-empty (small) page -- let its survivors die out so the
+  // page empties and is freed, instead of each allocation generation re-pinning every page.
+  // Disabled on the retry pass so memory pressure can still use every page.
+  const long drain_div = (first_try && pq->block_size <= MI_SMALL_MAX_OBJ_SIZE ? _mi_option_get_fast(mi_option_page_drain_sparse) : 0);
+  long sparse_skips = 0;
   mi_page_t* page_candidate = NULL;  // a page with free space
   mi_page_t* page = pq->first;
 
@@ -1544,6 +1549,13 @@ static mi_decl_noinline mi_page_t* mi_page_queue_find_free_ex(mi_theap_t* theap,
         mi_assert_internal(!mi_page_is_in_full(page) && !mi_page_immediate_available(page));
         mi_page_to_full(page, pq);
       }
+    }
+    else if (drain_div > 0 && page->used > 0 && !mi_page_is_expandable(page)
+             && (long)page->used * drain_div < (long)page->capacity) {
+      // sparse page: skip it (do not break on its free space); an all-free page (used == 0)
+      // stays eligible below -- it can be re-seeded densely or freed.
+      sparse_skips++;
+      if (sparse_skips >= 32 && page_candidate == NULL) break; // all sparse so far: give up, take a fresh page
     }
     else {
       // the page has free space, make it a candidate
