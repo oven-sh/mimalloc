@@ -667,13 +667,16 @@ void _mi_page_unpurge_unformed_upto(mi_page_t* page, uintptr_t end) {
 
 
 // Walk the free list of a page and discard every OS page in it that holds no live block.
-static void mi_page_purge_holes_walk(mi_page_t* page) {
-  if (page->free == NULL) return;                         // nothing to take off the free list
+// Returns false if any discard failed: those blocks went straight back on the free list and the
+// page must be swept again, so the caller must not record it as swept.
+static bool mi_page_purge_holes_walk(mi_page_t* page) {
+  if (page->free == NULL) return true;                    // nothing to take off the free list
 
   const size_t os_size = _mi_os_page_size();
   const size_t nbits = mi_page_purge_bits(page);
   mi_assert_internal(nbits <= MI_PAGE_PURGE_BITS);
-  if (nbits > MI_PAGE_PURGE_BITS) return;
+  if (nbits > MI_PAGE_PURGE_BITS) return true;
+  bool complete = true;
 
   // 1. count, per OS page, the blocks on the free list that overlap it
   uint16_t nfree[MI_PAGE_PURGE_BITS];
@@ -712,7 +715,7 @@ static void mi_page_purge_holes_walk(mi_page_t* page) {
     todo[k / 64] |= ((uint64_t)1 << (k % 64));
     ntodo++;
   }
-  if (ntodo == 0) return;
+  if (ntodo == 0) return true;   // nothing discardable: the page IS fully swept
 
   // 3. rebuild the free list without the blocks that are about to lose memory. This must
   //    happen *before* the discard: it walks `next` pointers that live in the very memory
@@ -750,8 +753,10 @@ static void mi_page_purge_holes_walk(mi_page_t* page) {
     else {
       // the discard failed: the memory is intact, so hand these blocks straight back
       mi_page_unpurge_range(page, k0, k - 1, false /* nothing was discarded, so no reuse */);
+      complete = false;
     }
   }
+  return complete;
 }
 
 // Discard the memory of the free blocks in a still-used page.
@@ -787,10 +792,16 @@ void _mi_page_purge_holes(mi_page_t* page) {
     mi_holes_sweep_skipped++;   // nothing was allocated or freed in this page since we swept it
     return;
   }
-  mi_page_purge_holes_walk(page);
   // Record the state we LEAVE the page in, read back from the page: a nested `mi_malloc` (see
   // `mi_purging_holes`) may have taken a block out of it while we walked.
-  page->swept_state = mi_page_sweep_state(page);
+  //
+  // Only if the walk got everything. A failed `_mi_os_discard` (ENOMEM under pressure) puts its
+  // blocks straight back, and changes neither `capacity` nor `used` -- so recording here would
+  // say "already swept" for a page that still has holes, and the skip check would then park them
+  // until the next full sweep, or forever with `purge_holes_full_every=0`.
+  if (mi_page_purge_holes_walk(page)) {
+    page->swept_state = mi_page_sweep_state(page);
+  }
 }
 
 // Bring the first run of discarded OS pages back onto the free list. Only that run is
