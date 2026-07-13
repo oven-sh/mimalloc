@@ -231,10 +231,15 @@ static void stress(intptr_t tid) {
       void* q = atomic_exchange_ptr(&transfer[transfer_idx], p);
       data[data_idx] = q;
     }
+    // note: draw from the rng unconditionally, or the std-malloc baseline runs a different
+    // allocation sequence than the mimalloc build and the two are no longer comparable.
+    const bool do_purge_holes = chance(1, &r);
     #ifndef USE_STD_MALLOC
-    if (chance(1, &r)) {
+    if (do_purge_holes) {
       mi_purge_holes();   // 1% discard the free blocks inside still-used pages
     }
+    #else
+    (void)do_purge_holes;
     #endif
   }
 

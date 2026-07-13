@@ -19,6 +19,7 @@ terms of the MIT license. A copy of the license can be found in the file
 #include <stdint.h>
 
 #include "mimalloc.h"
+#include "mimalloc-stats.h"
 #include "mimalloc/internal.h"   // _mi_ptr_page, _mi_page_purged_count, _mi_page_purge_run_range
 
 #include "testhelper.h"
@@ -28,6 +29,29 @@ static bool purging_enabled = true;   // MIMALLOC_PURGE_HOLES
 // ---------------------------------------------------------------------------
 // helpers
 // ---------------------------------------------------------------------------
+
+// the process-wide hole-purging counters
+typedef struct hole_stats_s {
+  int64_t bytes_now;      // bytes discarded right now
+  int64_t bytes_total;    // bytes ever discarded
+  int64_t blocks_now;     // blocks held off the free lists right now
+  int64_t discards;       // discard syscalls
+  int64_t reuses;         // reuse syscalls
+  int64_t pages_freed;    // pages the sweep found all-free and gave back to the arena
+} hole_stats_t;
+
+static hole_stats_t hole_stats(void) {
+  mi_purge_holes_stats_t s;
+  mi_purge_holes_stats_get(&s);
+  hole_stats_t h;
+  h.bytes_now   = (int64_t)s.purged_bytes;
+  h.bytes_total = (int64_t)s.purged_bytes_total;
+  h.blocks_now  = (int64_t)s.purged_blocks;
+  h.discards    = (int64_t)s.discard_calls;
+  h.reuses      = (int64_t)s.reuse_calls;
+  h.pages_freed = (int64_t)s.pages_freed;
+  return h;
+}
 
 // a byte pattern that depends on both the block and the offset, so a hole
 // punched one OS page too far in either direction shows up as a mismatch.
@@ -61,6 +85,26 @@ static size_t purged_blocks(void** ptrs, size_t n) {
     total += _mi_page_purged_count(page);
   }
   return total;
+}
+
+// every test that depends on a purge asserts one actually happened (or, with the feature
+// off, that none did) -- otherwise the test passes vacuously when the pages turn out to be
+// ineligible or the sweep no-ops.
+static bool expect_purged(hole_stats_t before, const char* what) {
+  const hole_stats_t after = hole_stats();
+  const long long dbytes = (long long)(after.bytes_total - before.bytes_total);
+  const long long ddisc  = (long long)(after.discards - before.discards);
+  if (purging_enabled) {
+    if (dbytes <= 0 || ddisc <= 0) {
+      fprintf(stderr, "\n  %s: NOTHING was purged (bytes=%lld, discards=%lld)\n", what, dbytes, ddisc);
+      return false;
+    }
+  }
+  else if (dbytes != 0 || ddisc != 0) {
+    fprintf(stderr, "\n  %s: purging is off but %lld bytes were discarded in %lld calls\n", what, dbytes, ddisc);
+    return false;
+  }
+  return true;
 }
 
 static uint32_t rng_state = 0x853c49e6;
@@ -221,6 +265,7 @@ static bool test_churn(void) {
 static bool test_aligned(void) {
   enum { N = 128, ALIGN = 16384 };
   void* ptrs[N];
+  const hole_stats_t before = hole_stats();
   for (size_t i = 0; i < N; i++) {
     ptrs[i] = mi_malloc_aligned(ALIGN, ALIGN);
     if (ptrs[i] == NULL) return false;
@@ -233,6 +278,15 @@ static bool test_aligned(void) {
   // free every other block, punch holes, then take the blocks back out of the bitmap
   for (size_t i = 1; i < N; i += 2) { mi_free(ptrs[i]); ptrs[i] = NULL; }
   mi_purge_holes();
+
+  // these 16KB blocks must actually have been discarded (this is the JSC MarkedBlock case)
+  if (!expect_purged(before, "aligned-16k")) return false;
+  const size_t npurged = purged_blocks(ptrs, N);
+  if (purging_enabled && npurged == 0) {
+    fprintf(stderr, "\n  aligned-16k: no block of these pages is discarded\n");
+    return false;
+  }
+  if (!purging_enabled && npurged != 0) return false;
 
   for (size_t i = 1; i < N; i += 2) {
     ptrs[i] = mi_malloc_aligned(ALIGN, ALIGN);
@@ -264,6 +318,7 @@ static bool test_page_lifecycle(void) {
   enum { N = 512, SZ = 8192 };
   void** ptrs = (void**)calloc(N, sizeof(void*));
   if (ptrs == NULL) return false;
+  const hole_stats_t before = hole_stats();
 
   for (size_t i = 0; i < N; i++) {
     ptrs[i] = mi_malloc(SZ);
@@ -275,6 +330,16 @@ static bool test_page_lifecycle(void) {
     if ((i % 8) != 0) { mi_free(ptrs[i]); ptrs[i] = NULL; }
   }
   mi_purge_holes();
+
+  // the pages we are about to recycle must really carry holes, or the test below
+  // (which is what would catch a MEM_DECOMMIT on Windows) proves nothing
+  if (!expect_purged(before, "page-lifecycle")) { free(ptrs); return false; }
+  const size_t npurged = purged_blocks(ptrs, N);
+  if (purging_enabled && npurged == 0) {
+    fprintf(stderr, "\n  page-lifecycle: no block of these pages is discarded\n");
+    free(ptrs);
+    return false;
+  }
 
   // now free the survivors: the pages (holes and all) return to the arena
   for (size_t i = 0; i < N; i++) {
@@ -300,7 +365,74 @@ static bool test_page_lifecycle(void) {
 }
 
 // ---------------------------------------------------------------------------
-// 5. option off == no-op
+// 5. abandoned pages: a thread exits while blocks in its pages are still live, so
+//    the pages end up in the arena's abandoned list with no owning thread. This is
+//    where most of the holes are (every page that ever became full is abandoned),
+//    so `mi_purge_holes` must reach them.
+// ---------------------------------------------------------------------------
+
+#define ABANDON_N   (256)
+#define ABANDON_SZ  (8192)
+static void* abandoned_ptrs[ABANDON_N];
+
+static void run_one_thread(void (*fun)(void));   // joins; defined at the bottom
+
+static void abandoned_worker(void) {
+  for (size_t i = 0; i < ABANDON_N; i++) {
+    abandoned_ptrs[i] = mi_malloc(ABANDON_SZ);
+    if (abandoned_ptrs[i] != NULL) { pattern_fill(abandoned_ptrs[i], ABANDON_SZ, i); }
+  }
+  // keep one live block in every 64KB page (8 blocks of 8KB); the rest become holes
+  for (size_t i = 0; i < ABANDON_N; i++) {
+    if ((i % 8) != 0) { mi_free(abandoned_ptrs[i]); abandoned_ptrs[i] = NULL; }
+  }
+  // the thread now exits: the pages are abandoned with a live block in each
+}
+
+static bool test_abandoned(void) {
+  const hole_stats_t before = hole_stats();
+  memset(abandoned_ptrs, 0, sizeof(abandoned_ptrs));
+  run_one_thread(&abandoned_worker);
+
+  mi_purge_holes();
+
+  const size_t npurged = purged_blocks(abandoned_ptrs, ABANDON_N);
+  if (purging_enabled) {
+    if (!expect_purged(before, "abandoned-pages")) return false;
+    if (npurged == 0) {
+      fprintf(stderr, "\n  the abandoned pages of the exited thread were not purged\n");
+      return false;
+    }
+  }
+  else if (npurged != 0) {
+    fprintf(stderr, "\n  purging is off but %zu abandoned blocks were discarded\n", npurged);
+    return false;
+  }
+
+  // the survivors in those pages must be intact and writable
+  for (size_t i = 0; i < ABANDON_N; i++) {
+    if (abandoned_ptrs[i] == NULL) continue;
+    const size_t bad = pattern_check(abandoned_ptrs[i], ABANDON_SZ, i);
+    if (bad != ABANDON_SZ) {
+      fprintf(stderr, "\n  CORRUPT survivor in abandoned page: block %zu at offset %zu\n", i, bad);
+      return false;
+    }
+    memset(abandoned_ptrs[i], 0x3C, ABANDON_SZ);
+  }
+  // re-use the holes from this thread (they are reclaimed on allocation)
+  void* re[ABANDON_N];
+  for (size_t i = 0; i < ABANDON_N; i++) {
+    re[i] = mi_malloc(ABANDON_SZ);
+    if (re[i] == NULL) return false;
+    memset(re[i], 0x5E, ABANDON_SZ);
+  }
+  for (size_t i = 0; i < ABANDON_N; i++) { mi_free(re[i]); }
+  for (size_t i = 0; i < ABANDON_N; i++) { if (abandoned_ptrs[i] != NULL) { mi_free(abandoned_ptrs[i]); abandoned_ptrs[i] = NULL; } }
+  return true;
+}
+
+// ---------------------------------------------------------------------------
+// 6. option off == no-op
 // ---------------------------------------------------------------------------
 
 static bool test_option_off(void) {
@@ -418,10 +550,47 @@ static bool test_run_arithmetic(void) {
 }
 
 // ---------------------------------------------------------------------------
+// portable "run one thread and join" (mirrors test-stress.c)
+// ---------------------------------------------------------------------------
+
+#ifdef _WIN32
+#include <windows.h>
+static void (*thread_fun)(void);
+static DWORD WINAPI thread_entry(LPVOID param) {
+  (void)param;
+  thread_fun();
+  return 0;
+}
+static void run_one_thread(void (*fun)(void)) {
+  thread_fun = fun;
+  DWORD tid = 0;
+  HANDLE h = CreateThread(0, 8*1024L, &thread_entry, NULL, 0, &tid);
+  if (h == NULL) return;
+  WaitForSingleObject(h, INFINITE);
+  CloseHandle(h);
+}
+#else
+#include <pthread.h>
+static void* thread_entry(void* param) {
+  ((void (*)(void))param)();
+  return NULL;
+}
+static void run_one_thread(void (*fun)(void)) {
+  pthread_t t;
+  if (pthread_create(&t, NULL, &thread_entry, (void*)(uintptr_t)fun) != 0) return;
+  pthread_join(t, NULL);
+}
+#endif
+
+// ---------------------------------------------------------------------------
 
 int main(void) {
   mi_version();
   purging_enabled = mi_option_is_enabled(mi_option_purge_holes);
+  // Zero every hole before it is discarded. Without this the survivor checks below are
+  // VACUOUS in a release build on macOS: MADV_FREE_REUSABLE is lazy, so a discard that
+  // wrongly covers a live block leaves its data intact until the kernel reclaims the page.
+  mi_option_set(mi_option_purge_holes_eager_zero, 1);
   fprintf(stderr, "purge_holes is %s, os page size is %zu\n",
           (purging_enabled ? "ON" : "OFF"), (size_t)_mi_os_page_size());
 
@@ -451,9 +620,17 @@ int main(void) {
   CHECK("churn-no-aliasing", test_churn());
   CHECK("aligned-16k", test_aligned());
   CHECK("page-lifecycle", test_page_lifecycle());
+  CHECK("abandoned-pages", test_abandoned());
   CHECK("option-off-is-noop", test_option_off());
 
+  // everything above is freed by now, so every hole must have been handed back
   mi_collect(true);
+  const hole_stats_t end = hole_stats();
+  fprintf(stderr, "holes: %lld bytes discarded in total over %lld discards / %lld reuses; %lld pages freed by the sweep; %lld bytes still discarded\n",
+          (long long)end.bytes_total, (long long)end.discards, (long long)end.reuses,
+          (long long)end.pages_freed, (long long)end.bytes_now);
+  CHECK("no-holes-outstanding-at-exit", (end.bytes_now == 0 && end.blocks_now == 0));
+
   mi_stats_print(NULL);
   return print_test_summary();
 }
