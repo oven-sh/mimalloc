@@ -60,6 +60,13 @@ int _mi_prim_commit(void* addr, size_t size, bool* is_zero);
 // pre: needs_recommit != NULL
 int _mi_prim_decommit(void* addr, size_t size, bool* needs_recommit);
 
+// Like `_mi_prim_decommit`, but additionally report whether the range is GUARANTEED to read
+// back as zero when next touched (`*is_zero`). Claiming zero for memory that can come back
+// stale hands one allocation's bytes to the next, so only set it when the OS documents the
+// guarantee (Linux MADV_DONTNEED on private anonymous mappings; Darwin MADV_ZERO). A
+// conservative implementation forwards to `_mi_prim_decommit` with `*is_zero = false`.
+int _mi_prim_decommit_zero(void* addr, size_t size, bool* needs_recommit, bool* is_zero);
+
 // Reset memory. The range keeps being accessible but the content might be reset to zero at any moment.
 // Returns error code or 0 on success.
 int _mi_prim_reset(void* addr, size_t size);

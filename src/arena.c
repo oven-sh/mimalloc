@@ -2222,7 +2222,22 @@ static bool mi_arena_purge(mi_arena_t* arena, size_t slice_index, size_t slice_c
   size_t already_committed;
   mi_bitmap_setN(arena->slices_committed, slice_index, slice_count, &already_committed); // pretend all committed.. (as we lack a clearN call that counts the already set bits..)
   const bool all_committed = (already_committed == slice_count);
-  const bool needs_recommit = _mi_os_purge_ex(p, size, all_committed /* allow reset? */, mi_size_of_slices(already_committed), arena->commit_fun, arena->commit_fun_arg);
+  bool needs_recommit;
+  if (arena->commit_fun != NULL) {
+    // externally managed memory (a host-provided arena): we do not know what its commit
+    // callback does to the contents, so never claim zero.
+    needs_recommit = _mi_os_purge_ex(p, size, all_committed /* allow reset? */, mi_size_of_slices(already_committed), arena->commit_fun, arena->commit_fun_arg);
+  }
+  else {
+    bool is_zero = false;
+    needs_recommit = _mi_os_purge_zero(p, size, mi_size_of_slices(already_committed), &is_zero);
+    if (is_zero) {
+      // The OS guarantees this range reads back zero, so forget that it was ever dirty: the
+      // next `mi_arenas_alloc` hands it out with `initially_zero`, `mi_zalloc` skips the
+      // memset, and pages the caller never writes are never made resident again.
+      mi_bitmap_clearN(arena->slices_dirty, slice_index, slice_count);
+    }
+  }
 
   if (needs_recommit) {
     // no longer committed

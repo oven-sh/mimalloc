@@ -559,6 +559,53 @@ int _mi_prim_decommit(void* start, size_t size, bool* needs_recommit) {
   return err;
 }
 
+#if defined(__APPLE__) && defined(MADV_ZERO)
+// MADV_ZERO may be defined but unsupported by the running kernel (ENOTSUP), and can fail
+// per-call (e.g. on CoW ranges after fork). Probe once, then fall back per-call on failure.
+// (Same approach as WebKit's pas_page_malloc / bmalloc VMAllocate.)
+static bool unix_madv_zero_supported(void) {
+  static _Atomic(int) supported;  // 0 = unknown, 1 = yes, -1 = no
+  int s = mi_atomic_load_relaxed(&supported);
+  if (s == 0) {
+    void* probe = mmap(NULL, _mi_os_page_size(), PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, unix_mmap_fd(), 0);
+    if (probe == MAP_FAILED) return false;  // transient: do not latch
+    const int rc = madvise(probe, _mi_os_page_size(), MADV_ZERO);
+    s = ((rc == 0 || errno != ENOTSUP) ? 1 : -1);
+    munmap(probe, _mi_os_page_size());
+    mi_atomic_store_release(&supported, s);
+  }
+  return (s > 0);
+}
+#endif
+
+int _mi_prim_decommit_zero(void* start, size_t size, bool* needs_recommit, bool* is_zero) {
+  *is_zero = false;
+  #if !MI_DEBUG && MI_SECURE<=2
+  #if defined(__linux__)
+    // MADV_DONTNEED on a private anonymous mapping is documented to zero-fill on refault.
+    // Arena memory is always our own MAP_PRIVATE|MAP_ANONYMOUS mmap; externally managed
+    // memory goes through commit callbacks and never reaches this primitive.
+    const int err = unix_madvise(start, size, MADV_DONTNEED);
+    if (err == 0) { *is_zero = true; }
+    *needs_recommit = false;
+    return err;
+  #elif defined(__APPLE__) && defined(MADV_ZERO)
+    // MADV_ZERO zeroes in place (no accounting change); MADV_FREE_REUSABLE then releases the
+    // pages with immediate footprint accounting. Reclaimed pages refault as zero and pages the
+    // kernel keeps were just zeroed, so BOTH outcomes read back zero. Only claim zero if the
+    // MADV_ZERO itself succeeded -- the REUSABLE/DONTNEED fallbacks below do not zero on Darwin.
+    if (unix_madv_zero_supported() && unix_madvise(start, size, MADV_ZERO) == 0) {
+      *is_zero = true;
+    }
+    *needs_recommit = false;
+    int err = unix_madvise(start, size, MADV_FREE_REUSABLE);
+    if (err) { err = unix_madvise(start, size, MADV_DONTNEED); }
+    return err;
+  #endif
+  #endif
+  return _mi_prim_decommit(start, size, needs_recommit);
+}
+
 int _mi_prim_reset(void* start, size_t size) {
   int err = 0;
 

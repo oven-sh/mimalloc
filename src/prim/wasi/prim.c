@@ -137,6 +137,11 @@ int _mi_prim_commit(void* addr, size_t size, bool* is_zero) {
   return 0;
 }
 
+int _mi_prim_decommit_zero(void* addr, size_t size, bool* needs_recommit, bool* is_zero) {
+  *is_zero = false;  // zero-on-reuse is delivered by the recommit path here, not by the purge
+  return _mi_prim_decommit(addr, size, needs_recommit);
+}
+
 int _mi_prim_decommit(void* addr, size_t size, bool* needs_recommit) {
   MI_UNUSED(addr); MI_UNUSED(size);
   *needs_recommit = false;

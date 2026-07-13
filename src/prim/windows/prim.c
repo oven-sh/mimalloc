@@ -382,6 +382,11 @@ int _mi_prim_commit(void* addr, size_t size, bool* is_zero) {
   return 0;
 }
 
+int _mi_prim_decommit_zero(void* addr, size_t size, bool* needs_recommit, bool* is_zero) {
+  *is_zero = false;  // zero-on-reuse is delivered by the recommit path here, not by the purge
+  return _mi_prim_decommit(addr, size, needs_recommit);
+}
+
 int _mi_prim_decommit(void* addr, size_t size, bool* needs_recommit) {
   BOOL ok = VirtualFree(addr, size, MEM_DECOMMIT);
   *needs_recommit = true;  // for safety, assume always decommitted even in the case of an error.
