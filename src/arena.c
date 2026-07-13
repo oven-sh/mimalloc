@@ -2259,17 +2259,14 @@ static bool mi_arena_purge(mi_arena_t* arena, size_t slice_index, size_t slice_c
       // The OS guarantees this range reads back zero, so forget that it was ever dirty: the
       // next `mi_arenas_alloc` hands it out with `initially_zero`, `mi_zalloc` skips the
       // memset, and pages the caller never writes are never made resident again.
-      const size_t dirty_slices = mi_bitmap_popcountN(arena->slices_dirty, slice_index, slice_count);
       mi_bitmap_clearN(arena->slices_dirty, slice_index, slice_count);
-      // A range that stays committed (MADV_DONTNEED needs no recommit) keeps its commit bits,
-      // so the next `mi_arena_try_alloc_at` takes the "already fully committed" path and counts
-      // every slice we just un-dirtied as newly touched. `_mi_os_purge_zero` only decreases
-      // `committed` when it decommits, so without this the stat ratchets up by the size of
-      // every purge/reuse cycle even though nothing was committed twice.
-      if (!needs_recommit && all_committed && dirty_slices > 0
-          && _mi_os_has_overcommit() && !arena->memid.is_pinned) {
-        mi_subproc_stat_decrease(arena->subproc, committed, mi_size_of_slices(dirty_slices));
-      }
+      // Do NOT touch the `committed` stat here. `committed` is keyed on the COMMIT bits, not the
+      // dirty bits: it is credited in `mi_arena_try_alloc_at` only for slices whose commit bit was
+      // clear (`slice_count - already_committed`, and the whole block is skipped when the range is
+      // already fully committed). A zero-claim purge deliberately KEEPS the commit bits set, so the
+      // next allocation credits nothing -- and debiting here would be an unmatched debit that walks
+      // `committed` down without bound (it is an int64; `mi_process_info` casts it to size_t, so it
+      // wraps). The real ratchet is the partial-commit branch below, which *clears* commit bits.
     }
   }
 
@@ -2282,12 +2279,8 @@ static bool mi_arena_purge(mi_arena_t* arena, size_t slice_index, size_t slice_c
   else if (!all_committed) {
     // we cannot assume any of these are committed any longer (even with reset since we did setN and may have marked uncommitted slices as committed)
     mi_bitmap_clearN(arena->slices_committed, slice_index, slice_count);
-    // The slices that WERE committed are no longer counted as such: we just cleared their commit
-    // bits, and the next allocation re-commits and re-counts them. `_mi_os_purge_*` only decreases
-    // `committed` when it decommits (needs_recommit), which is not this path -- so without this the
-    // counter ratchets up by `already_committed` on every purge/reuse cycle of a partially
-    // committed range. (Upstream leaves this decrement commented out; that is the bug.)
-    mi_subproc_stat_decrease(arena->subproc, committed, mi_size_of_slices(already_committed));
+    // we adjust the commit count as parts will be re-committed
+    // mi_subproc_stat_decrease(arena->subproc, committed, mi_size_of_slices(already_committed));
   }
 
   return needs_recommit;
