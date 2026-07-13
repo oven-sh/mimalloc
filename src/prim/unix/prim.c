@@ -528,7 +528,14 @@ int _mi_prim_commit(void* start, size_t size, bool* is_zero) {
 int _mi_prim_reuse(void* start, size_t size) {
   MI_UNUSED(start); MI_UNUSED(size);
   #if defined(__APPLE__) && defined(MADV_FREE_REUSE)
-  return unix_madvise(start, size, MADV_FREE_REUSE);
+  // Deliberately do NOT call MADV_FREE_REUSE. The kernel charges pages to phys_footprint as
+  // they are touched, but the explicit REUSE re-charges the ENTIRE range up front -- including
+  // OS pages the program never touches again. _mi_os_reuse runs on every un-purge (an arena
+  // slice run, a hole-punched OS page, an unformed tail), so issuing it would undo exactly the
+  // laziness hole punching and sparse zalloc rely on: measured 24MB -> 161MB on a JSC-like
+  // churn. libpas and bmalloc skip it on Darwin for the same reason (WebKit
+  // Source/bmalloc/bmalloc/VMAllocate.h, and pas_page_malloc.c only ever issues REUSABLE).
+  return 0;
   #endif
   return 0;
 }
