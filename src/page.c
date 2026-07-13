@@ -55,6 +55,20 @@ void _mi_page_purged_reset(mi_page_t* page) {
   for (size_t i = 0; i < MI_PAGE_PURGE_WORDS; i++) { page->purged[i] = 0; }
   page->unformed_purged_lo = 0;
   page->unformed_purged_hi = 0;
+  page->swept_state = MI_PAGE_SWEPT_NONE;   // a fresh (or recycled) page was never swept
+}
+
+// The block state of the page, as the sweep sees it (see `_mi_page_purge_holes`).
+static inline uint32_t mi_page_sweep_state(const mi_page_t* page) {
+  mi_assert_internal(page->used <= page->capacity);
+  return (((uint32_t)page->capacity) << 16) | (uint32_t)page->used;
+}
+
+// Anything that changes which blocks are free *without* changing `(capacity,used)` must say so,
+// or the next sweep would wrongly skip the page. That is exactly `mi_page_unpurge_range`: it puts
+// discarded blocks back on the free list, and a purged block was already free.
+static inline void mi_page_sweep_state_invalidate(mi_page_t* page) {
+  page->swept_state = MI_PAGE_SWEPT_NONE;
 }
 
 static inline size_t mi_page_block_index(const mi_page_t* page, const mi_block_t* block) {
@@ -375,6 +389,8 @@ static int64_t mi_holes_unformed_bytes;         // unformed tail discarded right
 static int64_t mi_holes_unformed_bytes_total;
 static int64_t mi_holes_unformed_discard_calls;
 static int64_t mi_holes_unformed_reuse_calls;
+static int64_t mi_holes_pages_skipped;          // pages the sweep skipped: unchanged since it last swept them
+static int64_t mi_holes_blocks_visited;         // free-list blocks the sweep walked (the cost the skip avoids)
 
 static inline size_t mi_holes_load(volatile int64_t* c) {
   const int64_t v = mi_atomic_addi64_relaxed(c, 0);
@@ -396,6 +412,8 @@ void mi_purge_holes_stats_get(mi_purge_holes_stats_t* stats) mi_attr_noexcept {
   stats->unformed_bytes_total   = mi_holes_load(&mi_holes_unformed_bytes_total);
   stats->unformed_discard_calls = mi_holes_load(&mi_holes_unformed_discard_calls);
   stats->unformed_reuse_calls   = mi_holes_load(&mi_holes_unformed_reuse_calls);
+  stats->pages_skipped          = mi_holes_load(&mi_holes_pages_skipped);
+  stats->blocks_visited         = mi_holes_load(&mi_holes_blocks_visited);
 }
 
 void _mi_page_holes_count_page_freed(void) {
@@ -411,9 +429,10 @@ void _mi_page_holes_reset_ineligible(void) {
 }
 
 void _mi_page_holes_count_ineligible(const mi_page_t* page) {
-  size_t nfree = 0;
-  for (mi_block_t* b = page->free; b != NULL; b = mi_block_next(page, b)) { nfree++; }
-  for (mi_block_t* b = page->local_free; b != NULL; b = mi_block_next(page, b)) { nfree++; }
+  // blocks are conserved (see `mi_page_is_valid_init`): free-listed == capacity - used - purged,
+  // and an ineligible page can hold no purged block. O(1): this runs on every page of every sweep.
+  mi_assert_internal(_mi_page_purged_count(page) == 0);
+  const size_t nfree = (size_t)(page->capacity - page->used);
   mi_atomic_addi64_relaxed(&mi_holes_inelig_pages, 1);
   mi_atomic_addi64_relaxed(&mi_holes_inelig_bytes, (int64_t)mi_page_size(page));
   mi_atomic_addi64_relaxed(&mi_holes_inelig_free_bytes, (int64_t)(nfree * page->block_size));
@@ -495,6 +514,7 @@ static void mi_page_unpurge_range(mi_page_t* page, size_t k0, size_t k1, bool di
     nblocks++;
   }
   page->free_is_zero = false;
+  mi_page_sweep_state_invalidate(page);   // the free list grew, but `used`/`capacity` did not
   mi_holes_count_reuse(dsize, nblocks, discarded);
 }
 
@@ -607,6 +627,22 @@ void _mi_page_unpurge_unformed_upto(mi_page_t* page, uintptr_t end) {
 
 
 // Discard the memory of the free blocks in a still-used page.
+//
+// The free blocks a sweep leaves behind are the ones it could NOT discard (their OS page still
+// holds a live block), and they stay on `page->free`. Walking them again on the next sweep finds
+// exactly the same thing, so the sweep must not: on a long-lived thread that parks often, that
+// re-walk is the dominant cost and it grows with uptime. `page->swept_state` is the O(1) guard:
+//
+//   an OS page that is discardable now but was not at the end of the last sweep must have gained
+//   a free block since (the last sweep discarded EVERY OS page all of whose blocks were free),
+//   so `used` must have gone down, or `capacity` up, since we recorded them.
+//
+// The converse does not hold: a page can churn back to the same `used` (as many frees as allocs)
+// with a *different* set of blocks free, and hide a discardable OS page from the skip. That is a
+// missed discard, never a correctness bug -- the block bookkeeping stays exact either way -- and
+// it is not sticky: the first sweep that sees a different `used` walks the page and finds it. The
+// alternative, an exact "was anything freed here" bit, costs a store in `mi_free` itself, which is
+// the hot path this whole feature stays off.
 void _mi_page_purge_holes(mi_page_t* page) {
   mi_assert_internal(page != NULL);
   if (!mi_option_is_enabled(mi_option_purge_holes)) return;
@@ -614,6 +650,15 @@ void _mi_page_purge_holes(mi_page_t* page) {
   if (mi_option_get(mi_option_purge_delay) < 0) return;   // purging disabled
   mi_page_purge_unformed_tail(page);                      // the blocks that are not formed yet: resident, but never handed out
   if (!mi_page_can_purge_holes(page)) { _mi_page_holes_count_ineligible(page); return; }
+
+  // nothing was allocated or freed in this page since we last swept it
+  const uint32_t swept_state = mi_page_sweep_state(page);
+  if (page->swept_state == swept_state) {
+    mi_atomic_addi64_relaxed(&mi_holes_pages_skipped, 1);
+    return;
+  }
+  page->swept_state = swept_state;   // discarding a hole changes neither `capacity` nor `used`
+
   if (page->free == NULL) return;                         // nothing new to take off the free list
 
   const size_t os_size = _mi_os_page_size();
@@ -624,10 +669,12 @@ void _mi_page_purge_holes(mi_page_t* page) {
   // 1. count, per OS page, the blocks on the free list that overlap it
   uint16_t nfree[MI_PAGE_PURGE_BITS];
   _mi_memzero(nfree, nbits * sizeof(uint16_t));
+  size_t nvisited = 0;
   for (mi_block_t* b = page->free; b != NULL; b = mi_block_next(page, b)) {
     const size_t idx = mi_page_block_index(page, b);
     mi_assert_internal(idx < page->capacity);
     mi_assert_internal(!mi_page_block_index_is_purged(page, idx));   // it is on the free list, so not purged
+    nvisited++;
     size_t kfirst, klast;
     mi_page_block_os_pages(page, idx, &kfirst, &klast);
     for (size_t k = kfirst; k <= klast && k < nbits; k++) {
@@ -635,6 +682,7 @@ void _mi_page_purge_holes(mi_page_t* page) {
       nfree[k]++;
     }
   }
+  mi_atomic_addi64_relaxed(&mi_holes_blocks_visited, (int64_t)nvisited);
 
   // 2. an OS page can be discarded when *every* block overlapping it is free -- either on the
   //    free list, or purged already. Of the blocks overlapping an OS page, only the first and

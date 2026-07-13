@@ -894,6 +894,31 @@ void _mi_prim_process_info(mi_process_info_t* pinfo)
   #endif
 #else
   pinfo->peak_rss = rusage.ru_maxrss * 1024;  // Linux/BSD report in KiB
+  #if defined(__linux__)
+  // Without this `current_rss` keeps its default, which is `current_commit` -- so anything
+  // reporting "rss" on Linux prints committed bytes instead. That is not a rounding error:
+  // a purge that keeps a range committed does not lower commit, so the two diverge by
+  // gigabytes (a Bun crash report read "RSS: 4.91 GB" against a real 0.56 GB peak).
+  {
+    int fd = mi_prim_open("/proc/self/statm", O_RDONLY);
+    if (fd >= 0) {
+      char buf[64];
+      const ssize_t nread = mi_prim_read(fd, buf, sizeof(buf) - 1);
+      mi_prim_close(fd);
+      if (nread > 0) {
+        buf[nread] = 0;
+        // "size resident shared text lib data dt" -- all in pages; we want the 2nd field
+        const char* p = buf;
+        while (*p == ' ') { p++; }
+        while (*p != 0 && *p != ' ') { p++; }     // skip `size`
+        while (*p == ' ') { p++; }
+        size_t resident_pages = 0;
+        while (*p >= '0' && *p <= '9') { resident_pages = (resident_pages * 10) + (size_t)(*p - '0'); p++; }
+        if (resident_pages > 0) { pinfo->current_rss = resident_pages * _mi_os_page_size(); }
+      }
+    }
+  }
+  #endif
 #endif
   // use defaults for commit
 }

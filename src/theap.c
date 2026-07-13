@@ -93,7 +93,11 @@ static bool mi_theap_page_collect(mi_theap_t* theap, mi_page_queue_t* pq, mi_pag
   MI_UNUSED(theap);
   mi_assert_internal(mi_theap_page_is_valid(theap, pq, page, NULL, NULL));
   mi_collect_t collect = *((mi_collect_t*)arg_collect);
-  _mi_page_free_collect(page, collect >= MI_FORCE);
+  // A collect has no allocation to serve, so it must not un-purge: the allocation path
+  // (`mi_page_queue_find_free_ex`) hands a hole back when a page is actually needed. Otherwise
+  // `mi_on_thread_idle`, which collects before it sweeps, un-purges a run of every page whose free
+  // blocks are all discarded and then re-discards it: two syscalls per page per park, forever.
+  _mi_page_free_collect_no_unpurge(page, collect >= MI_FORCE);
   if (mi_page_all_free(page)) {
     // no more used blocks, possibly free the page.
     if (collect >= MI_FORCE || page->retire_expire == 0) {  // either forced/abandon, or not already retired

@@ -45,6 +45,8 @@ typedef struct hole_stats_s {
   int64_t unformed_total;     // bytes of unformed tail ever discarded
   int64_t unformed_discards;
   int64_t unformed_reuses;
+  int64_t pages_skipped;      // pages the sweep skipped because nothing changed in them
+  int64_t visited;            // free-list blocks the sweep walked
 } hole_stats_t;
 
 static hole_stats_t hole_stats(void) {
@@ -64,6 +66,8 @@ static hole_stats_t hole_stats(void) {
   h.unformed_total    = (int64_t)s.unformed_bytes_total;
   h.unformed_discards = (int64_t)s.unformed_discard_calls;
   h.unformed_reuses   = (int64_t)s.unformed_reuse_calls;
+  h.pages_skipped     = (int64_t)s.pages_skipped;
+  h.visited           = (int64_t)s.blocks_visited;
   return h;
 }
 
@@ -1233,6 +1237,232 @@ done:
 }
 
 // ---------------------------------------------------------------------------
+// the sweep is not a treadmill
+//
+// The free blocks a sweep leaves on `page->free` are the ones it could NOT discard (their OS
+// page still holds a live block). Re-walking them on the next sweep can only find the same
+// thing, so a sweep that follows one with no allocation and no free in between must not walk a
+// single free list, must discard nothing new, and must un-purge nothing. And once something IS
+// freed, the sweep must catch every OS page that became discardable -- the skip may not cost
+// memory. (Before the `page->swept_state` check, `visited` grew by the full free-list length of
+// every page on EVERY sweep, forever: the cost the profile showed growing with uptime.)
+// ---------------------------------------------------------------------------
+
+#define SKIP_N     (4096)
+#define SKIP_SZ    (512)
+#define SKIP_KEEP  (64)      // keep 1 in 64 blocks live: with 8 blocks per 4KB OS page that leaves
+                             // 7 of every 8 OS pages fully free (discardable), and one OS page
+                             // pinned by a live block with 7 free blocks stuck on the free list.
+
+static bool test_sweep_skip(void) {
+  const size_t os = _mi_os_page_size();
+  void** ptrs = (void**)calloc(SKIP_N, sizeof(void*));
+  uint64_t* live = NULL;
+  expect_t e;
+  bool ok = true;
+  hole_stats_t s0, s1, s2, s3, s4, s5;
+  mi_page_t* page = NULL;
+  size_t bs = 0, cap = 0, nmine = 0, victim = SKIP_N;
+  uintptr_t pstart = 0;
+  memset(&e, 0, sizeof(e));
+  if (ptrs == NULL) { ok = false; goto done; }
+
+  for (size_t i = 0; i < SKIP_N; i++) {
+    ptrs[i] = mi_malloc(SKIP_SZ);
+    if (ptrs[i] == NULL) { ok = false; goto done; }
+    pattern_fill(ptrs[i], SKIP_SZ, i);
+  }
+  for (size_t i = 0; i < SKIP_N; i++) {
+    if ((i % SKIP_KEEP) != 0) { mi_free(ptrs[i]); ptrs[i] = NULL; }
+  }
+
+  // The page we will make a new hole in, and the live blocks left in it.
+  page = _mi_ptr_page(ptrs[0]);
+  bs = page->block_size;
+  cap = page->capacity;
+  pstart = (uintptr_t)mi_page_start(page);
+  live = (uint64_t*)calloc((cap + 63) / 64, sizeof(uint64_t));
+  if (live == NULL) { ok = false; goto done; }
+  for (size_t i = 0; i < SKIP_N; i++) {
+    if (ptrs[i] == NULL || _mi_ptr_page(ptrs[i]) != page) continue;
+    const size_t idx = (size_t)((uintptr_t)ptrs[i] - pstart) / bs;
+    live[idx / 64] |= ((uint64_t)1 << (idx % 64));
+    nmine++;
+  }
+  if (page->used != nmine) {   // the oracle below assumes every other block in the page is free
+    fprintf(stderr, "\n  page %p is not exclusively ours: used=%zu but we hold %zu\n", (void*)page, (size_t)page->used, nmine);
+    ok = false; goto done;
+  }
+  // the block to free later: the ONLY live block in an OS page that lies wholly inside the block
+  // area, so freeing it -- and nothing else -- makes that OS page discardable.
+  for (size_t k = 0; k < (mi_page_size(page) / os) + 1 && victim == SKIP_N; k++) {
+    size_t first, last;
+    if (!_mi_page_purge_os_page_blocks(os, bs, pstart, cap, k, &first, &last)) continue;
+    size_t nlive = 0, only = 0;
+    for (size_t idx = first; idx <= last; idx++) {
+      if (bit_get(live, idx)) { nlive++; only = idx; }
+    }
+    if (nlive != 1) continue;
+    for (size_t i = 0; i < SKIP_N; i++) {
+      if (ptrs[i] == NULL || _mi_ptr_page(ptrs[i]) != page) continue;
+      if ((size_t)((uintptr_t)ptrs[i] - pstart) / bs == only) { victim = i; break; }
+    }
+  }
+  if (victim == SKIP_N) {
+    fprintf(stderr, "\n  no OS page in page %p is pinned by exactly one live block\n", (void*)page);
+    ok = false; goto done;
+  }
+
+  // From here to the last sweep: NOT ONE allocation or free, except the single `mi_free` below.
+  // Everything is measured through the process-wide counters, so an allocation anywhere would
+  // legitimately un-skip its page.
+  s0 = hole_stats();
+  mi_on_thread_idle();     // 1st sweep: walks every free list, discards the free OS pages
+  s1 = hole_stats();
+  mi_on_thread_idle();     // 2nd: nothing changed, so it must do nothing at all
+  s2 = hole_stats();
+  mi_on_thread_idle();     // 3rd: still nothing
+  s3 = hole_stats();
+
+  {
+    const size_t idx = (size_t)((uintptr_t)ptrs[victim] - pstart) / bs;
+    live[idx / 64] &= ~((uint64_t)1 << (idx % 64));
+  }
+  mi_free(ptrs[victim]);   // its OS page is now entirely free
+  ptrs[victim] = NULL;
+
+  mi_on_thread_idle();     // 4th: `used` dropped, so this page is walked again
+  s4 = hole_stats();
+  mi_on_thread_idle();     // 5th: and it is quiet again
+  s5 = hole_stats();
+
+  if (purging_enabled && s1.visited <= s0.visited) {
+    fprintf(stderr, "\n  the first sweep walked no free list at all (visited %lld)\n", (long long)(s1.visited - s0.visited));
+    ok = false; goto done;
+  }
+  if (purging_enabled && s1.discards <= s0.discards) {
+    fprintf(stderr, "\n  the first sweep discarded nothing, so there is no treadmill to test\n");
+    ok = false; goto done;
+  }
+
+  // THE FIX: an unchanged page is skipped without its free list being walked.
+  #define SKIP_QUIET(a, b, which)                                                                     \
+    if ((b).visited != (a).visited) {                                                                 \
+      fprintf(stderr, "\n  the %s sweep re-walked %lld free-list blocks (nothing changed in between)\n", \
+              which, (long long)((b).visited - (a).visited));                                         \
+      ok = false;                                                                                     \
+    }                                                                                                 \
+    if ((b).discards != (a).discards || (b).reuses != (a).reuses || (b).bytes_now != (a).bytes_now) { \
+      fprintf(stderr, "\n  the %s sweep churned the OS: discards %lld, reuses %lld, bytes now %lld -> %lld\n", \
+              which, (long long)((b).discards - (a).discards), (long long)((b).reuses - (a).reuses),  \
+              (long long)(a).bytes_now, (long long)(b).bytes_now);                                    \
+      ok = false;                                                                                     \
+    }
+  SKIP_QUIET(s1, s2, "second")
+  SKIP_QUIET(s2, s3, "third")
+  SKIP_QUIET(s4, s5, "fifth")
+  #undef SKIP_QUIET
+  if (!ok) goto done;
+  if (purging_enabled && s2.pages_skipped <= s1.pages_skipped) {
+    fprintf(stderr, "\n  the second sweep skipped no page, so it did nothing for another reason\n");
+    ok = false; goto done;
+  }
+
+  // ...and the skip costs no memory: the free that made an OS page discardable is not missed.
+  if (purging_enabled) {
+    if (s4.visited <= s3.visited) {
+      fprintf(stderr, "\n  the sweep after the free did not walk the page it was freed in\n");
+      ok = false; goto done;
+    }
+    if (s4.discards <= s3.discards || s4.bytes_now < s3.bytes_now + (int64_t)os) {
+      fprintf(stderr, "\n  the freed OS page was not discarded: discards %lld, bytes now %lld -> %lld (os page %zu)\n",
+              (long long)(s4.discards - s3.discards), (long long)s3.bytes_now, (long long)s4.bytes_now, os);
+      ok = false; goto done;
+    }
+  }
+
+  // The strong version of "no memory lost": the page must hold EXACTLY the holes an
+  // implementation without any skip would have -- every OS page inside the block area with no
+  // live block in it is discarded. (`expect_page` is the same oracle the report test uses.)
+  if (!expect_page(page, live, &e)) { ok = false; goto done; }
+
+  // and the survivors are intact
+  for (size_t i = 0; i < SKIP_N; i++) {
+    if (ptrs[i] == NULL) continue;
+    if (pattern_check(ptrs[i], SKIP_SZ, i) != SKIP_SZ) {
+      fprintf(stderr, "\n  CORRUPT survivor %zu\n", i);
+      ok = false; goto done;
+    }
+  }
+  fprintf(stderr, "(sweep 1: %lld blocks walked; sweeps 2+3: %lld; %lld pages skipped) ",
+          (long long)(s1.visited - s0.visited), (long long)(s3.visited - s1.visited),
+          (long long)(s3.pages_skipped - s0.pages_skipped));
+
+done:
+  if (ptrs != NULL) {
+    for (size_t i = 0; i < SKIP_N; i++) { if (ptrs[i] != NULL) mi_free(ptrs[i]); }
+    free(ptrs);
+  }
+  free(live);
+  return ok;
+}
+
+// A page whose free blocks are ALL discarded has an empty free list, and a collect used to hand
+// a run of its holes straight back (`_mi_page_free_collect` un-purges when `page->free == NULL`).
+// `mi_on_thread_idle` collects before it sweeps, so that page was un-purged and re-discarded on
+// every park -- two syscalls per page, forever, for no memory. Only the allocation path may
+// un-purge. One block per OS page makes every free block discardable, so the free list empties.
+static bool test_sweep_no_unpurge_on_collect(void) {
+  const size_t os = _mi_os_page_size();
+  const size_t n = 256;
+  void** ptrs = (void**)calloc(n, sizeof(void*));
+  hole_stats_t s1, s2;
+  bool ok = true;
+  if (ptrs == NULL) return false;
+
+  for (size_t i = 0; i < n; i++) {
+    ptrs[i] = mi_malloc(os);
+    if (ptrs[i] == NULL) { ok = false; goto done; }
+  }
+  for (size_t i = 0; i < n; i++) {
+    if ((i % 64) != 0) { mi_free(ptrs[i]); ptrs[i] = NULL; }   // 63 of every 64 blocks: whole OS pages
+  }
+
+  mi_on_thread_idle();
+  s1 = hole_stats();
+  for (int r = 0; r < 4; r++) { mi_on_thread_idle(); }   // no allocation, no free: must be free of charge
+  s2 = hole_stats();
+
+  if (s2.visited != s1.visited || s2.discards != s1.discards || s2.reuses != s1.reuses) {
+    fprintf(stderr, "\n  4 idle sweeps with nothing to do: %lld blocks walked, %lld discards, %lld reuses\n",
+            (long long)(s2.visited - s1.visited), (long long)(s2.discards - s1.discards),
+            (long long)(s2.reuses - s1.reuses));
+    ok = false; goto done;
+  }
+  if (s2.bytes_now != s1.bytes_now) {   // and they gave nothing back to the process
+    fprintf(stderr, "\n  the discarded bytes moved from %lld to %lld with no allocation in between\n",
+            (long long)s1.bytes_now, (long long)s2.bytes_now);
+    ok = false; goto done;
+  }
+  if (purging_enabled && s1.bytes_now <= 0) {
+    fprintf(stderr, "\n  nothing is discarded, so this proves nothing\n");
+    ok = false; goto done;
+  }
+  // the memory must still be usable: the allocation path hands a hole back
+  for (size_t i = 0; i < n; i++) {
+    if (ptrs[i] != NULL) continue;
+    ptrs[i] = mi_malloc(os);
+    if (ptrs[i] == NULL) { fprintf(stderr, "\n  allocation failed after the holes were kept\n"); ok = false; goto done; }
+    memset(ptrs[i], 0x5A, os);
+  }
+
+done:
+  for (size_t i = 0; i < n; i++) { if (ptrs[i] != NULL) mi_free(ptrs[i]); }
+  free(ptrs);
+  return ok;
+}
+
+// ---------------------------------------------------------------------------
 // portable "run one thread and join" (mirrors test-stress.c)
 // ---------------------------------------------------------------------------
 
@@ -1318,6 +1548,8 @@ int main(void) {
   CHECK("option-off-is-noop", test_option_off());
   CHECK("unformed-tail", test_unformed_tail());
   CHECK("unformed-tail-freed", test_unformed_tail_freed());
+  CHECK("sweep-skips-unchanged-pages", test_sweep_skip());
+  CHECK("sweep-does-not-unpurge-on-collect", test_sweep_no_unpurge_on_collect());
 
   // everything above is freed by now, so every hole must have been handed back
   mi_collect(true);

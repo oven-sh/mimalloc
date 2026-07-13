@@ -434,7 +434,16 @@ typedef struct mi_page_s {
   // exist yet. The region only ever shrinks from the left, as `capacity` grows.
   uint32_t                  unformed_purged_lo;
   uint32_t                  unformed_purged_hi;
+
+  // The `(capacity,used)` the last hole sweep left this page in, packed as `(capacity<<16)|used`.
+  // A sweep that finds it unchanged skips the page without walking its free list at all: nothing
+  // was allocated or freed in it since, so the sweep has nothing new to discard (see
+  // `_mi_page_purge_holes`). `MI_PAGE_SWEPT_NONE` means "unknown". Cold, like `purged` above.
+  uint32_t                  swept_state;
 } mi_page_t;
+
+// An impossible `(capacity,used)` (`used > capacity` never holds): "this page has no sweep state".
+#define MI_PAGE_SWEPT_NONE                ((uint32_t)0x0000FFFF)
 
 
 // ------------------------------------------------------

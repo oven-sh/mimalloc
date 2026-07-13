@@ -222,6 +222,10 @@ typedef struct mi_purge_holes_stats_s {
   size_t unformed_bytes_total;  // bytes of unformed tail ever discarded
   size_t unformed_discard_calls;
   size_t unformed_reuse_calls;  // reuse syscalls made when a page extends back into its tail
+  // What the sweep costs. A page in which nothing was allocated or freed since the last sweep is
+  // skipped without its free list being walked at all (see `_mi_page_purge_holes`).
+  size_t pages_skipped;         // pages skipped that way (monotonic)
+  size_t blocks_visited;        // free-list blocks the sweep did walk (monotonic): what the skip avoids
 } mi_purge_holes_stats_t;
 
 mi_decl_export void mi_purge_holes_stats_get(mi_purge_holes_stats_t* stats) mi_attr_noexcept;

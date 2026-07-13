@@ -41,7 +41,8 @@ const mi_page_t _mi_page_empty = {
   MI_MEMID_STATIC,        // memid
   { 0 },                  // purged
   0,                      // unformed_purged_lo
-  0                       // unformed_purged_hi
+  0,                      // unformed_purged_hi
+  MI_PAGE_SWEPT_NONE      // swept_state
 };
 
 #define MI_PAGE_EMPTY() ((mi_page_t*)&_mi_page_empty)

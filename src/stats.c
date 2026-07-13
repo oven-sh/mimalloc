@@ -500,6 +500,8 @@ void mi_subproc_stats_print_out(mi_subproc_id_t subproc_id, mi_output_fun* out, 
                 hs.purged_bytes, hs.purged_blocks, hs.purged_bytes_total, hs.discard_calls, hs.reuse_calls, hs.pages_freed);
     _mi_fprintf(out, arg, "holes: %zu ineligible pages in the last sweep (%zu bytes, of which %zu bytes are free)\n",
                 hs.ineligible_pages, hs.ineligible_bytes, hs.ineligible_free_bytes);
+    _mi_fprintf(out, arg, "holes: the sweeps walked %zu free blocks and skipped %zu unchanged pages\n",
+                hs.blocks_visited, hs.pages_skipped);
   }
 }
 
