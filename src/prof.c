@@ -504,6 +504,7 @@ static void mi_prof_collect_mappings(mi_prof_map_t* maps, size_t* nmaps, size_t 
       if (mh == NULL || mh->magic != MH_MAGIC_64) continue;
       // walk load commands to find __TEXT extent and LC_UUID
       uint64_t start = (uint64_t)(uintptr_t)mh, end = start;
+      uint64_t text_vmaddr = 0;   // unslid vmaddr of the executable segment
       maps[n].build_id[0] = 0;
       const struct load_command* lc = (const struct load_command*)((const uint8_t*)mh + sizeof(*mh));
       for (uint32_t c = 0; c < mh->ncmds; c++) {
@@ -512,7 +513,7 @@ static void mi_prof_collect_mappings(mi_prof_map_t* maps, size_t* nmaps, size_t 
           intptr_t slide = _dyld_get_image_vmaddr_slide(i);
           uint64_t s = sc->vmaddr + (uint64_t)slide;
           if (sc->initprot & 0x4 /* VM_PROT_EXECUTE */) {
-            if (end == start) start = s;
+            if (end == start) { start = s; text_vmaddr = sc->vmaddr; }
             if (s + sc->vmsize > end) end = s + sc->vmsize;
           }
         }
@@ -523,7 +524,10 @@ static void mi_prof_collect_mappings(mi_prof_map_t* maps, size_t* nmaps, size_t 
         lc = (const struct load_command*)((const uint8_t*)lc + lc->cmdsize);
       }
       if (end <= start) end = start + 0x1000;
-      maps[n].start = start; maps[n].end = end; maps[n].off = 0;
+      // pprof reconstructs a file address as `addr - memory_start + file_offset`.
+      // Mach-O symbols are recorded at their (unslid) vmaddr, not at an offset
+      // from __TEXT, so file_offset must be that vmaddr or nothing symbolizes.
+      maps[n].start = start; maps[n].end = end; maps[n].off = text_vmaddr;
       const char* nm = _dyld_get_image_name(i);
       size_t plen = _mi_strlen(nm)+1;
       if (soff + plen <= strbuf_cap) { _mi_memcpy(strbuf+soff, nm, plen); maps[n].name = strbuf+soff; soff += plen; }
