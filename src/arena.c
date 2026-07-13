@@ -2222,10 +2222,18 @@ static bool mi_arena_purge(mi_arena_t* arena, size_t slice_index, size_t slice_c
   size_t already_committed;
   mi_bitmap_setN(arena->slices_committed, slice_index, slice_count, &already_committed); // pretend all committed.. (as we lack a clearN call that counts the already set bits..)
   const bool all_committed = (already_committed == slice_count);
+  // The zero-claim is only sound for memory WE mapped: `mi_manage_os_memory` /
+  // `mi_arena_reload` hand us external regions (MI_MEM_EXTERNAL) that may be MAP_SHARED or
+  // file-backed, where MADV_DONTNEED does NOT zero-fill -- it refaults the file's contents.
+  // A custom commit callback is likewise opaque to us. And an arena that is not itself
+  // `initially_zero` never sets `memid->initially_zero` on allocation (see the dirty-bit
+  // block in `mi_arena_try_alloc_at`), so clearing its dirty bits buys nothing and would
+  // only corrupt the bitmap.
+  const bool can_claim_zero = (arena->commit_fun == NULL
+                               && mi_memkind_is_os(arena->memid.memkind)
+                               && arena->memid.initially_zero);
   bool needs_recommit;
-  if (arena->commit_fun != NULL) {
-    // externally managed memory (a host-provided arena): we do not know what its commit
-    // callback does to the contents, so never claim zero.
+  if (!can_claim_zero) {
     needs_recommit = _mi_os_purge_ex(p, size, all_committed /* allow reset? */, mi_size_of_slices(already_committed), arena->commit_fun, arena->commit_fun_arg);
   }
   else {

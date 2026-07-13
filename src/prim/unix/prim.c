@@ -569,8 +569,15 @@ static bool unix_madv_zero_supported(void) {
   if (s == 0) {
     void* probe = mmap(NULL, _mi_os_page_size(), PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, unix_mmap_fd(), 0);
     if (probe == MAP_FAILED) return false;  // transient: do not latch
+    // Only latch on a definitive answer: success means supported; ENOTSUP means the kernel
+    // does not implement it. Any other errno is about THIS probe mapping (it is PROT_NONE),
+    // not about support, so leave it unknown and re-probe rather than latching "supported"
+    // and then failing every real call.
     const int rc = madvise(probe, _mi_os_page_size(), MADV_ZERO);
-    s = ((rc == 0 || errno != ENOTSUP) ? 1 : -1);
+    const int perrno = errno;
+    if (rc == 0) { s = 1; }
+    else if (perrno == ENOTSUP) { s = -1; }
+    else { munmap(probe, _mi_os_page_size()); return false; }   // unknown: do not latch
     munmap(probe, _mi_os_page_size());
     mi_atomic_store_release(&supported, s);
   }
