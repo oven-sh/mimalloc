@@ -222,10 +222,11 @@ void mi_on_thread_idle(void) mi_attr_noexcept {
   if (theap0->tld->thread_id != _mi_thread_id()) return;
   mi_theap_collect(theap0, false /* not forced */);
   mi_purge_holes();  // every theap of this thread + the abandoned pages
-  // (mi_theap_collect above already ran an expiry-gated arena purge; this second pass
-  // covers slices freed by the hole sweep itself. visit_all=false keeps the early-out
-  // so an idle park with nothing due costs no lock or clock read.)
-  _mi_arenas_collect(false /* respect purge delay */, false /* expiry-gated */, theap0->tld);
+  // Everything above is owner-thread-only (it rewrites this thread's free lists). The arena
+  // purge is not: those slices are in no page and belong to no thread. So don't pay for the
+  // madvise here -- tell the scavenger the delay is void because we are idle, and let it do
+  // the syscalls off-thread.
+  _mi_arenas_purge_now(theap0->tld->subproc);
 }
 
 // Report what hole punching leaves behind (see the "Hole report" section in `page.c`).

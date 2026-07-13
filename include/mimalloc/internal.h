@@ -277,6 +277,8 @@ void          _mi_prof_theap_init(mi_theap_t* theap);
 void          _mi_scavenger_start(void);
 void          _mi_scavenger_stop(void);
 void          _mi_scavenger_wake(mi_subproc_t* subproc);
+bool          _mi_scavenger_is_running(void);
+void          _mi_arenas_purge_now(mi_subproc_t* subproc);
 void          _mi_prof_theap_lazy_enable(mi_theap_t* theap);
 size_t        _mi_prof_rate(void);
 void          _mi_prof_on_exit(void);
@@ -837,7 +839,8 @@ typedef struct mi_holes_report_s {
   mi_holes_bin_t bin[MI_BIN_COUNT];
   size_t total_pages;
   size_t ineligible_pages;
-  size_t unformed_bytes;       // memory of blocks not formed yet (`capacity < reserved`); never purgeable
+  size_t unformed_bytes;       // memory of blocks not formed yet (`capacity < reserved`)
+  size_t unformed_discarded_bytes;  // of those: the OS pages the sweep discarded (`page->unformed_purged_*`)
   // The granularity curve: how many bytes WOULD be discardable if the OS page size were
   // `mi_holes_granularity(g)` -- the total size of the G-aligned, G-sized spans that lie wholly
   // inside a page's block area and hold not one live block. Nothing is discarded to measure it;

@@ -2325,6 +2325,37 @@ static int mi_arena_try_purge(mi_arena_t* arena, mi_msecs_t now, bool force)
 }
 
 
+// The calling thread just went idle. `purge_delay` exists to avoid churning the OS while a
+// thread is actively allocating -- idle voids that premise -- so pull every scheduled arena
+// purge forward to `now` and wake the scavenger, which does the madvise off-thread. Arena
+// slices sit in no page and are owned by no thread, so this is the scavenger's job; only the
+// theap collect and the hole sweep have to run on the owner.
+void _mi_arenas_purge_now(mi_subproc_t* subproc) {
+  if (subproc == NULL) return;
+  const long delay = mi_arena_purge_delay();
+  if (delay <= 0) return;   // purging disabled, or already immediate at free time
+  const mi_msecs_t now = _mi_clock_now();
+  const size_t max_arena = mi_arenas_get_count(subproc);
+  bool any_scheduled = false;
+  for (size_t i = 0; i < max_arena; i++) {
+    mi_arena_t* const arena = mi_arena_from_index(subproc, i);
+    if (arena == NULL) continue;
+    const mi_msecs_t expire = mi_atomic_loadi64_relaxed(&arena->purge_expire);
+    if (expire == 0) continue;                 // nothing queued for this arena
+    any_scheduled = true;
+    if (expire > now) { mi_atomic_storei64_release(&arena->purge_expire, now); }
+  }
+  if (!any_scheduled) return;
+  const mi_msecs_t sexpire = mi_atomic_loadi64_relaxed(&subproc->purge_expire);
+  if (sexpire == 0 || sexpire > now) { mi_atomic_storei64_release(&subproc->purge_expire, now); }
+  if (_mi_scavenger_is_running()) {
+    _mi_scavenger_wake(subproc);
+  }
+  else {
+    _mi_arenas_try_purge(false /* force */, true /* visit all */, subproc, 0 /* tseq */);  // no scavenger: purge here
+  }
+}
+
 void _mi_arenas_try_purge(bool force, bool visit_all, mi_subproc_t* subproc, size_t tseq)
 {
   // try purge can be called often so try to only run when needed

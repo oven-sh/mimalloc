@@ -18,6 +18,7 @@ terms of the MIT license. A copy of the license can be found in the file
 void _mi_scavenger_start(void) { }
 void _mi_scavenger_stop(void)  { }
 void _mi_scavenger_wake(mi_subproc_t* subproc) { MI_UNUSED(subproc); }
+bool _mi_scavenger_is_running(void) { return false; }
 
 #else
 
@@ -199,6 +200,10 @@ static void mi_scavenger_run(void) {
     if (mi_atomic_load_acquire(&_mi_scavenger_running) == 0) break;
     mi_scav_wait(&subproc->scavenger_wake, timeout_ms);
   }
+}
+
+bool _mi_scavenger_is_running(void) {
+  return (mi_atomic_load_relaxed(&_mi_scavenger_running) != 0);
 }
 
 void _mi_scavenger_wake(mi_subproc_t* subproc) {
