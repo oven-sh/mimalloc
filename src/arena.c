@@ -2243,7 +2243,17 @@ static bool mi_arena_purge(mi_arena_t* arena, size_t slice_index, size_t slice_c
       // The OS guarantees this range reads back zero, so forget that it was ever dirty: the
       // next `mi_arenas_alloc` hands it out with `initially_zero`, `mi_zalloc` skips the
       // memset, and pages the caller never writes are never made resident again.
+      const size_t dirty_slices = mi_bitmap_popcountN(arena->slices_dirty, slice_index, slice_count);
       mi_bitmap_clearN(arena->slices_dirty, slice_index, slice_count);
+      // A range that stays committed (MADV_DONTNEED needs no recommit) keeps its commit bits,
+      // so the next `mi_arena_try_alloc_at` takes the "already fully committed" path and counts
+      // every slice we just un-dirtied as newly touched. `_mi_os_purge_zero` only decreases
+      // `committed` when it decommits, so without this the stat ratchets up by the size of
+      // every purge/reuse cycle even though nothing was committed twice.
+      if (!needs_recommit && all_committed && dirty_slices > 0
+          && _mi_os_has_overcommit() && !arena->memid.is_pinned) {
+        mi_subproc_stat_decrease(arena->subproc, committed, mi_size_of_slices(dirty_slices));
+      }
     }
   }
 
