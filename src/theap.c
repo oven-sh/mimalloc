@@ -151,11 +151,15 @@ void _mi_theap_collect_abandon(mi_theap_t* theap) {
 // it is idle (e.g. from an event loop about to park): it costs a few madvise
 // calls and nothing on the alloc/free hot path.
 static bool mi_theap_page_purge_holes(mi_theap_t* theap, mi_page_queue_t* pq, mi_page_t* page, void* arg1, void* arg2) {
-  MI_UNUSED(theap); MI_UNUSED(pq); MI_UNUSED(arg1); MI_UNUSED(arg2);
+  MI_UNUSED(theap); MI_UNUSED(arg1); MI_UNUSED(arg2);
   _mi_page_free_collect(page, true);   // force: fold local_free (and thread_free) into `free` first
-  if (!mi_page_all_free(page)) {
-    _mi_page_purge_holes(page);
+  if (mi_page_all_free(page)) {
+    // the forced collect emptied the page: hand it back instead of leaving it resident
+    _mi_page_holes_count_page_freed();
+    _mi_page_free(page, pq);
+    return true;
   }
+  _mi_page_purge_holes(page);
   mi_assert_expensive(_mi_page_is_valid(page));
   return true; // continue
 }
@@ -170,8 +174,40 @@ void mi_theap_purge_holes(mi_theap_t* theap) mi_attr_noexcept {
   _mi_page_purge_holes_end();
 }
 
+// Purge the holes in every page this thread may safely touch:
+//  - the pages of every theap of this thread (`page->free`/`used` are plain fields that only the
+//    owning thread may write, so we can never do this for a theap of another thread), and
+//  - the abandoned pages of the heaps behind those theaps: those have no owning thread and are
+//    claimed through the arena ownership protocol (see `_mi_arenas_purge_abandoned_holes`).
+// The abandoned pages matter: with the default `allow_page_abandon`, every page that ever became
+// full ends up there. Non-default heaps matter too (JSC allocates its structure heap with
+// `mi_heap_new_in_arena`), which is why we sweep every theap and not just the default one.
+#define MI_PURGE_HOLES_MAX_HEAPS  (8)
+
 void mi_purge_holes(void) mi_attr_noexcept {
-  mi_theap_purge_holes(_mi_theap_default());
+  if (!mi_option_is_enabled(mi_option_purge_holes)) return;
+  mi_theap_t* const theap0 = _mi_theap_default();
+  if (theap0 == NULL || !mi_theap_is_initialized(theap0) || theap0->tld == NULL) return;
+  mi_tld_t* const tld = theap0->tld;
+
+  mi_heap_t* heaps[MI_PURGE_HOLES_MAX_HEAPS];
+  size_t heap_count = 0;
+
+  // another thread can unlink a theap from this list in `mi_heap_free`, so hold the lock
+  mi_lock(&tld->theaps_lock) {
+    for (mi_theap_t* theap = tld->theaps; theap != NULL; theap = theap->tnext) {
+      mi_theap_purge_holes(theap);
+      mi_heap_t* const heap = _mi_theap_heap(theap);
+      if (heap != NULL && heap_count < MI_PURGE_HOLES_MAX_HEAPS) {
+        bool seen = false;
+        for (size_t i = 0; i < heap_count; i++) { if (heaps[i] == heap) { seen = true; break; } }
+        if (!seen) { heaps[heap_count++] = heap; }
+      }
+    }
+  }
+  for (size_t i = 0; i < heap_count; i++) {
+    _mi_arenas_purge_abandoned_holes(heaps[i]);
+  }
 }
 
 void mi_theap_collect(mi_theap_t* theap, bool force) mi_attr_noexcept {

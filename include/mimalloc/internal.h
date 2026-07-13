@@ -252,6 +252,7 @@ void*         _mi_arenas_alloc_aligned(mi_heap_t* heap, size_t size, size_t alig
 void          _mi_arenas_free(void* p, size_t size, mi_memid_t memid);
 bool          _mi_arenas_contain(const void* p);
 void          _mi_arenas_collect(bool force_purge, bool visit_all, mi_tld_t* tld);
+void          _mi_arenas_purge_abandoned_holes(mi_heap_t* heap);
 void          _mi_arenas_try_purge(bool force, bool visit_all, mi_subproc_t* subproc, size_t tseq);
 void          _mi_arenas_unsafe_destroy_all(mi_subproc_t* subproc);
 

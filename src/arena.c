@@ -596,10 +596,10 @@ void* _mi_arenas_alloc(mi_heap_t* heap, size_t size, bool commit, bool allow_lar
 
 // release ownership of a page. This may free the page if all blocks were concurrently
 // freed in the meantime. Returns true if the page was freed.
-static bool mi_abandoned_page_unown(mi_page_t* page, mi_theap_t* current_theap) {
+static bool mi_abandoned_page_unown(mi_page_t* page, mi_theap_t* current_theap /* can be NULL */) {
   mi_assert_internal(mi_page_is_owned(page));
   mi_assert_internal(mi_page_is_abandoned(page));
-  mi_assert_internal(_mi_thread_id()==current_theap->tld->thread_id);
+  mi_assert_internal(current_theap==NULL || _mi_thread_id()==current_theap->tld->thread_id);
   mi_thread_free_t tf_new;
   mi_thread_free_t tf_old = mi_atomic_load_relaxed(&page->xthread_free);
   do {
@@ -1266,6 +1266,68 @@ void _mi_arenas_page_unabandon(mi_page_t* page, mi_theap_t* current_theapx) {
   else {
     mi_heap_stat_decrease(heap, pages_abandoned, 1);
   }
+}
+
+
+/* -----------------------------------------------------------
+  Purge the holes in abandoned pages
+
+  Abandoned pages have no owning thread, so the idle sweep of a theap never sees them --
+  yet with the default `allow_page_abandon` every page that ever became full ends up here.
+  We claim each page with the arena's ownership protocol before touching its free list.
+----------------------------------------------------------- */
+
+static bool mi_arena_page_purge_holes_at(size_t slice_index, size_t slice_count, mi_arena_t* arena, void* arg) {
+  MI_UNUSED(slice_count);
+  mi_bitmap_t* const bitmap = (mi_bitmap_t*)arg;
+
+  // Take the page out of the abandoned map first: this is the reader side of the protocol in
+  // `mi_arena_try_claim_abandoned`. A concurrent `_mi_arenas_page_unabandon` busy-waits for the
+  // bit to reappear (`mi_bitmap_clear_once_set`), so while we hold it cleared the page cannot be
+  // freed under us. If the bit is already clear, someone else has the page: skip it.
+  if (!mi_bitmap_clear(bitmap, slice_index)) return true;
+
+  mi_page_t* const page = mi_arena_page_at_slice(arena, slice_index);
+  if (!mi_page_claim_ownership(page)) {
+    mi_bitmap_set(bitmap, slice_index);   // a concurrent free owns it: keep it abandoned (as `mi_arena_try_claim_abandoned` does)
+    return true;
+  }
+
+  // We own the page: no other thread can reclaim, unabandon, or free it now, and only the
+  // atomic `xthread_free` can still change under us.
+  _mi_page_free_collect(page, true);
+  if (mi_page_all_free(page)) {
+    mi_bitmap_set(bitmap, slice_index);   // `_mi_arenas_page_unabandon` expects it in the map
+    _mi_arenas_page_unabandon(page, NULL);
+    _mi_arenas_page_free(page, NULL);
+    _mi_page_holes_count_page_freed();
+    return true;
+  }
+  _mi_page_purge_holes(page);
+  mi_bitmap_set(bitmap, slice_index);     // back in the map *before* unowning: unown may free the page
+  mi_abandoned_page_unown(page, NULL);
+  return true;
+}
+
+// note: this only reaches the *mapped* abandoned pages (the ones in `pages_abandoned`).
+// A page abandoned while full is not mapped; it has no free blocks at that point, and once
+// enough blocks are freed in it, `_mi_arenas_page_try_reabandon_to_mapped` puts it in the map.
+void _mi_arenas_purge_abandoned_holes(mi_heap_t* heap) {
+  if (heap == NULL) return;
+  if (!mi_option_is_enabled(mi_option_purge_holes)) return;
+  _mi_page_purge_holes_begin();
+  mi_forall_arenas(heap, ((mi_arena_t*)NULL), 0, arena) {
+    mi_arena_pages_t* const arena_pages = mi_heap_arena_pages(heap, arena);
+    if (arena_pages != NULL) {
+      for (size_t bin = 0; bin < MI_BIN_COUNT; bin++) {
+        if (mi_atomic_load_relaxed(&heap->abandoned_count[bin]) == 0) continue;
+        mi_bitmap_t* const bitmap = arena_pages->pages_abandoned[bin];
+        (void)_mi_bitmap_forall_set(bitmap, &mi_arena_page_purge_holes_at, arena, bitmap);
+      }
+    }
+  }
+  mi_forall_arenas_end();
+  _mi_page_purge_holes_end();
 }
 
 
