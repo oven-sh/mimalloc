@@ -192,7 +192,12 @@ static void mi_purge_holes(void) mi_attr_noexcept {
   mi_heap_t* heaps[MI_PURGE_HOLES_MAX_HEAPS];
   size_t heap_count = 0;
 
-  // another thread can unlink a theap from this list in `mi_heap_free`, so hold the lock
+  // Hold `tld->theaps_lock` for the whole sweep, including the abandoned-page pass below:
+  //  - another thread can unlink a theap from this list in `mi_heap_free_theaps`, and
+  //  - it keeps every `heaps[i]` alive: a heap is only freed by `mi_heap_delete`/`mi_heap_destroy`
+  //    *after* `mi_heap_free_theaps` freed every theap of it, and freeing our theap needs this lock
+  //    (`_mi_theap_free` try-acquires it and its caller retries), so it cannot complete while we
+  //    hold it. Reading a `heaps[i]` outside the lock is a use-after-free (`heap->subproc`).
   mi_lock(&tld->theaps_lock) {
     for (mi_theap_t* theap = tld->theaps; theap != NULL; theap = theap->tnext) {
       mi_theap_purge_holes(theap);
@@ -203,9 +208,9 @@ static void mi_purge_holes(void) mi_attr_noexcept {
         if (!seen) { heaps[heap_count++] = heap; }
       }
     }
-  }
-  for (size_t i = 0; i < heap_count; i++) {
-    _mi_arenas_purge_abandoned_holes(heaps[i]);
+    for (size_t i = 0; i < heap_count; i++) {
+      _mi_arenas_purge_abandoned_holes(heaps[i]);
+    }
   }
 }
 
@@ -248,7 +253,7 @@ void _mi_purge_holes_report_collect(mi_holes_report_t* rep) {
   mi_heap_t* heaps[MI_PURGE_HOLES_MAX_HEAPS];
   size_t heap_count = 0;
 
-  // another thread can unlink a theap from this list in `mi_heap_free`, so hold the lock
+  // hold the lock for the whole walk -- it also keeps the heaps alive, see `mi_purge_holes`
   mi_lock(&tld->theaps_lock) {
     for (mi_theap_t* theap = tld->theaps; theap != NULL; theap = theap->tnext) {
       if (!mi_theap_is_initialized(theap)) continue;
@@ -260,13 +265,13 @@ void _mi_purge_holes_report_collect(mi_holes_report_t* rep) {
         if (!seen) { heaps[heap_count++] = heap; }
       }
     }
+    for (size_t i = 0; i < heap_count; i++) {
+      _mi_arenas_holes_report(heaps[i], rep);
+    }
+    // The committed partition is a property of the subprocess's arenas, not of a heap, so count it
+    // once: every heap of this thread reaches the same arenas.
+    if (heap_count > 0) { _mi_arenas_holes_committed(heaps[0], rep); }
   }
-  for (size_t i = 0; i < heap_count; i++) {
-    _mi_arenas_holes_report(heaps[i], rep);
-  }
-  // The committed partition is a property of the subprocess's arenas, not of a heap, so count it
-  // once: every heap of this thread reaches the same arenas.
-  if (heap_count > 0) { _mi_arenas_holes_committed(heaps[0], rep); }
 }
 
 void mi_purge_holes_report(void) mi_attr_noexcept {
