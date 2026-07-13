@@ -27,8 +27,13 @@ terms of the MIT license. A copy of the license can be found in the file
 #include "arena-meta.c"
 #include "bitmap.c"
 #include "heap.c"
+// Debugging tools, not built by default: a heap snapshot writer and a pprof-compatible
+// sampling profiler. Nothing in mimalloc or its embedders calls them; build with
+// -DMI_BUILD_PROF=1 to get them.
+#if defined(MI_BUILD_PROF) && MI_BUILD_PROF
 #include "heap-snapshot.c"
 #include "prof.c"
+#endif
 #include "init.c"
 #include "libc.c"
 #include "options.c"
