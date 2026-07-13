@@ -53,6 +53,8 @@ typedef char mi_page_hot_fields_first_cacheline[(offsetof(mi_page_t,theap) + siz
 
 void _mi_page_purged_reset(mi_page_t* page) {
   for (size_t i = 0; i < MI_PAGE_PURGE_WORDS; i++) { page->purged[i] = 0; }
+  page->unformed_purged_lo = 0;
+  page->unformed_purged_hi = 0;
 }
 
 static inline size_t mi_page_block_index(const mi_page_t* page, const mi_block_t* block) {
@@ -369,6 +371,10 @@ static int64_t mi_holes_pages_freed;
 static int64_t mi_holes_inelig_pages;   // pages the sweep cannot purge at all (see `mi_page_can_purge_holes`)
 static int64_t mi_holes_inelig_bytes;
 static int64_t mi_holes_inelig_free_bytes;
+static int64_t mi_holes_unformed_bytes;         // unformed tail discarded right now
+static int64_t mi_holes_unformed_bytes_total;
+static int64_t mi_holes_unformed_discard_calls;
+static int64_t mi_holes_unformed_reuse_calls;
 
 static inline size_t mi_holes_load(volatile int64_t* c) {
   const int64_t v = mi_atomic_addi64_relaxed(c, 0);
@@ -386,6 +392,10 @@ void mi_purge_holes_stats_get(mi_purge_holes_stats_t* stats) mi_attr_noexcept {
   stats->ineligible_pages      = mi_holes_load(&mi_holes_inelig_pages);
   stats->ineligible_bytes      = mi_holes_load(&mi_holes_inelig_bytes);
   stats->ineligible_free_bytes = mi_holes_load(&mi_holes_inelig_free_bytes);
+  stats->unformed_bytes         = mi_holes_load(&mi_holes_unformed_bytes);
+  stats->unformed_bytes_total   = mi_holes_load(&mi_holes_unformed_bytes_total);
+  stats->unformed_discard_calls = mi_holes_load(&mi_holes_unformed_discard_calls);
+  stats->unformed_reuse_calls   = mi_holes_load(&mi_holes_unformed_reuse_calls);
 }
 
 void _mi_page_holes_count_page_freed(void) {
@@ -488,12 +498,121 @@ static void mi_page_unpurge_range(mi_page_t* page, size_t k0, size_t k1, bool di
   mi_holes_count_reuse(dsize, nblocks, discarded);
 }
 
+
+/* -----------------------------------------------------------
+  The unformed tail.
+
+  The blocks in `[capacity, reserved)` were never handed out: `mi_page_extend_free`
+  formats them lazily, a few OS pages worth at a time. They still cost memory though --
+  a page is carved from an arena slice that had a previous life, so its tail is already
+  resident, dirtying memory for blocks that may never exist.
+
+  So we discard it too, but NOT through the `purged` bitmap: a bit there means "this block
+  is free and off every free list" (`_mi_page_is_valid`, `mi_check_is_double_freex`), and an
+  unformed block is on no list and has no identity yet. The region is contiguous and only
+  shrinks from the left as `capacity` grows, so two offsets say everything there is to say.
+
+  `mi_page_extend_free` calls `_mi_page_unpurge_unformed_upto` on exactly the range it is
+  about to format, *before* it writes the first free-list pointer into it.
+----------------------------------------------------------- */
+
+// Can this page's memory be discarded at ALL? Pinned (large/huge OS pages) memory cannot be
+// madvise'd away, and an arena with a custom commit function owns its own decommit. Note this
+// is deliberately weaker than `mi_page_can_purge_holes`, which also rejects pages whose OS
+// pages do not fit the `purged` bitmap -- the unformed tail needs no bitmap.
+static bool mi_page_holes_madvisable(const mi_page_t* page) {
+  if (page->memid.is_pinned) return false;
+  const mi_arena_t* const arena = mi_memid_arena(page->memid);
+  return (arena == NULL || arena->commit_fun == NULL);
+}
+
+// The OS pages that lie wholly inside the unformed tail *and* inside the committed part of
+// the page: `[align_up(page_start + capacity*bs), align_down(min(page_start + reserved*bs, committed_end)))`.
+// Empty (lo == hi) when there is no tail, when it is smaller than an OS page, or when the
+// page has no committed memory there (`slice_committed`).
+static void mi_page_unformed_tail_range(const mi_page_t* page, uintptr_t* lo, uintptr_t* hi) {
+  *lo = 0; *hi = 0;
+  if (page->capacity >= page->reserved) return;    // no tail
+  const size_t os_size = _mi_os_page_size();
+  const uintptr_t pstart = (uintptr_t)page->page_start;
+  const uintptr_t tlo = pstart + ((size_t)page->capacity * page->block_size);
+  uintptr_t thi = pstart + ((size_t)page->reserved * page->block_size);
+  const uintptr_t climit = pstart + mi_page_committed(page);   // never discard memory that is not committed
+  if (thi > climit) { thi = climit; }
+  const uintptr_t alo = _mi_align_up(tlo, os_size);
+  const uintptr_t ahi = _mi_align_down(thi, os_size);
+  if (alo >= ahi) return;
+  *lo = alo;
+  *hi = ahi;
+}
+
+size_t _mi_page_unformed_purged_bytes(const mi_page_t* page) {
+  return (page->unformed_purged_hi > page->unformed_purged_lo
+            ? (size_t)(page->unformed_purged_hi - page->unformed_purged_lo) : 0);
+}
+
+// Discard the OS pages of the unformed tail that are not discarded already.
+static void mi_page_purge_unformed_tail(mi_page_t* page) {
+  if (!mi_page_holes_madvisable(page)) return;
+  uintptr_t lo, hi;
+  mi_page_unformed_tail_range(page, &lo, &hi);
+  if (lo >= hi) return;
+  const uintptr_t pstart = (uintptr_t)page->page_start;
+  mi_assert_internal(hi - pstart <= UINT32_MAX);   // only a huge page can be that big, and it has no tail
+  if (hi - pstart > UINT32_MAX) return;
+
+  // the part of the tail that is not discarded yet (the tail can only grow to the right,
+  // when `mi_page_extend_free` commits more of the page)
+  uintptr_t dlo = lo;
+  const size_t already = _mi_page_unformed_purged_bytes(page);
+  if (already > 0) {
+    mi_assert_internal(pstart + page->unformed_purged_lo >= lo);   // extend un-discards what it formats
+    const uintptr_t uhi = pstart + page->unformed_purged_hi;
+    if (uhi > dlo) { dlo = uhi; }
+    lo = pstart + page->unformed_purged_lo;
+  }
+  if (dlo >= hi) return;   // nothing new
+
+  if (!_mi_os_discard((void*)dlo, (size_t)(hi - dlo))) return;   // the discard failed: leave the page as it was
+  page->unformed_purged_lo = (uint32_t)(lo - pstart);
+  page->unformed_purged_hi = (uint32_t)(hi - pstart);
+  mi_atomic_addi64_relaxed(&mi_holes_unformed_discard_calls, 1);
+  mi_atomic_addi64_relaxed(&mi_holes_unformed_bytes_total, (int64_t)(hi - dlo));
+  mi_atomic_addi64_relaxed(&mi_holes_unformed_bytes, (int64_t)(hi - dlo));
+}
+
+// Tell the OS we are using the discarded unformed tail below `end` again, *before* anything
+// in it is written to. `end` is an absolute address (`UINTPTR_MAX` for the whole tail); it is
+// rounded up to an OS page, as the discard covers whole OS pages.
+void _mi_page_unpurge_unformed_upto(mi_page_t* page, uintptr_t end) {
+  if (_mi_page_unformed_purged_bytes(page) == 0) return;
+  const size_t os_size = _mi_os_page_size();
+  const uintptr_t pstart = (uintptr_t)page->page_start;
+  const uintptr_t rlo = pstart + page->unformed_purged_lo;
+  const uintptr_t rhi = pstart + page->unformed_purged_hi;
+  uintptr_t rend;
+  if (end >= rhi) { rend = rhi; }   // (also the `UINTPTR_MAX` case: `_mi_align_up` would overflow)
+  else {
+    rend = _mi_align_up(end, os_size);
+    if (rend > rhi) { rend = rhi; }
+  }
+  if (rend <= rlo) return;   // nothing of the discarded tail is needed yet
+
+  _mi_os_reuse((void*)rlo, (size_t)(rend - rlo));
+  if (rend >= rhi) { page->unformed_purged_lo = 0; page->unformed_purged_hi = 0; }
+  else { page->unformed_purged_lo = (uint32_t)(rend - pstart); }
+  mi_atomic_addi64_relaxed(&mi_holes_unformed_reuse_calls, 1);
+  mi_atomic_addi64_relaxed(&mi_holes_unformed_bytes, -(int64_t)(rend - rlo));
+}
+
+
 // Discard the memory of the free blocks in a still-used page.
 void _mi_page_purge_holes(mi_page_t* page) {
   mi_assert_internal(page != NULL);
   if (!mi_option_is_enabled(mi_option_purge_holes)) return;
   if (mi_page_all_free(page)) return;                     // the page itself is about to be freed
   if (mi_option_get(mi_option_purge_delay) < 0) return;   // purging disabled
+  mi_page_purge_unformed_tail(page);                      // the blocks that are not formed yet: resident, but never handed out
   if (!mi_page_can_purge_holes(page)) { _mi_page_holes_count_ineligible(page); return; }
   if (page->free == NULL) return;                         // nothing new to take off the free list
 
@@ -599,6 +718,7 @@ bool _mi_page_unpurge_run(mi_page_t* page) {
 // block is free), so we do NOT rebuild its free list: writing `next` pointers into the
 // holes would fault every discarded OS page right back in.
 void _mi_page_unpurge_all(mi_page_t* page) {
+  _mi_page_unpurge_unformed_upto(page, UINTPTR_MAX);   // the unformed tail goes back as well
   if (!mi_page_has_purged(page)) return;
   const size_t os_size = _mi_os_page_size();
   const uintptr_t base = mi_page_purge_base(page);
@@ -679,17 +799,6 @@ static bool mi_holes_block_is_free(const mi_page_t* page, const uint64_t* freeli
   return mi_page_block_index_is_purged(page, idx);
 }
 
-// Can this page's memory be discarded at ALL, at any granularity? Pinned (large/huge OS pages)
-// memory cannot be madvise'd away, and an arena with a custom commit function owns its own
-// decommit. Note this is deliberately weaker than `mi_page_can_purge_holes`, which also rejects
-// pages whose OS pages do not fit the bitmap -- that is a limit of our bitmap, not of the OS,
-// and the curve is a question about the OS.
-static bool mi_page_holes_madvisable(const mi_page_t* page) {
-  if (page->memid.is_pinned) return false;
-  const mi_arena_t* const arena = mi_memid_arena(page->memid);
-  return (arena == NULL || arena->commit_fun == NULL);
-}
-
 // How many bytes of this page would be discardable if the OS page size were `G`? A G-aligned,
 // G-sized span can be discarded exactly when it lies wholly inside the block area and every
 // block overlapping it is free -- the same rule the real sweep applies at `_mi_os_page_size()`.
@@ -724,6 +833,7 @@ void _mi_page_holes_report_page(const mi_page_t* page, mi_holes_report_t* rep) {
   rep->total_pages++;
   rep->page_committed_bytes += mi_page_committed(page);
   if (page->reserved > cap) { rep->unformed_bytes += ((size_t)page->reserved - cap) * bs; }
+  rep->unformed_discarded_bytes += _mi_page_unformed_purged_bytes(page);
   if (cap == 0) return;
 
   uint64_t freelisted[MI_HOLES_MAX_CAP / 64];
@@ -915,12 +1025,13 @@ void _mi_page_holes_report_print(const mi_holes_report_t* rep) {
   }
   mi_holes_print_row("TOTAL", &total);
 
-  char edge[32], pending[32], unformed[32];
+  char edge[32], pending[32], unformed[32], unformed_disc[32];
   mi_holes_mb(total.edge_bytes, edge, sizeof(edge));
   mi_holes_mb(total.pending_bytes, pending, sizeof(pending));
   mi_holes_mb(rep->unformed_bytes, unformed, sizeof(unformed));
+  mi_holes_mb(rep->unformed_discarded_bytes, unformed_disc, sizeof(unformed_disc));
   _mi_fprintf(NULL, NULL, "  of undiscardable: %s MB lies in a partial OS page (page header / past capacity)\n", edge);
-  _mi_fprintf(NULL, NULL, "  free and discardable but not discarded: %s MB;  blocks not formed yet: %s MB\n", pending, unformed);
+  _mi_fprintf(NULL, NULL, "  free and discardable but not discarded: %s MB;  blocks not formed yet: %s MB (of which discarded: %s MB)\n", pending, unformed, unformed_disc);
 
   // the 3 worst size classes by undiscardable bytes: how many live blocks pin each pinned OS page?
   size_t taken[3] = { MI_BIN_COUNT, MI_BIN_COUNT, MI_BIN_COUNT };
@@ -1440,6 +1551,11 @@ static bool mi_page_extend_free(mi_theap_t* theap, mi_page_t* page) {
       page->slice_committed = needed_commit;
     }
   }
+
+  // The blocks we are about to format may sit in the discarded unformed tail: hand that memory
+  // back to the OS *before* the first free-list pointer is written into it (on macOS a discarded
+  // page stays reclaimable by the kernel, and stays charged to the process, until it is REUSE'd).
+  _mi_page_unpurge_unformed_upto(page, (uintptr_t)page->page_start + ((size_t)page->capacity + extend) * bsize);
 
   // and append the extend the free list
   if (extend < MI_MIN_SLICES || MI_SECURE<2) { //!mi_option_is_enabled(mi_option_secure)) {

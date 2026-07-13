@@ -215,6 +215,13 @@ typedef struct mi_purge_holes_stats_s {
   size_t ineligible_pages;
   size_t ineligible_bytes;      // total size of those pages
   size_t ineligible_free_bytes; // the free (but not discardable) blocks inside them
+  // The unformed tail: the blocks of a page that were never handed out (`capacity < reserved`).
+  // Carved from a recycled arena slice, that memory is already resident, so the sweep discards
+  // it as well; `mi_page_extend_free` hands it back before it formats a block in it.
+  size_t unformed_bytes;        // bytes of unformed tail discarded right now
+  size_t unformed_bytes_total;  // bytes of unformed tail ever discarded
+  size_t unformed_discard_calls;
+  size_t unformed_reuse_calls;  // reuse syscalls made when a page extends back into its tail
 } mi_purge_holes_stats_t;
 
 mi_decl_export void mi_purge_holes_stats_get(mi_purge_holes_stats_t* stats) mi_attr_noexcept;

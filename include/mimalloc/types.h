@@ -425,6 +425,15 @@ typedef struct mi_page_s {
   // hold a `next` pointer. Cold: touched only by the idle hole-purge sweep, so it must stay
   // *after* the fields above (see `mi_page_hot_fields_first_cacheline` in `page.c`).
   uint64_t                  purged[MI_PAGE_PURGE_WORDS];
+
+  // The discarded part of the *unformed tail*: the blocks in `[capacity,reserved)` are not
+  // formatted yet, but when the page is carved from a recycled arena slice their memory is
+  // already resident. Byte offsets from `page_start`, OS-page aligned, `lo == hi` when
+  // nothing is discarded. Deliberately NOT part of `purged` above: a bit there means "this
+  // block is free and off every free list" (`_mi_page_is_valid`), and these blocks do not
+  // exist yet. The region only ever shrinks from the left, as `capacity` grows.
+  uint32_t                  unformed_purged_lo;
+  uint32_t                  unformed_purged_hi;
 } mi_page_t;
 
 

@@ -39,7 +39,9 @@ const mi_page_t _mi_page_empty = {
   NULL, NULL,             // next, prev
   MI_ARENA_SLICE_SIZE,    // page_committed
   MI_MEMID_STATIC,        // memid
-  { 0 }                   // purged
+  { 0 },                  // purged
+  0,                      // unformed_purged_lo
+  0                       // unformed_purged_hi
 };
 
 #define MI_PAGE_EMPTY() ((mi_page_t*)&_mi_page_empty)

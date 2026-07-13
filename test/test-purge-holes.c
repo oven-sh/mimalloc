@@ -41,6 +41,10 @@ typedef struct hole_stats_s {
   int64_t inelig_pages;   // pages the last sweep could not purge at all
   int64_t inelig_bytes;
   int64_t inelig_free;
+  int64_t unformed_now;       // bytes of unformed tail discarded right now
+  int64_t unformed_total;     // bytes of unformed tail ever discarded
+  int64_t unformed_discards;
+  int64_t unformed_reuses;
 } hole_stats_t;
 
 static hole_stats_t hole_stats(void) {
@@ -56,6 +60,10 @@ static hole_stats_t hole_stats(void) {
   h.inelig_pages = (int64_t)s.ineligible_pages;
   h.inelig_bytes = (int64_t)s.ineligible_bytes;
   h.inelig_free  = (int64_t)s.ineligible_free_bytes;
+  h.unformed_now      = (int64_t)s.unformed_bytes;
+  h.unformed_total    = (int64_t)s.unformed_bytes_total;
+  h.unformed_discards = (int64_t)s.unformed_discard_calls;
+  h.unformed_reuses   = (int64_t)s.unformed_reuse_calls;
   return h;
 }
 
@@ -528,6 +536,7 @@ static bool test_option_off(void) {
 
   const long saved = mi_option_get(mi_option_purge_holes);
   mi_option_set(mi_option_purge_holes, 0);
+  const hole_stats_t before = hole_stats();
 
   for (size_t i = 0; i < N; i++) {
     ptrs[i] = mi_malloc(SZ);
@@ -543,6 +552,10 @@ static bool test_option_off(void) {
     fprintf(stderr, "\n  purge_holes=0 but blocks were discarded\n");
     ok_all = false;
   }
+  if (hole_stats().unformed_total != before.unformed_total) {
+    fprintf(stderr, "\n  purge_holes=0 but unformed tail bytes were discarded\n");
+    ok_all = false;
+  }
   for (size_t i = 0; i < N; i++) {
     if (ptrs[i] == NULL) continue;
     if (pattern_check(ptrs[i], SZ, i) != SZ) { ok_all = false; break; }
@@ -553,6 +566,205 @@ done:
   free(ptrs);
   mi_option_set(mi_option_purge_holes, saved);
   return ok_all;
+}
+
+// ---------------------------------------------------------------------------
+// 6b. the unformed tail: the blocks in `[capacity,reserved)` of a page are never
+//     handed out, but on a recycled arena slice their memory is already resident.
+//     The sweep must discard the OS pages that lie wholly inside that tail, and
+//     `mi_page_extend_free` must hand them back before it formats a block in one.
+// ---------------------------------------------------------------------------
+
+// Dirty a lot of arena slices and give them all back, so the pages we allocate next are
+// carved from recycled (already resident) memory -- which is what makes the unformed tail
+// cost anything at all.
+static void dirty_arena_slices(size_t bsize, size_t n) {
+  void** ptrs = (void**)calloc(n, sizeof(void*));
+  if (ptrs == NULL) return;
+  for (size_t i = 0; i < n; i++) {
+    ptrs[i] = mi_malloc(bsize);
+    if (ptrs[i] != NULL) { memset(ptrs[i], 0x5A, bsize); }
+  }
+  for (size_t i = 0; i < n; i++) { if (ptrs[i] != NULL) mi_free(ptrs[i]); }
+  free(ptrs);
+  mi_collect(true);   // hand the pages back to the arena
+}
+
+// The page holding `p` must have a tail worth discarding (several OS pages).
+static bool tail_page_is_interesting(const mi_page_t* page, const char* what) {
+  const size_t os_page = _mi_os_page_size();
+  if (page->capacity >= page->reserved) {
+    fprintf(stderr, "\n  %s: the page has no unformed tail (capacity == reserved == %u)\n", what, page->reserved);
+    return false;
+  }
+  const size_t tail = ((size_t)page->reserved - page->capacity) * page->block_size;
+  if (tail < 2 * os_page) {
+    fprintf(stderr, "\n  %s: the unformed tail is only %zu bytes (< 2 OS pages)\n", what, tail);
+    return false;
+  }
+  return true;
+}
+
+// (a) the tail is discarded, and (b) the blocks later formed in it are usable and keep what
+// is written into them.
+static bool test_unformed_tail(void) {
+  const size_t bsize = 64;
+  dirty_arena_slices(bsize, 20000);
+
+  void* first = mi_malloc(bsize);
+  if (first == NULL) return false;
+  mi_page_t* const page = _mi_ptr_page(first);
+  const size_t usable = mi_usable_size(first);
+  const uint16_t cap0 = page->capacity;
+  const uint16_t reserved = page->reserved;
+  bool ok = true;
+  void** ptrs = NULL;
+  size_t nlive = 0;
+
+  if (!tail_page_is_interesting(page, "unformed-tail")) { mi_free(first); return false; }
+
+  const hole_stats_t before = hole_stats();
+  mi_on_thread_idle();
+  const hole_stats_t after = hole_stats();
+  const size_t discarded = _mi_page_unformed_purged_bytes(page);
+
+  // (a) the mechanism: THIS page's tail must be discarded (not some other page's)
+  if (purging_enabled) {
+    if (discarded == 0) {
+      fprintf(stderr, "\n  unformed-tail: the tail of the page was NOT discarded (capacity=%u reserved=%u bsize=%zu)\n",
+              cap0, reserved, bsize);
+      ok = false;
+    }
+    if (after.unformed_total <= before.unformed_total || after.unformed_discards <= before.unformed_discards) {
+      fprintf(stderr, "\n  unformed-tail: no unformed bytes were discarded (bytes=%lld calls=%lld)\n",
+              (long long)(after.unformed_total - before.unformed_total),
+              (long long)(after.unformed_discards - before.unformed_discards));
+      ok = false;
+    }
+  }
+  else if (discarded != 0 || after.unformed_total != before.unformed_total) {
+    fprintf(stderr, "\n  unformed-tail: purging is off but %zu bytes of tail were discarded\n", discarded);
+    ok = false;
+  }
+  if (!ok) { mi_free(first); return false; }
+
+  // the discarded range must lie strictly inside the unformed tail: never the page header,
+  // never a formed block, never past the end of the page
+  const uintptr_t pstart = (uintptr_t)page->page_start;
+  if (discarded > 0) {
+    const uintptr_t lo = pstart + page->unformed_purged_lo;
+    const uintptr_t hi = pstart + page->unformed_purged_hi;
+    if (lo < pstart + ((size_t)cap0 * bsize) || hi > pstart + ((size_t)reserved * bsize)) {
+      fprintf(stderr, "\n  unformed-tail: the discarded range escapes the unformed tail!\n");
+      mi_free(first);
+      return false;
+    }
+  }
+
+  // (b) fill the page: every block must be usable and keep its contents. This drives
+  //     `mi_page_extend_free` straight through the discarded tail, a few OS pages at a time.
+  ptrs = (void**)calloc(reserved, sizeof(void*));
+  if (ptrs == NULL) { mi_free(first); return false; }
+  ptrs[0] = first;
+  pattern_fill(first, usable, 0);
+  nlive = 1;
+  for (size_t i = 1; i < (size_t)reserved; i++) {
+    void* const q = mi_malloc(bsize);
+    if (q == NULL) { ok = false; goto done; }
+    if (_mi_ptr_page(q) != page) { mi_free(q); break; }   // this page is full: the rest comes from another one
+    ptrs[i] = q;
+    nlive++;
+    pattern_fill(q, usable, i);
+  }
+
+  if (page->capacity <= cap0) {
+    fprintf(stderr, "\n  unformed-tail: the page never extended (capacity is still %u)\n", page->capacity);
+    ok = false;
+    goto done;
+  }
+  // the tail we discarded is formed by now, so nothing of it may still be discarded
+  if (page->capacity >= page->reserved && _mi_page_unformed_purged_bytes(page) != 0) {
+    fprintf(stderr, "\n  unformed-tail: the page is fully formed but %zu bytes of tail are still discarded\n",
+            _mi_page_unformed_purged_bytes(page));
+    ok = false;
+    goto done;
+  }
+  if (purging_enabled && hole_stats().unformed_reuses <= before.unformed_reuses) {
+    fprintf(stderr, "\n  unformed-tail: the page extended into the discarded tail without a reuse call\n");
+    ok = false;
+    goto done;
+  }
+  // every block handed out of the once-discarded tail must have kept what we wrote into it
+  for (size_t i = 0; i < nlive; i++) {
+    const size_t bad = pattern_check(ptrs[i], usable, i);
+    if (bad != usable) {
+      fprintf(stderr, "\n  unformed-tail: CORRUPT block %zu at offset %zu (of %zu)\n", i, bad, usable);
+      ok = false;
+      break;
+    }
+  }
+
+done:
+  for (size_t i = 0; i < nlive; i++) { if (ptrs[i] != NULL) mi_free(ptrs[i]); }
+  free(ptrs);
+  return ok;
+}
+
+// A page whose tail was discarded and then extended into, and one whose tail was discarded and
+// never extended into, both go back to the arena without tripping an assertion -- and the arena
+// hands the memory out again as writable (this is what a decommit here would break on Windows).
+static bool test_unformed_tail_freed(void) {
+  const size_t bsize = 128;
+  dirty_arena_slices(bsize, 10000);
+
+  void* keep = mi_malloc(bsize);
+  if (keep == NULL) return false;
+  mi_page_t* const page = _mi_ptr_page(keep);
+  if (!tail_page_is_interesting(page, "unformed-tail-freed")) { mi_free(keep); return false; }
+
+  mi_on_thread_idle();
+  const size_t discarded = _mi_page_unformed_purged_bytes(page);
+  if (purging_enabled && discarded == 0) {
+    fprintf(stderr, "\n  unformed-tail-freed: the tail of the page was not discarded\n");
+    mi_free(keep);
+    return false;
+  }
+
+  // free the only live block: the page goes back to the arena with its tail still discarded
+  mi_free(keep);
+  mi_collect(true);
+
+  const hole_stats_t after = hole_stats();
+  if (after.unformed_now != 0) {
+    fprintf(stderr, "\n  unformed-tail-freed: %lld bytes of tail are still discarded after the page was freed\n",
+            (long long)after.unformed_now);
+    return false;
+  }
+
+  // take the memory back from the arena and write every byte of it
+  enum { N = 4000 };
+  void** ptrs = (void**)calloc(N, sizeof(void*));
+  if (ptrs == NULL) return false;
+  bool ok = true;
+  for (size_t i = 0; i < N; i++) {
+    ptrs[i] = mi_malloc(bsize);
+    if (ptrs[i] == NULL) { ok = false; break; }
+    memset(ptrs[i], 0x3C, bsize);
+  }
+  for (size_t i = 0; i < N && ok; i++) {
+    const uint8_t* const b = (const uint8_t*)ptrs[i];
+    for (size_t j = 0; j < bsize; j++) {
+      if (b[j] != 0x3C) {
+        fprintf(stderr, "\n  unformed-tail-freed: re-used byte %zu of block %zu is %u\n", j, i, b[j]);
+        ok = false;
+        break;
+      }
+    }
+  }
+  for (size_t i = 0; i < N; i++) { if (ptrs[i] != NULL) mi_free(ptrs[i]); }
+  free(ptrs);
+  mi_collect(true);
+  return ok;
 }
 
 // ---------------------------------------------------------------------------
@@ -1104,6 +1316,8 @@ int main(void) {
   CHECK("report-is-read-only", test_report_is_read_only());
   CHECK("report-is-read-only-on-abandoned", test_report_read_only_abandoned());
   CHECK("option-off-is-noop", test_option_off());
+  CHECK("unformed-tail", test_unformed_tail());
+  CHECK("unformed-tail-freed", test_unformed_tail_freed());
 
   // everything above is freed by now, so every hole must have been handed back
   mi_collect(true);
@@ -1113,7 +1327,11 @@ int main(void) {
           (long long)end.pages_freed, (long long)end.bytes_now);
   fprintf(stderr, "holes: the last sweep could not touch %lld pages (%lld bytes, of which %lld bytes free)\n",
           (long long)end.inelig_pages, (long long)end.inelig_bytes, (long long)end.inelig_free);
+  fprintf(stderr, "holes: unformed tail: %lld bytes discarded in total over %lld discards / %lld reuses; %lld bytes still discarded\n",
+          (long long)end.unformed_total, (long long)end.unformed_discards, (long long)end.unformed_reuses,
+          (long long)end.unformed_now);
   CHECK("no-holes-outstanding-at-exit", (end.bytes_now == 0 && end.blocks_now == 0));
+  CHECK("no-unformed-tail-outstanding-at-exit", (end.unformed_now == 0));
 
   mi_stats_print(NULL);
   return print_test_summary();
