@@ -80,6 +80,7 @@ set(mi_sources
     src/page.c
     src/page-map.c
     src/random.c
+    src/scavenger.c
     src/stats.c
     src/theap.c
     src/threadlocal.c
@@ -565,7 +566,7 @@ function(find_link_library libname outlibname)
 endfunction()
 
 if(WIN32)
-  list(APPEND mi_libraries psapi shell32 user32 advapi32 bcrypt)
+  list(APPEND mi_libraries psapi shell32 user32 advapi32 bcrypt synchronization)
 else()
   find_link_library("pthread" MI_LIB_PTHREAD)
   if(MI_LIB_PTHREAD)

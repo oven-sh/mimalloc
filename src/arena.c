@@ -1267,7 +1267,6 @@ void _mi_arenas_page_unabandon(mi_page_t* page, mi_theap_t* current_theapx) {
   Arena free
 ----------------------------------------------------------- */
 static void mi_arena_schedule_purge(mi_arena_t* arena, size_t slice_index, size_t slices);
-static void mi_arenas_try_purge(bool force, bool visit_all, mi_subproc_t* subproc, size_t tseq);
 
 void _mi_arenas_free(void* p, size_t size, mi_memid_t memid) {
   if (p==NULL) return;
@@ -1323,12 +1322,12 @@ void _mi_arenas_free(void* p, size_t size, mi_memid_t memid) {
   }
 
   // try to purge expired decommits
-  // mi_arenas_try_purge(false, false, NULL);
+  // _mi_arenas_try_purge(false, false, NULL);
 }
 
 // Purge the arenas; if `force_purge` is true, amenable parts are purged even if not yet expired
 void _mi_arenas_collect(bool force_purge, bool visit_all, mi_tld_t* tld) {
-  mi_arenas_try_purge(force_purge, visit_all, tld->subproc, tld->thread_seq);
+  _mi_arenas_try_purge(force_purge, visit_all, tld->subproc, tld->thread_seq);
 }
 
 
@@ -1399,7 +1398,7 @@ static void mi_arenas_unsafe_destroy(mi_subproc_t* subproc) {
 // for dynamic libraries that are unloaded and need to release all their allocated memory.
 void _mi_arenas_unsafe_destroy_all(mi_subproc_t* subproc) {
   mi_arenas_unsafe_destroy(subproc);
-  // mi_arenas_try_purge(true /* force purge */, true /* visit all*/, subproc, 0 /* thread seq */);  // purge non-owned arenas
+  // _mi_arenas_try_purge(true /* force purge */, true /* visit all*/, subproc, 0 /* thread seq */);  // purge non-owned arenas
 }
 
 
@@ -2101,7 +2100,11 @@ static void mi_arena_schedule_purge(mi_arena_t* arena, size_t slice_index, size_
       // expiration was not yet set
       // maybe set the global arenas expire as well (if it wasn't set already)
       mi_assert_internal(expire0==0);
-      mi_atomic_casi64_strong_acq_rel(&arena->subproc->purge_expire, &expire0, expire);
+      if (mi_atomic_casi64_strong_acq_rel(&arena->subproc->purge_expire, &expire0, expire)) {
+        // subproc expire went 0 -> set: this is the only transition the scavenger
+        // actually needs to observe, so wake it here instead of on every free.
+        _mi_scavenger_wake(arena->subproc);
+      }
     }
     else {
       // already an expiration was set
@@ -2187,7 +2190,7 @@ static int mi_arena_try_purge(mi_arena_t* arena, mi_msecs_t now, bool force)
 }
 
 
-static void mi_arenas_try_purge(bool force, bool visit_all, mi_subproc_t* subproc, size_t tseq)
+void _mi_arenas_try_purge(bool force, bool visit_all, mi_subproc_t* subproc, size_t tseq)
 {
   // try purge can be called often so try to only run when needed
   const long delay = mi_arena_purge_delay();
@@ -2211,6 +2214,7 @@ static void mi_arenas_try_purge(bool force, bool visit_all, mi_subproc_t* subpro
     size_t max_purge_count = (visit_all ? max_arena : (max_arena/4)+1);
     bool all_visited = true;
     bool any_purged = false;
+    mi_msecs_t next_expire = 0;   // earliest still-pending per-arena expire
     for (size_t _i = 0; _i < max_arena; _i++) {
       size_t i = _i + arena_start;
       if (i >= max_arena) { i -= max_arena; }
@@ -2227,10 +2231,16 @@ static void mi_arenas_try_purge(bool force, bool visit_all, mi_subproc_t* subpro
             max_purge_count--;
           }
         }
+        const mi_msecs_t aexpire = mi_atomic_loadi64_relaxed(&arena->purge_expire);
+        if (aexpire != 0 && (next_expire == 0 || aexpire < next_expire)) { next_expire = aexpire; }
       }
     }
-    if (all_visited && !any_purged) {
-      mi_atomic_storei64_release(&subproc->purge_expire, (mi_msecs_t)0);
+    MI_UNUSED(any_purged);
+    if (all_visited) {
+      // we saw every arena: subproc->purge_expire becomes the earliest pending
+      // per-arena expire (0 if none) so the scavenger's next wait is exact.
+      mi_msecs_t expected = arenas_expire;
+      mi_atomic_casi64_strong_acq_rel(&subproc->purge_expire, &expected, next_expire);
     }
   }
 }

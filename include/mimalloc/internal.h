@@ -251,6 +251,7 @@ void*         _mi_arenas_alloc_aligned(mi_heap_t* heap, size_t size, size_t alig
 void          _mi_arenas_free(void* p, size_t size, mi_memid_t memid);
 bool          _mi_arenas_contain(const void* p);
 void          _mi_arenas_collect(bool force_purge, bool visit_all, mi_tld_t* tld);
+void          _mi_arenas_try_purge(bool force, bool visit_all, mi_subproc_t* subproc, size_t tseq);
 void          _mi_arenas_unsafe_destroy_all(mi_subproc_t* subproc);
 
 mi_page_t*    _mi_arenas_page_alloc(mi_theap_t* theap, size_t block_size, size_t page_alignment);
@@ -269,6 +270,11 @@ void          _mi_prof_sample(mi_theap_t* theap, mi_page_t* page, void* p, size_
 void          _mi_prof_free(const void* p);
 void          _mi_prof_init(void);
 void          _mi_prof_theap_init(mi_theap_t* theap);
+
+// scavenger.c
+void          _mi_scavenger_start(void);
+void          _mi_scavenger_stop(void);
+void          _mi_scavenger_wake(mi_subproc_t* subproc);
 void          _mi_prof_theap_lazy_enable(mi_theap_t* theap);
 size_t        _mi_prof_rate(void);
 void          _mi_prof_on_exit(void);

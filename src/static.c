@@ -36,6 +36,7 @@ terms of the MIT license. A copy of the license can be found in the file
 #include "page.c"           // includes page-queue.c
 #include "page-map.c"
 #include "random.c"
+#include "scavenger.c"
 #include "stats.c"
 #include "theap.c"
 #include "threadlocal.c"

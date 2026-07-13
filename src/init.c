@@ -1158,6 +1158,7 @@ static void mi_process_init_once(void) mi_attr_noexcept {
       mi_reserve_os_memory((size_t)ksize*MI_KiB, true, true);
     }
   }
+  _mi_scavenger_start();
 }
 
 /* -----------------------------------------------------------
@@ -1264,6 +1265,9 @@ void mi_cdecl mi_process_done(void) mi_attr_noexcept {
   static bool process_done = false;
   if (process_done) return;
   process_done = true;
+
+  // stop the background scavenger before any teardown
+  _mi_scavenger_stop();
 
   // write a heap snapshot / heap profile if requested (before any cleanup so the live state is captured)
   _mi_heap_snapshot_on_exit();
