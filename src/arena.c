@@ -1343,7 +1343,9 @@ void _mi_arenas_purge_abandoned_holes(mi_heap_t* heap) {
   mi_forall_arenas(heap, ((mi_arena_t*)NULL), 0, arena) {
     mi_arena_pages_t* const arena_pages = mi_heap_arena_pages(heap, arena);
     if (arena_pages != NULL) {
-      for (size_t bin = 0; bin < MI_BIN_COUNT; bin++) {
+      // pages_abandoned[] is MI_ARENA_BIN_COUNT wide, not MI_BIN_COUNT: bins above the
+      // singleton bins have no abandoned bitmap (upstream ad1bcdbf, to shrink arena meta).
+      for (size_t bin = 0; bin < MI_ARENA_BIN_COUNT; bin++) {
         if (mi_atomic_load_relaxed(&heap->abandoned_count[bin]) == 0) continue;
         mi_bitmap_t* const bitmap = arena_pages->pages_abandoned[bin];
         (void)_mi_bitmap_forall_set(bitmap, &mi_arena_page_purge_holes_at, arena, bitmap);
@@ -1385,7 +1387,7 @@ void _mi_arenas_holes_report(mi_heap_t* heap, mi_holes_report_t* rep) {
   mi_forall_arenas(heap, ((mi_arena_t*)NULL), 0, arena) {
     mi_arena_pages_t* const arena_pages = mi_heap_arena_pages(heap, arena);
     if (arena_pages != NULL) {
-      for (size_t bin = 0; bin < MI_BIN_COUNT; bin++) {
+      for (size_t bin = 0; bin < MI_ARENA_BIN_COUNT; bin++) {   // see above: not MI_BIN_COUNT
         if (mi_atomic_load_relaxed(&heap->abandoned_count[bin]) == 0) continue;
         mi_arena_holes_report_arg_t ra = { arena_pages->pages_abandoned[bin], rep };
         (void)_mi_bitmap_forall_set(ra.bitmap, &mi_arena_page_holes_report_at, arena, &ra);
