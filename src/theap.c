@@ -186,6 +186,7 @@ void mi_theap_purge_holes(mi_theap_t* theap) mi_attr_noexcept {
 
 void mi_purge_holes(void) mi_attr_noexcept {
   if (!mi_option_is_enabled(mi_option_purge_holes)) return;
+  _mi_page_holes_reset_ineligible();   // the ineligible counters are a gauge over this sweep
   mi_theap_t* const theap0 = _mi_theap_default();
   if (theap0 == NULL || !mi_theap_is_initialized(theap0) || theap0->tld == NULL) return;
   mi_tld_t* const tld = theap0->tld;
@@ -719,14 +720,14 @@ bool _mi_theap_area_visit_blocks(const mi_heap_area_t* area, mi_page_t* page, mi
     size_t bit = blockidx - (bitidx * MI_INTPTR_BITS);
     free_map[bitidx] |= ((uintptr_t)1 << bit);
   }
-  // purged blocks are free too, but held off the free list (see the hole purging
-  // section in `page.c`); a page with purged blocks has capacity <= MI_PAGE_PURGE_MAX_BLOCKS.
+  // purged blocks are free too, but held off the free list (see the hole purging section in
+  // `page.c`): a block is purged exactly when it overlaps a discarded OS page of the page.
   #if MI_DEBUG>1
   size_t purged_count = 0;
   #endif
   if (mi_page_has_purged(page)) {
     for (size_t blockidx = 0; blockidx < page->capacity; blockidx++) {
-      if (!mi_page_purged_at(page, blockidx)) continue;
+      if (!mi_page_block_index_is_purged(page, blockidx)) continue;
       #if MI_DEBUG>1
       purged_count++;
       #endif

@@ -20,7 +20,7 @@ terms of the MIT license. A copy of the license can be found in the file
 
 #include "mimalloc.h"
 #include "mimalloc-stats.h"
-#include "mimalloc/internal.h"   // _mi_ptr_page, _mi_page_purged_count, _mi_page_purge_run_range
+#include "mimalloc/internal.h"   // _mi_ptr_page, _mi_page_purged_count, _mi_page_purge_os_page_blocks
 
 #include "testhelper.h"
 
@@ -38,18 +38,24 @@ typedef struct hole_stats_s {
   int64_t discards;       // discard syscalls
   int64_t reuses;         // reuse syscalls
   int64_t pages_freed;    // pages the sweep found all-free and gave back to the arena
+  int64_t inelig_pages;   // pages the last sweep could not purge at all
+  int64_t inelig_bytes;
+  int64_t inelig_free;
 } hole_stats_t;
 
 static hole_stats_t hole_stats(void) {
   mi_purge_holes_stats_t s;
   mi_purge_holes_stats_get(&s);
   hole_stats_t h;
-  h.bytes_now   = (int64_t)s.purged_bytes;
-  h.bytes_total = (int64_t)s.purged_bytes_total;
-  h.blocks_now  = (int64_t)s.purged_blocks;
-  h.discards    = (int64_t)s.discard_calls;
-  h.reuses      = (int64_t)s.reuse_calls;
-  h.pages_freed = (int64_t)s.pages_freed;
+  h.bytes_now    = (int64_t)s.purged_bytes;
+  h.bytes_total  = (int64_t)s.purged_bytes_total;
+  h.blocks_now   = (int64_t)s.purged_blocks;
+  h.discards     = (int64_t)s.discard_calls;
+  h.reuses       = (int64_t)s.reuse_calls;
+  h.pages_freed  = (int64_t)s.pages_freed;
+  h.inelig_pages = (int64_t)s.ineligible_pages;
+  h.inelig_bytes = (int64_t)s.ineligible_bytes;
+  h.inelig_free  = (int64_t)s.ineligible_free_bytes;
   return h;
 }
 
@@ -117,7 +123,15 @@ static uint32_t rng_next(void) {
 // 1. survivors: scattered live blocks must be byte-for-byte intact after purging
 // ---------------------------------------------------------------------------
 
-static bool test_survivors(size_t bsize, size_t count, size_t keep_every, bool* out_purged) {
+// A hole is discarded one OS page at a time, so a run of free blocks only yields something
+// once it covers a whole OS page: leave at least 2 OS pages worth of free blocks between the
+// survivors, whatever the block size (this is what makes the small size classes purge at all).
+static bool test_survivors(size_t bsize, bool* out_purged) {
+  const size_t os_page = _mi_os_page_size();
+  const size_t keep_every = (((2 * os_page) + bsize - 1) / bsize) + 2;
+  size_t count = keep_every * 32;
+  if (count < 256) { count = 256; }
+
   void** ptrs = (void**)calloc(count, sizeof(void*));
   if (ptrs == NULL) return false;
   bool ok_all = true;
@@ -432,6 +446,77 @@ static bool test_abandoned(void) {
 }
 
 // ---------------------------------------------------------------------------
+// 6. large pages (4MB, for blocks over ~84KB). Whether they fit the OS-page bitmap depends
+//    on the OS page size: 4MB/4KB = 1024 bits does not fit, 4MB/16KB = 256 bits does. So we
+//    assert what the page itself reports: either it is eligible and its holes are discarded,
+//    or it is ineligible and the sweep counts it (and discards nothing). Either way its data
+//    must survive.
+// ---------------------------------------------------------------------------
+
+#define LARGE_N   (32)
+#define LARGE_SZ  (128 * 1024)   // > MI_MEDIUM_MAX_OBJ_SIZE, so these land in large (4MB) pages
+
+static bool test_large_pages(void) {
+  void** ptrs = (void**)calloc(LARGE_N, sizeof(void*));
+  if (ptrs == NULL) return false;
+  bool ok_all = true;
+
+  for (size_t i = 0; i < LARGE_N; i++) {
+    ptrs[i] = mi_malloc(LARGE_SZ);
+    if (ptrs[i] == NULL) { ok_all = false; goto done; }
+    pattern_fill(ptrs[i], LARGE_SZ, i);
+  }
+  const bool eligible = mi_page_can_purge_holes(_mi_ptr_page(ptrs[0]));
+  for (size_t i = 1; i < LARGE_N; i += 2) { mi_free(ptrs[i]); ptrs[i] = NULL; }
+
+  const hole_stats_t before = hole_stats();
+  mi_purge_holes();
+  const hole_stats_t after = hole_stats();
+  const size_t npurged = purged_blocks(ptrs, LARGE_N);
+
+  if (purging_enabled && eligible) {
+    if (npurged == 0) {
+      fprintf(stderr, "\n  the large pages are eligible but nothing was discarded in them\n");
+      ok_all = false;
+    }
+    if (!expect_purged(before, "large-pages")) { ok_all = false; }
+  }
+  else if (purging_enabled && !eligible) {
+    if (npurged != 0) {
+      fprintf(stderr, "\n  an ineligible large page was purged after all\n");
+      ok_all = false;
+    }
+    if (after.inelig_pages <= 0 || after.inelig_free <= 0) {
+      fprintf(stderr, "\n  the ineligible large pages are not reported (%lld pages, %lld free bytes)\n",
+              (long long)after.inelig_pages, (long long)after.inelig_free);
+      ok_all = false;
+    }
+  }
+  else if (npurged != 0) {
+    fprintf(stderr, "\n  purging is off but a large page was purged\n");
+    ok_all = false;
+  }
+
+  for (size_t i = 0; i < LARGE_N; i += 2) {
+    const size_t bad = pattern_check(ptrs[i], LARGE_SZ, i);
+    if (bad != LARGE_SZ) {
+      fprintf(stderr, "\n  CORRUPT large-page survivor %zu at offset %zu\n", i, bad);
+      ok_all = false;
+      break;
+    }
+    memset(ptrs[i], 0x6D, LARGE_SZ);   // and still writable
+  }
+  fprintf(stderr, "(%s; %lld ineligible pages, %lld bytes, %lld of them free) ",
+          (eligible ? "eligible" : "INELIGIBLE"),
+          (long long)after.inelig_pages, (long long)after.inelig_bytes, (long long)after.inelig_free);
+
+done:
+  for (size_t i = 0; i < LARGE_N; i++) { if (ptrs[i] != NULL) mi_free(ptrs[i]); }
+  free(ptrs);
+  return ok_all;
+}
+
+// ---------------------------------------------------------------------------
 // 6. option off == no-op
 // ---------------------------------------------------------------------------
 
@@ -471,56 +556,55 @@ done:
 }
 
 // ---------------------------------------------------------------------------
-// 6. unit test of the run -> OS-page-aligned-interior arithmetic
-//    (this is what catches the arm64/16KB bug class on a 4KB CI box)
+// 7. unit test of the OS-page -> overlapping-blocks arithmetic. Everything else
+//    is derived from it: getting `last` one block short is a silent over-discard
+//    of a live block. (this is also what catches the arm64/16KB bug class on a
+//    4KB CI box)
 // ---------------------------------------------------------------------------
 
-static bool check_run_range(size_t ospage, size_t bsize, uintptr_t pstart, size_t start, size_t len, size_t capacity) {
-  uintptr_t ds = 0; size_t dsz = 0;
-  const bool discarded = _mi_page_purge_run_range(ospage, bsize, pstart, start, len, &ds, &dsz);
+// brute force: does block `i` overlap the byte range [lo,hi)?
+static bool block_overlaps(size_t i, size_t bsize, uintptr_t pstart, uintptr_t lo, uintptr_t hi) {
+  const uintptr_t blo = pstart + (i * bsize);
+  const uintptr_t bhi = blo + bsize;
+  return (blo < hi && lo < bhi);
+}
 
-  const uintptr_t lo = pstart + (start * bsize);         // first byte of the run
-  const uintptr_t hi = lo + (len * bsize);               // one past the last byte of the run
-  const uintptr_t pend = pstart + (capacity * bsize);    // one past the last block of the page
+static bool check_os_page_blocks(size_t ospage, size_t bsize, uintptr_t pstart, size_t capacity, size_t k) {
+  size_t first = 0, last = 0;
+  const bool inside = _mi_page_purge_os_page_blocks(ospage, bsize, pstart, capacity, k, &first, &last);
 
-  if (!discarded) {
-    if (ds != 0 || dsz != 0) { fprintf(stderr, "\n  no discard but range is %p+%zu\n", (void*)ds, dsz); return false; }
-    // nothing discarded is only correct when the run holds no whole OS page
-    const uintptr_t alo = (lo + ospage - 1) & ~(uintptr_t)(ospage - 1);
-    const uintptr_t ahi = hi & ~(uintptr_t)(ospage - 1);
-    if (ahi > alo) {
-      fprintf(stderr, "\n  MISSED a whole OS page: ospage=%zu bsize=%zu run=[%zu,%zu)\n", ospage, bsize, start, start + len);
-      return false;
-    }
+  const uintptr_t base = pstart & ~(uintptr_t)(ospage - 1);
+  const uintptr_t lo = base + (k * ospage);
+  const uintptr_t hi = lo + ospage;
+  const uintptr_t pend = pstart + (capacity * bsize);
+  const bool want_inside = (lo >= pstart && hi <= pend);
+
+  if (inside != want_inside) {
+    fprintf(stderr, "\n  inside=%d but the OS page [%p,%p) vs area [%p,%p) says %d\n",
+            (int)inside, (void*)lo, (void*)hi, (void*)pstart, (void*)pend, (int)want_inside);
+    return false;
+  }
+  if (!inside) {
+    if (first != 0 || last != 0) { fprintf(stderr, "\n  not inside but got [%zu,%zu]\n", first, last); return false; }
     return true;
   }
-
-  if ((ds % ospage) != 0 || (dsz % ospage) != 0) {
-    fprintf(stderr, "\n  not OS-page aligned: %p+%zu (ospage=%zu)\n", (void*)ds, dsz, ospage);
-    return false;
+  // [first,last] must be EXACTLY the blocks overlapping the OS page
+  for (size_t i = 0; i < capacity; i++) {
+    const bool overlaps = block_overlaps(i, bsize, pstart, lo, hi);
+    const bool reported = (i >= first && i <= last);
+    if (overlaps != reported) {
+      fprintf(stderr, "\n  block %zu overlaps=%d but reported=%d (range [%zu,%zu], os page [%p,%p))\n",
+              i, (int)overlaps, (int)reported, first, last, (void*)lo, (void*)hi);
+      return false;
+    }
   }
-  if (ds < lo || ds + dsz > hi) {
-    fprintf(stderr, "\n  OUTSIDE the run: discard [%p,%p) run [%p,%p)\n", (void*)ds, (void*)(ds + dsz), (void*)lo, (void*)hi);
-    return false;
-  }
-  if (ds < pstart || ds + dsz > pend) {
-    fprintf(stderr, "\n  OUTSIDE the page: discard [%p,%p) page [%p,%p)\n", (void*)ds, (void*)(ds + dsz), (void*)pstart, (void*)pend);
-    return false;
-  }
-  // maximal: exactly the OS-page-aligned interior of the run
-  const uintptr_t alo = (lo + ospage - 1) & ~(uintptr_t)(ospage - 1);
-  const uintptr_t ahi = hi & ~(uintptr_t)(ospage - 1);
-  if (ds != alo || dsz != (size_t)(ahi - alo)) {
-    fprintf(stderr, "\n  not the aligned interior: got [%p,%p) want [%p,%p)\n",
-            (void*)ds, (void*)(ds + dsz), (void*)alo, (void*)ahi);
-    return false;
-  }
+  if (last >= capacity) { fprintf(stderr, "\n  last=%zu is beyond capacity=%zu\n", last, capacity); return false; }
   return true;
 }
 
-static bool test_run_arithmetic(void) {
+static bool test_os_page_arithmetic(void) {
   static const size_t ospages[] = { 4096, 16384 };
-  static const size_t bsizes[]  = { 64, 512, 1024, 4096, 8192, 10240, 10256, 16384, 21856, 65536 };
+  static const size_t bsizes[]  = { 16, 32, 64, 512, 1024, 4096, 8192, 10240, 10256, 16384, 21856, 65536 };
   // page_start offsets: the block area does not have to be OS-page aligned
   static const size_t offsets[] = { 0, 8, 64, 128, 4096, 8192, 12288 };
 
@@ -531,12 +615,15 @@ static bool test_run_arithmetic(void) {
       const size_t bsize = bsizes[bi];
       for (size_t fi = 0; fi < sizeof(offsets)/sizeof(offsets[0]); fi++) {
         const uintptr_t pstart = (uintptr_t)0x40000000u + offsets[fi];
-        const size_t capacity = 128;
-        for (size_t start = 0; start < capacity; start++) {
-          for (size_t len = 0; len + start <= capacity; len++) {
-            if (!check_run_range(ospage, bsize, pstart, start, len, capacity)) {
-              fprintf(stderr, "  (case: ospage=%zu bsize=%zu offset=%zu start=%zu len=%zu)\n",
-                      ospage, bsize, offsets[fi], start, len);
+        // a 64KB and a 512KB page worth of blocks, plus a degenerate one
+        const size_t caps[] = { 0, 1, (64*1024) / bsize, (512*1024) / bsize };
+        for (size_t ci = 0; ci < sizeof(caps)/sizeof(caps[0]); ci++) {
+          const size_t capacity = caps[ci];
+          const size_t nk = (((capacity * bsize) + (pstart - (pstart & ~(uintptr_t)(ospage-1)))) / ospage) + 2;
+          for (size_t k = 0; k < nk; k++) {
+            if (!check_os_page_blocks(ospage, bsize, pstart, capacity, k)) {
+              fprintf(stderr, "  (case: ospage=%zu bsize=%zu offset=%zu capacity=%zu k=%zu)\n",
+                      ospage, bsize, offsets[fi], capacity, k);
               return false;
             }
             cases++;
@@ -594,24 +681,30 @@ int main(void) {
   fprintf(stderr, "purge_holes is %s, os page size is %zu\n",
           (purging_enabled ? "ON" : "OFF"), (size_t)_mi_os_page_size());
 
-  CHECK("run-arithmetic", test_run_arithmetic());
+  CHECK("os-page-arithmetic", test_os_page_arithmetic());
 
-  // an eligible page holds at most MI_PAGE_PURGE_MAX_BLOCKS blocks; 1024-byte
-  // blocks in a 64KB page (64 blocks) is the case the old `block_size >= os_page`
-  // gate excluded, and the one that needs whole *runs* to cover an OS page.
+  // The bitmap is indexed by OS page, so eligibility no longer depends on the block count:
+  // every size class of a small (64KB) or medium (512KB) page is eligible, down to the
+  // smallest one. A run of free blocks still has to cover a whole OS page.
   bool purged_any = false;
-  bool p1 = false, p2 = false, p3 = false, p4 = false;
-  CHECK("survivors-1024",  test_survivors(1024, 2048, 32, &p1));
-  CHECK("survivors-4096",  test_survivors(4096, 1024, 16, &p2));
-  CHECK("survivors-8192",  test_survivors(8192, 512, 8, &p3));
-  CHECK("survivors-16384", test_survivors(16384, 256, 4, &p4));
-  purged_any = (p1 || p2 || p3 || p4);
-  // 256-byte blocks give 256 blocks per 64KB page: too many for the bitmap, so
-  // the page is not eligible -- but it must of course still be uncorrupted.
-  CHECK("survivors-256-ineligible", test_survivors(256, 4096, 32, NULL));
+  bool ps[8];
+  for (size_t i = 0; i < 8; i++) { ps[i] = false; }
+  CHECK("survivors-16",    test_survivors(16, &ps[0]));
+  CHECK("survivors-64",    test_survivors(64, &ps[1]));
+  CHECK("survivors-256",   test_survivors(256, &ps[2]));
+  CHECK("survivors-1024",  test_survivors(1024, &ps[3]));
+  CHECK("survivors-4096",  test_survivors(4096, &ps[4]));
+  CHECK("survivors-8192",  test_survivors(8192, &ps[5]));
+  CHECK("survivors-16384", test_survivors(16384, &ps[6]));
+  CHECK("survivors-65536", test_survivors(65536, &ps[7]));   // medium page (512KB)
+  purged_any = false;
+  for (size_t i = 0; i < 8; i++) { purged_any = purged_any || ps[i]; }
 
   if (purging_enabled) {
     CHECK("purging-actually-happened", purged_any);
+    // the small size classes are what this rework unlocked: they must purge now
+    CHECK("small-blocks-are-eligible", (ps[0] && ps[1] && ps[2] && ps[3]));
+    CHECK("medium-page-is-eligible", ps[7]);
   }
   else {
     CHECK("nothing-purged-when-off", !purged_any);
@@ -621,6 +714,7 @@ int main(void) {
   CHECK("aligned-16k", test_aligned());
   CHECK("page-lifecycle", test_page_lifecycle());
   CHECK("abandoned-pages", test_abandoned());
+  CHECK("large-pages", test_large_pages());
   CHECK("option-off-is-noop", test_option_off());
 
   // everything above is freed by now, so every hole must have been handed back
@@ -629,6 +723,8 @@ int main(void) {
   fprintf(stderr, "holes: %lld bytes discarded in total over %lld discards / %lld reuses; %lld pages freed by the sweep; %lld bytes still discarded\n",
           (long long)end.bytes_total, (long long)end.discards, (long long)end.reuses,
           (long long)end.pages_freed, (long long)end.bytes_now);
+  fprintf(stderr, "holes: the last sweep could not touch %lld pages (%lld bytes, of which %lld bytes free)\n",
+          (long long)end.inelig_pages, (long long)end.inelig_bytes, (long long)end.inelig_free);
   CHECK("no-holes-outstanding-at-exit", (end.bytes_now == 0 && end.blocks_now == 0));
 
   mi_stats_print(NULL);

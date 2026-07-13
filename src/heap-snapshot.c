@@ -151,11 +151,11 @@ static void mi_snap_emit_page_freemap(mi_snap_out_t* out, mi_page_t* page) {
       size_t idx = (hi + off) >> shift;
       if (idx < cap) { map[idx >> 3] |= (uint8_t)(1u << (idx & 7)); }
     }
-    // purged blocks are free as well, but held off the free list (see the hole
-    // purging section in `page.c`); a purged page always has cap <= 128 < 4096.
+    // purged blocks are free as well, but held off the free list (see the hole purging
+    // section in `page.c`): a block is purged when it overlaps a discarded OS page.
     if (mi_page_has_purged(page)) {
-      for (size_t idx = 0; idx < cap && idx < MI_PAGE_PURGE_MAX_BLOCKS; idx++) {
-        if (mi_page_purged_at(page, idx)) { map[idx >> 3] |= (uint8_t)(1u << (idx & 7)); }
+      for (size_t idx = 0; idx < cap; idx++) {
+        if (mi_page_block_index_is_purged(page, idx)) { map[idx >> 3] |= (uint8_t)(1u << (idx & 7)); }
       }
     }
     mi_snap_u32(out, (uint32_t)nbytes);
@@ -176,6 +176,12 @@ static void mi_snap_emit_page_freemap(mi_snap_out_t* out, mi_page_t* page) {
       size_t byte = idx >> 3;
       if (byte >= emitted && byte < emitted + take) {
         map[byte - emitted] |= (uint8_t)(1u << (idx & 7));
+      }
+    }
+    // and the purged blocks in this window (free, but held off the free list)
+    if (mi_page_has_purged(page)) {
+      for (size_t idx = (emitted << 3); idx < cap && (idx >> 3) < emitted + take; idx++) {
+        if (mi_page_block_index_is_purged(page, idx)) { map[(idx >> 3) - emitted] |= (uint8_t)(1u << (idx & 7)); }
       }
     }
     mi_snap_put(out, map, take);

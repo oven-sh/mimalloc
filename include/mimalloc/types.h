@@ -193,12 +193,15 @@ terms of the MIT license. A copy of the license can be found in the file
 #error maximum object size may be too small to hold local thread data
 #endif
 
-// Hole purging: a block-indexed bitmap of free blocks whose memory has been
-// discarded. Only pages with `reserved <= MI_PAGE_PURGE_MAX_BLOCKS` are eligible,
-// so this bound is enforced at runtime and every bitmap index is < reserved.
-// (see `mi_page_can_purge_holes` and the "Page hole purging" section in page.c)
-#define MI_PAGE_PURGE_MAX_BLOCKS          (128)
-#define MI_PAGE_PURGE_WORDS               (MI_PAGE_PURGE_MAX_BLOCKS / 64)
+// Hole purging: a bitmap of the OS pages inside a mimalloc page whose memory has been
+// discarded. It is indexed by OS page (not by block), so its size does not depend on the
+// size class: a page needs `page_size/os_page_size` bits (plus one for the partial OS page
+// that holds the page header). 256 bits covers every small (64 KiB) and medium (512 KiB)
+// page on every OS page size, and a large (4 MiB) page when the OS page is 16 KiB. A large
+// page on a 4 KiB OS page needs 1025 bits and stays ineligible -- the capacity check is at
+// runtime (see `mi_page_can_purge_holes` and the "Page hole purging" section in page.c).
+#define MI_PAGE_PURGE_BITS                (256)
+#define MI_PAGE_PURGE_WORDS               (MI_PAGE_PURGE_BITS / 64)
 
 #define MI_SMALL_PAGE_SIZE                MI_ARENA_MIN_OBJ_SIZE                    // 64 KiB
 #define MI_MEDIUM_PAGE_SIZE               (8*MI_SMALL_PAGE_SIZE)                   // 512 KiB  (=byte in the bchunk bitmap)
@@ -415,11 +418,12 @@ typedef struct mi_page_s {
   size_t                    slice_committed;   // committed size relative to the first arena slice of the page data (or 0 if the page is fully committed already)
   mi_memid_t                memid;             // const: provenance of the page memory
 
-  // Free blocks taken OFF the free list because their memory was discarded to
-  // the OS. Out-of-band on purpose: mimalloc threads its free list through the
-  // free blocks themselves, so a discarded block cannot hold a `next` pointer.
-  // Cold: touched only by the idle hole-purge sweep, so it must stay *after* the
-  // fields above (see `mi_page_hot_fields_first_cacheline` in `page.c`).
+  // The OS pages inside this page whose memory was discarded to the OS. A block is
+  // "purged" exactly when it overlaps one of them (we discard an OS page only when every
+  // block overlapping it is free), and a purged block is held OFF every free list: mimalloc
+  // threads its free list through the free blocks themselves, so a discarded block cannot
+  // hold a `next` pointer. Cold: touched only by the idle hole-purge sweep, so it must stay
+  // *after* the fields above (see `mi_page_hot_fields_first_cacheline` in `page.c`).
   uint64_t                  purged[MI_PAGE_PURGE_WORDS];
 } mi_page_t;
 
