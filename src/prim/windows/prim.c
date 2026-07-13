@@ -399,6 +399,18 @@ int _mi_prim_reset(void* addr, size_t size) {
   return (p != NULL ? 0 : (int)GetLastError());
 }
 
+int _mi_prim_discard(void* addr, size_t size) {
+  // MEM_RESET keeps the range committed and accessible (contents become undefined).
+  // It must NOT be VirtualFree(MEM_DECOMMIT): the arena tracks commit per slice and
+  // cannot represent a sub-slice hole (see the hole purging section in `page.c`).
+  const int err = _mi_prim_reset(addr, size);
+  if (err != 0) return err;
+  // VirtualUnlock on a reset range removes it from the working set right away, so
+  // the rss drop is immediate (it fails with ERROR_NOT_LOCKED, which we ignore).
+  VirtualUnlock(addr, size);
+  return 0;
+}
+
 int _mi_prim_reuse(void* addr, size_t size) {
   MI_UNUSED(addr); MI_UNUSED(size);
   return 0;

@@ -678,6 +678,32 @@ bool _mi_os_purge(void* p, size_t size) {
   return _mi_os_purge_ex(p, size, true, size, NULL, NULL);
 }
 
+// Release the physical memory of a *committed* range while keeping that range
+// committed and accessible: the next access demand-faults a fresh page.
+// Unlike `_mi_os_purge`, this NEVER decommits -- whatever `purge_decommits`
+// says -- since commit is tracked per arena slice and cannot represent a
+// sub-slice hole (see the hole purging section in `page.c`).
+void _mi_os_discard(void* addr, size_t size) {
+  // page align conservatively *within* the range: never touch a partially covered OS page
+  size_t csize = 0;
+  void* const start = mi_os_page_align_area_conservative(addr, size, &csize);
+  if (csize == 0) return;
+  mi_os_stat_counter_increase(purge_calls, 1);
+  mi_os_stat_counter_increase(purged, csize);
+
+  #if (MI_DEBUG>1) && !MI_SECURE && !MI_TRACK_ENABLED
+  // pretend the discard is eager (as `_mi_os_reset` does): on macOS
+  // MADV_FREE_REUSABLE keeps the data until the pages are actually reclaimed, so
+  // without this a range that wrongly overlaps a *live* block would go unnoticed.
+  _mi_memzero(start, csize);
+  #endif
+
+  const int err = _mi_prim_discard(start, csize);
+  if (err != 0) {
+    _mi_warning_message("cannot discard OS memory (error: %d (0x%x), address: %p, size: 0x%zx bytes)\n", err, err, start, csize);
+  }
+}
+
 
 // Protect a region in memory to be not accessible.
 static  bool mi_os_protectx(void* addr, size_t size, bool protect) {

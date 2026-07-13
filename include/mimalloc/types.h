@@ -193,6 +193,13 @@ terms of the MIT license. A copy of the license can be found in the file
 #error maximum object size may be too small to hold local thread data
 #endif
 
+// Hole purging: a block-indexed bitmap of free blocks whose memory has been
+// discarded. Only pages with `reserved <= MI_PAGE_PURGE_MAX_BLOCKS` are eligible,
+// so this bound is enforced at runtime and every bitmap index is < reserved.
+// (see `mi_page_can_purge_holes` and the "Page hole purging" section in page.c)
+#define MI_PAGE_PURGE_MAX_BLOCKS          (128)
+#define MI_PAGE_PURGE_WORDS               (MI_PAGE_PURGE_MAX_BLOCKS / 64)
+
 #define MI_SMALL_PAGE_SIZE                MI_ARENA_MIN_OBJ_SIZE                    // 64 KiB
 #define MI_MEDIUM_PAGE_SIZE               (8*MI_SMALL_PAGE_SIZE)                   // 512 KiB  (=byte in the bchunk bitmap)
 #define MI_LARGE_PAGE_SIZE                (MI_SIZE_SIZE*MI_MEDIUM_PAGE_SIZE)       // 4 MiB    (=word in the bchunk bitmap)
@@ -400,6 +407,11 @@ typedef struct mi_page_s {
   uintptr_t                 keys[2];           // const: two random keys to encode the free lists (see `_mi_block_next`) or padding canary
   #endif
 
+  // Free blocks taken OFF the free list because their memory was discarded to
+  // the OS. Out-of-band on purpose: mimalloc threads its free list through the
+  // free blocks themselves, so a discarded block cannot hold a `next` pointer.
+  uint64_t                  purged[MI_PAGE_PURGE_WORDS];
+
   mi_theap_t*               theap;             // the theap owning this page (may not be valid or NULL for abandoned pages)
   mi_heap_t*                heap;              // const: the heap owning this page
 
@@ -421,7 +433,7 @@ typedef struct mi_page_s {
 #define MI_PAGE_MAX_OVERALLOC_ALIGN       MI_ARENA_SLICE_SIZE       // (64 KiB) limit for which we overallocate in arena pages, beyond this use OS allocation
 
 // The max object sizes are intended to not waste more than ~ 12.5% internally over the page sizes.
-#define MI_SMALL_MAX_OBJ_SIZE             ((MI_SMALL_PAGE_SIZE-MI_PAGE_OSPAGE_BLOCK_ALIGN2)/3)   // = 20 KiB
+#define MI_SMALL_MAX_OBJ_SIZE             ((MI_SMALL_PAGE_SIZE-MI_PAGE_OSPAGE_BLOCK_ALIGN2)/6)   // = 10 KiB
 #if MI_ENABLE_LARGE_PAGES
 #define MI_MEDIUM_MAX_OBJ_SIZE            ((MI_MEDIUM_PAGE_SIZE-MI_PAGE_OSPAGE_BLOCK_ALIGN2)/6)  // ~ 84 KiB
 #define MI_LARGE_MAX_OBJ_SIZE             (MI_LARGE_PAGE_SIZE/8)    // <= 512 KiB // note: this must be a nice power of 2 or we get rounding issues with `_mi_bin`

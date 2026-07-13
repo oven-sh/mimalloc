@@ -231,7 +231,17 @@ static void stress(intptr_t tid) {
       void* q = atomic_exchange_ptr(&transfer[transfer_idx], p);
       data[data_idx] = q;
     }
+    #ifndef USE_STD_MALLOC
+    if (chance(1, &r)) {
+      mi_purge_holes();   // 1% discard the free blocks inside still-used pages
+    }
+    #endif
   }
+
+  #ifndef USE_STD_MALLOC
+  // the retained blocks are exactly the "scattered survivors" case hole purging is for
+  mi_purge_holes();
+  #endif
 
   #ifdef MI_HEAP_WALK
   // walk the theap

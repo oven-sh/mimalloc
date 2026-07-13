@@ -187,6 +187,12 @@ typedef void (mi_cdecl mi_error_fun)(int err, void* arg);
 mi_decl_export void mi_register_error(mi_error_fun* fun, void* arg);
 
 mi_decl_export void mi_collect(bool force)      mi_attr_noexcept;
+
+// Discard the memory of free blocks inside still-used pages ("hole punching").
+// Call when the application is idle (e.g. before an event loop parks): a page
+// otherwise stays fully resident until every block in it is free, so a single
+// long-lived object can pin an entire 512KB page.
+mi_decl_export void mi_purge_holes(void)        mi_attr_noexcept;
 mi_decl_export int  mi_version(void)            mi_attr_noexcept;
 mi_decl_export void mi_options_print(void)      mi_attr_noexcept;
 mi_decl_export void mi_process_info_print(void) mi_attr_noexcept;
@@ -390,6 +396,7 @@ mi_decl_export mi_theap_t* mi_heap_theap(mi_heap_t* heap);
 mi_decl_export mi_theap_t* mi_theap_set_default(mi_theap_t* theap);
 mi_decl_export mi_theap_t* mi_theap_get_default(void);
 mi_decl_export void        mi_theap_collect(mi_theap_t* theap, bool force) mi_attr_noexcept;
+mi_decl_export void        mi_theap_purge_holes(mi_theap_t* theap) mi_attr_noexcept;
 
 mi_decl_nodiscard mi_decl_export mi_decl_restrict void* mi_theap_malloc(mi_theap_t* theap, size_t size) mi_attr_noexcept mi_attr_malloc mi_attr_alloc_size(2);
 mi_decl_nodiscard mi_decl_export mi_decl_restrict void* mi_theap_zalloc(mi_theap_t* theap, size_t size) mi_attr_noexcept mi_attr_malloc mi_attr_alloc_size(2);
@@ -502,6 +509,7 @@ typedef enum mi_option_e {
   mi_option_snapshot_on_exit,           // write a heap snapshot on process exit (=0). 1=on, 2=on with per-block freemaps. Path from MIMALLOC_SNAPSHOT_PATH or "mimalloc-snapshot.<pid>.bin".
   mi_option_prof_sample_rate,           // bytes per heap-profile sample (=0, off). Typical: 524288. Dumps profile.proto on exit to MIMALLOC_PROF_PATH.
   mi_option_scavenger,                  // run a background scavenger thread that purges freed arena memory when due (=1)
+  mi_option_purge_holes,                // discard the memory of free blocks inside a still-used page (=1)
   _mi_option_last,
   // legacy option names
   mi_option_large_os_pages = mi_option_allow_large_os_pages,

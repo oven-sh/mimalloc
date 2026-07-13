@@ -795,7 +795,7 @@ if (MI_BUILD_TESTS)
   enable_testing()
 
   # static link tests
-  set(mi_static_tests api api-fill stress heap-mt heap-delete-race heap-churn fork-user-heap snapshot prof prof-adversarial theap-sentinel)
+  set(mi_static_tests api api-fill stress heap-mt heap-delete-race heap-churn fork-user-heap snapshot prof prof-adversarial theap-sentinel purge-holes)
   if (MI_DEBUG_FULL OR CMAKE_BUILD_TYPE MATCHES "Debug")
     list(APPEND mi_static_tests commit-fail)  # uses mi_debug_fail_os_commit_after (MI_DEBUG>0 only)
   endif()
@@ -813,6 +813,9 @@ if (MI_BUILD_TESTS)
     endif()
     add_test(NAME test-${TEST_NAME} COMMAND mimalloc-test-${TEST_NAME})
   endforeach()
+
+  # the same hole-purging tests with the feature turned off: it must be a no-op
+  add_test(NAME test-purge-holes-off COMMAND ${CMAKE_COMMAND} -E env MIMALLOC_PURGE_HOLES=0 $<TARGET_FILE:mimalloc-test-purge-holes>)
 
   # heap snapshot reader CLI (standalone, no mimalloc dependency)
   add_executable(mi-heapview tools/mi-heapview.c)

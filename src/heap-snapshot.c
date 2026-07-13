@@ -151,6 +151,13 @@ static void mi_snap_emit_page_freemap(mi_snap_out_t* out, mi_page_t* page) {
       size_t idx = (hi + off) >> shift;
       if (idx < cap) { map[idx >> 3] |= (uint8_t)(1u << (idx & 7)); }
     }
+    // purged blocks are free as well, but held off the free list (see the hole
+    // purging section in `page.c`); a purged page always has cap <= 128 < 4096.
+    if (mi_page_has_purged(page)) {
+      for (size_t idx = 0; idx < cap && idx < MI_PAGE_PURGE_MAX_BLOCKS; idx++) {
+        if (mi_page_purged_at(page, idx)) { map[idx >> 3] |= (uint8_t)(1u << (idx & 7)); }
+      }
+    }
     mi_snap_u32(out, (uint32_t)nbytes);
     mi_snap_put(out, map, nbytes);
     return;

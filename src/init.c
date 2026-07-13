@@ -34,6 +34,7 @@ const mi_page_t _mi_page_empty = {
   #if (MI_PADDING || MI_ENCODE_FREELIST)
   { 0, 0 },               // keys
   #endif
+  { 0 },                  // purged
   NULL,                   // theap
   NULL,                   // heap
   NULL, NULL,             // next, prev

@@ -213,6 +213,7 @@ mi_decl_nodiscard bool _mi_os_protect(void* addr, size_t size);
 bool          _mi_os_unprotect(void* addr, size_t size);
 bool          _mi_os_purge(void* p, size_t size);
 bool          _mi_os_purge_ex(void* p, size_t size, bool allow_reset, size_t stats_size, mi_commit_fun_t* commit_fun, void* commit_fun_arg);
+void          _mi_os_discard(void* p, size_t size);
 
 size_t        _mi_os_secure_guard_page_size(void);
 bool          _mi_os_secure_guard_page_set_at(void* addr, mi_memid_t memid);
@@ -782,6 +783,39 @@ static inline size_t mi_page_committed(const mi_page_t* page) {
 static inline bool mi_page_all_free(const mi_page_t* page) {
   mi_assert_internal(page != NULL);
   return (page->used == 0);
+}
+
+// ------------------------------------------------------
+// Page hole purging  (see the "Page hole purging" section in `page.c`)
+// ------------------------------------------------------
+
+void          _mi_page_purge_holes(mi_page_t* page);
+void          _mi_page_purged_reset(mi_page_t* page);
+bool          _mi_page_unpurge_one(mi_page_t* page);
+size_t        _mi_page_purged_count(const mi_page_t* page);
+bool          _mi_page_purge_run_range(size_t os_page_size, size_t block_size, uintptr_t page_start,
+                                       size_t start, size_t len, uintptr_t* discard_start, size_t* discard_size);
+
+// Eligible when the block count fits the out-of-band bitmap. There is no lower
+// bound on the block size: the discard covers only the OS-page-aligned interior
+// of a *run* of adjacent free blocks, so several small blocks can together cover
+// a whole OS page (and a run too short to contain one discards nothing).
+// `reserved` bounds every bitmap index we can ever set (idx < capacity <= reserved).
+static inline bool mi_page_can_purge_holes(const mi_page_t* page) {
+  return (page->reserved <= MI_PAGE_PURGE_MAX_BLOCKS && page->reserved > 1);
+}
+
+static inline bool mi_page_has_purged(const mi_page_t* page) {
+  for (size_t i = 0; i < MI_PAGE_PURGE_WORDS; i++) {
+    if (page->purged[i] != 0) return true;
+  }
+  return false;
+}
+
+// is the block at index `idx` free-but-discarded? (and thus not on any free list)
+static inline bool mi_page_purged_at(const mi_page_t* page, size_t idx) {
+  mi_assert_internal(idx < MI_PAGE_PURGE_MAX_BLOCKS);
+  return ((page->purged[idx / 64] >> (idx % 64)) & 1) != 0;
 }
 
 // are there immediately available blocks, i.e. blocks available on the free list.

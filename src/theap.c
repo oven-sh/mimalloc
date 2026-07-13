@@ -145,6 +145,33 @@ void _mi_theap_collect_abandon(mi_theap_t* theap) {
   mi_theap_collect_ex(theap, MI_ABANDON);
 }
 
+// Visit every page (INCLUDING the full queue, which a normal collect skips --
+// see mi_theap_collect_ex) and discard the memory of free blocks inside pages
+// that are still partially used. Meant to be called when the application knows
+// it is idle (e.g. from an event loop about to park): it costs a few madvise
+// calls and nothing on the alloc/free hot path.
+static bool mi_theap_page_purge_holes(mi_theap_t* theap, mi_page_queue_t* pq, mi_page_t* page, void* arg1, void* arg2) {
+  MI_UNUSED(theap); MI_UNUSED(pq); MI_UNUSED(arg1); MI_UNUSED(arg2);
+  _mi_page_free_collect(page, true);   // force: fold local_free (and thread_free) into `free` first
+  if (!mi_page_all_free(page)) {
+    _mi_page_purge_holes(page);
+  }
+  mi_assert_expensive(_mi_page_is_valid(page));
+  return true; // continue
+}
+
+void mi_theap_purge_holes(mi_theap_t* theap) mi_attr_noexcept {
+  if (theap == NULL || !mi_theap_is_initialized(theap)) return;
+  if (!mi_option_is_enabled(mi_option_purge_holes)) return;
+  // this rewrites the thread-local free list of every page, so only the owning thread may do it
+  if (theap->tld == NULL || theap->tld->thread_id != _mi_thread_id()) return;
+  mi_theap_visit_pages(theap, &mi_theap_page_purge_holes, true /* include full pages */, NULL, NULL);
+}
+
+void mi_purge_holes(void) mi_attr_noexcept {
+  mi_theap_purge_holes(_mi_theap_default());
+}
+
 void mi_theap_collect(mi_theap_t* theap, bool force) mi_attr_noexcept {
   mi_theap_collect_ex(theap, (force ? MI_FORCE : MI_NORMAL));
 }
@@ -654,7 +681,23 @@ bool _mi_theap_area_visit_blocks(const mi_heap_area_t* area, mi_page_t* page, mi
     size_t bit = blockidx - (bitidx * MI_INTPTR_BITS);
     free_map[bitidx] |= ((uintptr_t)1 << bit);
   }
-  mi_assert_internal(page->capacity == (free_count + page->used));
+  // purged blocks are free too, but held off the free list (see the hole purging
+  // section in `page.c`); a page with purged blocks has capacity <= MI_PAGE_PURGE_MAX_BLOCKS.
+  #if MI_DEBUG>1
+  size_t purged_count = 0;
+  #endif
+  if (mi_page_has_purged(page)) {
+    for (size_t blockidx = 0; blockidx < page->capacity; blockidx++) {
+      if (!mi_page_purged_at(page, blockidx)) continue;
+      #if MI_DEBUG>1
+      purged_count++;
+      #endif
+      const size_t bitidx = (blockidx / MI_INTPTR_BITS);
+      const size_t bit = blockidx - (bitidx * MI_INTPTR_BITS);
+      free_map[bitidx] |= ((uintptr_t)1 << bit);
+    }
+  }
+  mi_assert_internal(page->capacity == (free_count + purged_count + page->used));
 
   // walk through all blocks skipping the free ones
   #if MI_DEBUG>1

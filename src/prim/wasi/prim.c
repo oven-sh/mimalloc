@@ -148,6 +148,11 @@ int _mi_prim_reset(void* addr, size_t size) {
   return 0;
 }
 
+int _mi_prim_discard(void* addr, size_t size) {
+  MI_UNUSED(addr); MI_UNUSED(size);
+  return 0;
+}
+
 int _mi_prim_reuse(void* addr, size_t size) {
   MI_UNUSED(addr); MI_UNUSED(size);
   return 0;

@@ -64,6 +64,12 @@ int _mi_prim_decommit(void* addr, size_t size, bool* needs_recommit);
 // Returns error code or 0 on success.
 int _mi_prim_reset(void* addr, size_t size);
 
+// Discard memory: like `_mi_prim_reset`, but release the physical pages *now*
+// (so `rss` drops immediately) while keeping the range committed and accessible.
+// Never changes the commit state of the range (in particular, never MEM_DECOMMIT).
+// Returns error code or 0 on success.
+int _mi_prim_discard(void* addr, size_t size);
+
 // Reuse memory. This is called for memory that is already committed but
 // may have been reset (`_mi_prim_reset`) or decommitted (`_mi_prim_decommit`) where `needs_recommit` was false.
 // Returns error code or 0 on success. On most platforms this is a no-op.

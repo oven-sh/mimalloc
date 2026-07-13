@@ -39,6 +39,53 @@ static inline mi_block_t* mi_page_block_at(const mi_page_t* page, void* page_sta
 
 static bool mi_page_extend_free(mi_theap_t* theap, mi_page_t* page);
 
+
+/* -----------------------------------------------------------
+  Hole purging: the `page->purged` bitmap.
+  (see the "Page hole purging" section below for the algorithm)
+----------------------------------------------------------- */
+
+void _mi_page_purged_reset(mi_page_t* page) {
+  for (size_t i = 0; i < MI_PAGE_PURGE_WORDS; i++) { page->purged[i] = 0; }
+}
+
+static inline size_t mi_page_block_index(const mi_page_t* page, const mi_block_t* block) {
+  mi_assert_internal((uint8_t*)block >= page->page_start);
+  return ((size_t)((uint8_t*)block - page->page_start)) / page->block_size;
+}
+
+static inline mi_block_t* mi_page_block_index_at(const mi_page_t* page, size_t idx) {
+  mi_assert_internal(idx < page->capacity);
+  return (mi_block_t*)(page->page_start + (idx * page->block_size));
+}
+
+static inline void mi_page_purged_set(mi_page_t* page, size_t idx) {
+  mi_assert_internal(idx < MI_PAGE_PURGE_MAX_BLOCKS);
+  page->purged[idx / 64] |= ((uint64_t)1 << (idx % 64));
+}
+
+static inline void mi_page_purged_clear(mi_page_t* page, size_t idx) {
+  mi_assert_internal(idx < MI_PAGE_PURGE_MAX_BLOCKS);
+  page->purged[idx / 64] &= ~((uint64_t)1 << (idx % 64));
+}
+
+// size_t-based mi_popcount/mi_ctz truncate on 32-bit, so fold the 64-bit word.
+static inline size_t mi_u64_popcount(uint64_t x) {
+  return mi_popcount((size_t)(uint32_t)x) + mi_popcount((size_t)(uint32_t)(x >> 32));
+}
+static inline size_t mi_u64_ctz(uint64_t x) {
+  mi_assert_internal(x != 0);
+  const uint32_t lo = (uint32_t)x;
+  return (lo != 0 ? mi_ctz((size_t)lo) : 32 + mi_ctz((size_t)(uint32_t)(x >> 32)));
+}
+
+size_t _mi_page_purged_count(const mi_page_t* page) {
+  size_t n = 0;
+  for (size_t i = 0; i < MI_PAGE_PURGE_WORDS; i++) { n += mi_u64_popcount(page->purged[i]); }
+  return n;
+}
+
+
 #if (MI_DEBUG>=3)
 static size_t mi_page_list_count(mi_page_t* page, mi_block_t* head) {
   mi_assert_internal(_mi_ptr_page(page->page_start) == page);
@@ -108,8 +155,10 @@ static bool mi_page_is_valid_init(mi_page_t* page) {
   //mi_assert_internal(tfree_count <= page->thread_freed + 1);
   #endif
 
+  // blocks are conserved: used (incl. not-yet-collected thread frees) + free-listed + purged == capacity.
+  // purged blocks are free but held OFF every free list (their memory is discarded).
   size_t free_count = mi_page_list_count(page, page->free) + mi_page_list_count(page, page->local_free);
-  mi_assert_internal(page->used + free_count == page->capacity);
+  mi_assert_internal(page->used + free_count + _mi_page_purged_count(page) == page->capacity);
 
   return true;
 }
@@ -121,6 +170,29 @@ bool _mi_page_is_valid(mi_page_t* page) {
   #if MI_SECURE
   mi_assert_internal(page->keys[0] != 0);
   #endif
+
+  // Hole-purging invariants (the conservation invariant is in mi_page_is_valid_init).
+  // These are what make every existing test in the suite a test of the purge machinery.
+  if (_mi_page_purged_count(page) > 0) {
+    mi_assert_internal(mi_page_can_purge_holes(page));   // only eligible pages may carry holes
+    // A purged block is OFF every free list: if it were on one, its `next`
+    // pointer would live in discarded memory.
+    for (size_t i = 0; i < page->capacity; i++) {
+      if (!mi_page_purged_at(page, i)) continue;
+      mi_block_t* const pb = mi_page_block_index_at(page, i);
+      for (mi_block_t* b = page->free; b != NULL; b = mi_block_next(page, b)) {
+        mi_assert_internal(b != pb);
+      }
+      for (mi_block_t* b = page->local_free; b != NULL; b = mi_block_next(page, b)) {
+        mi_assert_internal(b != pb);
+      }
+      #if !MI_TRACK_ENABLED && !MI_TSAN
+      for (mi_block_t* b = mi_page_thread_free(page); b != NULL; b = mi_block_next(page, b)) {
+        mi_assert_internal(b != pb);
+      }
+      #endif
+    }
+  }
   if (!mi_page_is_abandoned(page)) {
     //mi_assert_internal(!_mi_process_is_initialized);
     {
@@ -203,6 +275,136 @@ static bool mi_page_free_quick_collect(mi_page_t* page) {
   return true;
 }
 
+/* -----------------------------------------------------------
+  Page hole purging.
+
+  A page returns to the arena only once *every* block is free, so one live
+  block pins the whole page (up to 512KB). Here we discard the memory of the
+  free blocks inside a still-used page.
+
+  mimalloc threads its free list through the free blocks themselves, so a
+  discarded block cannot carry a `next` pointer. Purged blocks are therefore
+  taken OFF the free list and tracked in the out-of-band `page->purged` bitmap,
+  and handed back one at a time by `_mi_page_unpurge_one`.
+
+  We discard only the OS-page-aligned *interior* of each contiguous run of
+  purged blocks. The partially covered OS pages at either end hold bytes of
+  blocks outside the run, so they must be left alone. This is what makes the
+  scheme correct for any block size on any page size (notably arm64 macOS,
+  where the OS page is 16KB and most size classes are not multiples of it).
+
+  The discard goes through `_mi_os_discard`, which NEVER changes commit state
+  (MADV_FREE_REUSABLE on macOS, MADV_DONTNEED on Linux -- both keep the mapping
+  and demand-fault zeroes -- MEM_RESET on Windows). The arena tracks commit per
+  64KB slice and cannot represent a sub-slice hole, so commit state MUST stay
+  untouched: otherwise a page returned to the arena would be re-handed-out as
+  "committed" and the first write into a hole would fault (on Windows only --
+  silently fine on macOS/Linux). Note that `_mi_os_purge` is NOT usable here:
+  with the default `MIMALLOC_PURGE_DECOMMITS=1` it decommits (and in debug
+  builds it also mprotects the range PROT_NONE).
+----------------------------------------------------------- */
+
+// The OS-page-aligned *interior* of the run of blocks [start, start+len) that
+// begins at `page_start`. Returns `false` if the run contains no whole OS page.
+// The returned range is always OS-page aligned and entirely inside the run, so
+// it can never contain a byte of a block outside the run (nor of the page header,
+// which lives *before* `page_start`). Exposed for `test-purge-holes.c`.
+bool _mi_page_purge_run_range(size_t os_page_size, size_t block_size, uintptr_t page_start,
+                              size_t start, size_t len, uintptr_t* discard_start, size_t* discard_size)
+{
+  *discard_start = 0;
+  *discard_size = 0;
+  if (len == 0) return false;
+  const uintptr_t lo = page_start + (start * block_size);
+  const uintptr_t hi = lo + (len * block_size);
+  const uintptr_t alo = _mi_align_up(lo, os_page_size);
+  const uintptr_t ahi = _mi_align_down(hi, os_page_size);
+  if (ahi <= alo) return false;   // the run does not contain a whole OS page
+  mi_assert_internal(alo >= lo && ahi <= hi);
+  *discard_start = alo;
+  *discard_size = (size_t)(ahi - alo);
+  return true;
+}
+
+// Discard the OS-page-aligned interior of blocks [start, start+len).
+static void mi_page_discard_run(mi_page_t* page, size_t start, size_t len) {
+  mi_assert_internal(len > 0 && start + len <= page->capacity);
+  uintptr_t dstart; size_t dsize;
+  if (!_mi_page_purge_run_range(_mi_os_page_size(), page->block_size, (uintptr_t)page->page_start,
+                                start, len, &dstart, &dsize)) return;
+  mi_assert_internal((uint8_t*)dstart >= page->page_start);
+  mi_assert_internal((uint8_t*)(dstart + dsize) <= page->page_start + ((size_t)page->capacity * page->block_size));
+  _mi_os_discard((void*)dstart, dsize);
+}
+
+// Discard every free block except one, which stays on the free list so the
+// page never looks full and page-queue state is untouched.
+void _mi_page_purge_holes(mi_page_t* page) {
+  mi_assert_internal(page != NULL);
+  if (!mi_option_is_enabled(mi_option_purge_holes)) return;
+  if (!mi_page_can_purge_holes(page)) return;
+  if (mi_page_all_free(page)) return;        // the page itself is about to be freed
+  if (page->free == NULL) return;            // nothing on the free list
+  if (mi_option_get(mi_option_purge_delay) < 0) return;   // purging disabled
+
+  // Keep the head of the free list; take the rest off it.
+  mi_block_t* const keep = page->free;
+  mi_block_t* block = mi_block_next(page, keep);
+  if (block == NULL) return;                 // only one free block; nothing to gain
+
+  while (block != NULL) {
+    mi_block_t* const next = mi_block_next(page, block);
+    const size_t idx = mi_page_block_index(page, block);
+    mi_assert_internal(idx < page->capacity);
+    mi_assert_internal(!mi_page_purged_at(page, idx));   // was on the free list, so not purged
+    mi_page_purged_set(page, idx);
+    block = next;
+  }
+
+  mi_block_set_next(page, keep, NULL);
+  page->free = keep;
+  page->free_is_zero = false;   // discarded memory reads back zero or stale; never assume
+
+  // Discard contiguous runs. We extend a run through blocks that were already
+  // purged: re-discarding is a cheap kernel no-op, and the expensive part is
+  // the TLB shootdown, so fewer/larger ranges wins (jemalloc hpdata.c does the
+  // same). The run is broken only by a block that is live or is `keep`.
+  const size_t keep_idx = mi_page_block_index(page, keep);
+  size_t run_start = 0, run_len = 0;
+  for (size_t i = 0; i <= page->capacity; i++) {
+    const bool in_run = (i < page->capacity) && (i != keep_idx) && mi_page_purged_at(page, i);
+    if (in_run) {
+      if (run_len == 0) run_start = i;
+      run_len++;
+    }
+    else if (run_len > 0) {
+      mi_page_discard_run(page, run_start, run_len);
+      run_len = 0;
+    }
+  }
+}
+
+// Bring one discarded block back onto the free list. Only that block is
+// touched, so the remaining holes stay discarded.
+bool _mi_page_unpurge_one(mi_page_t* page) {
+  if (!mi_page_has_purged(page)) return false;
+  mi_assert_internal(page->free == NULL);
+  size_t idx = 0;
+  for (size_t w = 0; w < MI_PAGE_PURGE_WORDS; w++) {
+    if (page->purged[w] != 0) { idx = (w * 64) + mi_u64_ctz(page->purged[w]); break; }
+  }
+  mi_assert_internal(mi_page_purged_at(page, idx));
+  mi_page_purged_clear(page, idx);
+  mi_block_t* const block = mi_page_block_index_at(page, idx);
+  // tell the OS we are using these pages again (MADV_FREE_REUSE on macOS, no-op
+  // elsewhere); this aligns *inward* so it is a no-op for sub-OS-page blocks.
+  _mi_os_reuse(block, page->block_size);
+  mi_block_set_next(page, block, NULL);
+  page->free = block;
+  page->free_is_zero = false;
+  return true;
+}
+
 void _mi_page_free_collect(mi_page_t* page, bool force) {
   mi_assert_internal(page!=NULL);
 
@@ -232,6 +434,13 @@ void _mi_page_free_collect(mi_page_t* page, bool force) {
   }
 
   mi_assert_internal(!force || page->local_free == NULL);
+
+  // Free list empty but this page has discarded holes: bring one back. Every
+  // caller re-checks `mi_page_immediate_available` after collect, so the page
+  // becomes usable again without touching the other holes.
+  if (page->free == NULL && mi_page_has_purged(page)) {
+    _mi_page_unpurge_one(page);
+  }
 }
 
 // Collect elements in the thread-free list starting at `head`. This is an optimized
@@ -407,6 +616,11 @@ void _mi_page_free(mi_page_t* page, mi_page_queue_t* pq) {
 
   // no more aligned blocks in here
   mi_page_set_has_interior_pointers(page, false);
+
+  // Drop any hole bookkeeping: the whole page is going back to the arena.
+  // The memory was discarded with commit-preserving semantics, so the arena's
+  // per-slice commit bitmap is still accurate and needs no reconciliation.
+  _mi_page_purged_reset(page);
 
   // remove from the page list
   // (no need to do _mi_theap_delayed_free first as all blocks are already free)
@@ -695,6 +909,8 @@ mi_decl_nodiscard bool _mi_page_init(mi_theap_t* theap, mi_page_t* page) {
   mi_assert(theap!=NULL);
   page->heap = (_mi_is_heap_main(_mi_theap_heap(theap)) ? NULL : _mi_theap_heap(theap)); // faster for `mi_page_associated_theap`
   mi_page_set_theap(page, theap);
+
+  _mi_page_purged_reset(page);   // fresh page: no holes
 
   size_t page_size;
   uint8_t* page_start = mi_page_area(page, &page_size); MI_UNUSED(page_start);
