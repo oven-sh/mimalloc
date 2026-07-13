@@ -188,11 +188,15 @@ mi_decl_export void mi_register_error(mi_error_fun* fun, void* arg);
 
 mi_decl_export void mi_collect(bool force)      mi_attr_noexcept;
 
-// Discard the memory of free blocks inside still-used pages ("hole punching").
-// Call when the application is idle (e.g. before an event loop parks): a page
-// otherwise stays fully resident until every block in it is free, so a single
-// long-lived object can pin an entire 512KB page.
-mi_decl_export void mi_purge_holes(void)        mi_attr_noexcept;
+// Call whenever a thread goes idle (an event loop about to park, a worker with an
+// empty queue, a JIT/GC helper out of work): collects the thread's pending frees,
+// discards the memory of free blocks inside its still-used pages ("hole punching" --
+// a page otherwise stays fully resident until every block in it is free, so a single
+// long-lived object can pin an entire 512KB page), and drains the arena purge queue.
+// Owner-thread rules make each thread's own idle point the ONLY safe place to sweep
+// its heaps -- no other thread can do it for us. Safe on any thread; on a thread that
+// never allocated it is a no-op. purge_delay still applies to the arena drain.
+mi_decl_export void mi_on_thread_idle(void)     mi_attr_noexcept;
 
 // How much hole punching actually reclaims (process wide, monotonic except for the
 // two `*_now` gauges). These are not part of `mi_stats_t`: hole purging also covers
@@ -207,7 +211,7 @@ typedef struct mi_purge_holes_stats_s {
   size_t pages_freed;         // pages the sweep found completely free and gave back to the arena
   // What hole punching cannot reach: the pages the sweep found ineligible (a huge page, a
   // large page whose OS pages do not fit the bitmap, pinned memory, a custom-commit arena).
-  // Gauges over the last `mi_purge_holes()` sweep, which resets them.
+  // Gauges over the last idle sweep (`mi_on_thread_idle`), which resets them.
   size_t ineligible_pages;
   size_t ineligible_bytes;      // total size of those pages
   size_t ineligible_free_bytes; // the free (but not discardable) blocks inside them
@@ -217,7 +221,7 @@ mi_decl_export void mi_purge_holes_stats_get(mi_purge_holes_stats_t* stats) mi_a
 
 // Print, per size class, what hole punching leaves behind: the free bytes that share an OS
 // page with a live block and therefore cannot be discarded, and how few live blocks pin each
-// such OS page. Read-only (it purges nothing, and mutates no free list). Like `mi_purge_holes`
+// such OS page. Read-only (it purges nothing, and mutates no free list). Like the idle sweep
 // it only covers what the calling thread may safely read: its own theaps, plus the abandoned
 // pages of the heaps behind them. Call it right after a sweep.
 mi_decl_export void mi_purge_holes_report(void) mi_attr_noexcept;
@@ -425,7 +429,6 @@ mi_decl_export mi_theap_t* mi_heap_theap(mi_heap_t* heap);
 mi_decl_export mi_theap_t* mi_theap_set_default(mi_theap_t* theap);
 mi_decl_export mi_theap_t* mi_theap_get_default(void);
 mi_decl_export void        mi_theap_collect(mi_theap_t* theap, bool force) mi_attr_noexcept;
-mi_decl_export void        mi_theap_purge_holes(mi_theap_t* theap) mi_attr_noexcept;
 
 mi_decl_nodiscard mi_decl_export mi_decl_restrict void* mi_theap_malloc(mi_theap_t* theap, size_t size) mi_attr_noexcept mi_attr_malloc mi_attr_alloc_size(2);
 mi_decl_nodiscard mi_decl_export mi_decl_restrict void* mi_theap_zalloc(mi_theap_t* theap, size_t size) mi_attr_noexcept mi_attr_malloc mi_attr_alloc_size(2);
@@ -540,7 +543,6 @@ typedef enum mi_option_e {
   mi_option_scavenger,                  // run a background scavenger thread that purges freed arena memory when due (=1)
   mi_option_purge_holes,                // discard the memory of free blocks inside a still-used page (=1)
   mi_option_purge_holes_eager_zero,     // zero a hole before discarding it, so that an over-discard destroys data even on an OS that reclaims lazily (=0; for testing -- always on when MI_DEBUG>1)
-  mi_option_page_drain_sparse,          // don't allocate from a (small) page whose used count fell below 1/N of capacity; let it drain empty and be freed (=0, off; try 8)
   _mi_option_last,
   // legacy option names
   mi_option_large_os_pages = mi_option_allow_large_os_pages,

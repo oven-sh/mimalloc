@@ -164,7 +164,7 @@ static bool mi_theap_page_purge_holes(mi_theap_t* theap, mi_page_queue_t* pq, mi
   return true; // continue
 }
 
-void mi_theap_purge_holes(mi_theap_t* theap) mi_attr_noexcept {
+static void mi_theap_purge_holes(mi_theap_t* theap) mi_attr_noexcept {
   if (theap == NULL || !mi_theap_is_initialized(theap)) return;
   if (!mi_option_is_enabled(mi_option_purge_holes)) return;
   // this rewrites the thread-local free list of every page, so only the owning thread may do it
@@ -184,7 +184,7 @@ void mi_theap_purge_holes(mi_theap_t* theap) mi_attr_noexcept {
 // `mi_heap_new_in_arena`), which is why we sweep every theap and not just the default one.
 #define MI_PURGE_HOLES_MAX_HEAPS  (8)
 
-void mi_purge_holes(void) mi_attr_noexcept {
+static void mi_purge_holes(void) mi_attr_noexcept {
   if (!mi_option_is_enabled(mi_option_purge_holes)) return;
   _mi_page_holes_reset_ineligible();   // the ineligible counters are a gauge over this sweep
   mi_theap_t* const theap0 = _mi_theap_default();
@@ -209,6 +209,23 @@ void mi_purge_holes(void) mi_attr_noexcept {
   for (size_t i = 0; i < heap_count; i++) {
     _mi_arenas_purge_abandoned_holes(heaps[i]);
   }
+}
+
+// The one public entry point: call whenever a thread goes idle. Collects this thread's
+// pending frees, discards the holes in its still-used pages, and drains the arena purge
+// queue so freed slices are returned now instead of at the scavenger's next wake.
+// Owner-thread rules make each thread's own idle point the ONLY safe place to sweep its
+// heaps -- no other thread can do it for us. purge_delay still applies to the arena drain.
+void mi_on_thread_idle(void) mi_attr_noexcept {
+  mi_theap_t* const theap0 = _mi_theap_default();
+  if (theap0 == NULL || !mi_theap_is_initialized(theap0) || theap0->tld == NULL) return;
+  if (theap0->tld->thread_id != _mi_thread_id()) return;
+  mi_theap_collect(theap0, false /* not forced */);
+  mi_purge_holes();  // every theap of this thread + the abandoned pages
+  // (mi_theap_collect above already ran an expiry-gated arena purge; this second pass
+  // covers slices freed by the hole sweep itself. visit_all=false keeps the early-out
+  // so an idle park with nothing due costs no lock or clock read.)
+  _mi_arenas_collect(false /* respect purge delay */, false /* expiry-gated */, theap0->tld);
 }
 
 // Report what hole punching leaves behind (see the "Hole report" section in `page.c`).

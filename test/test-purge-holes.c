@@ -6,7 +6,7 @@ terms of the MIT license. A copy of the license can be found in the file
 -----------------------------------------------------------------------------*/
 
 // Tests for "hole punching": discarding the memory of free blocks that sit
-// inside a still-used page (`mi_purge_holes`, see the hole purging section in
+// inside a still-used page (the idle sweep in `mi_on_thread_idle`, see the hole purging section in
 // `src/page.c`).
 //
 // Run with MIMALLOC_PURGE_HOLES=0 to check the feature is a no-op when off:
@@ -148,7 +148,7 @@ static bool test_survivors(size_t bsize, bool* out_purged) {
     if ((i % keep_every) != 0) { mi_free(ptrs[i]); ptrs[i] = NULL; }
   }
 
-  mi_purge_holes();
+  mi_on_thread_idle();
 
   const size_t npurged = purged_blocks(ptrs, count);
   if (out_purged != NULL) { *out_purged = (npurged > 0); }
@@ -243,7 +243,7 @@ static bool test_churn(void) {
       nlive--; total_frees++;
     }
 
-    if ((iter % 97) == 0) { mi_purge_holes(); total_purges++; }
+    if ((iter % 97) == 0) { mi_on_thread_idle(); total_purges++; }
 
     // spot-check a couple of survivors right after a purge
     if ((iter % 97) == 1 && nlive > 0) {
@@ -291,7 +291,7 @@ static bool test_aligned(void) {
   }
   // free every other block, punch holes, then take the blocks back out of the bitmap
   for (size_t i = 1; i < N; i += 2) { mi_free(ptrs[i]); ptrs[i] = NULL; }
-  mi_purge_holes();
+  mi_on_thread_idle();
 
   // these 16KB blocks must actually have been discarded (this is the JSC MarkedBlock case)
   if (!expect_purged(before, "aligned-16k")) return false;
@@ -343,7 +343,7 @@ static bool test_page_lifecycle(void) {
   for (size_t i = 0; i < N; i++) {
     if ((i % 8) != 0) { mi_free(ptrs[i]); ptrs[i] = NULL; }
   }
-  mi_purge_holes();
+  mi_on_thread_idle();
 
   // the pages we are about to recycle must really carry holes, or the test below
   // (which is what would catch a MEM_DECOMMIT on Windows) proves nothing
@@ -382,7 +382,7 @@ static bool test_page_lifecycle(void) {
 // 5. abandoned pages: a thread exits while blocks in its pages are still live, so
 //    the pages end up in the arena's abandoned list with no owning thread. This is
 //    where most of the holes are (every page that ever became full is abandoned),
-//    so `mi_purge_holes` must reach them.
+//    so the idle sweep must reach them.
 // ---------------------------------------------------------------------------
 
 #define ABANDON_N   (256)
@@ -408,7 +408,7 @@ static bool test_abandoned(void) {
   memset(abandoned_ptrs, 0, sizeof(abandoned_ptrs));
   run_one_thread(&abandoned_worker);
 
-  mi_purge_holes();
+  mi_on_thread_idle();
 
   const size_t npurged = purged_blocks(abandoned_ptrs, ABANDON_N);
   if (purging_enabled) {
@@ -470,7 +470,7 @@ static bool test_large_pages(void) {
   for (size_t i = 1; i < LARGE_N; i += 2) { mi_free(ptrs[i]); ptrs[i] = NULL; }
 
   const hole_stats_t before = hole_stats();
-  mi_purge_holes();
+  mi_on_thread_idle();
   const hole_stats_t after = hole_stats();
   const size_t npurged = purged_blocks(ptrs, LARGE_N);
 
@@ -537,7 +537,7 @@ static bool test_option_off(void) {
   for (size_t i = 0; i < N; i++) {
     if ((i % 4) != 0) { mi_free(ptrs[i]); ptrs[i] = NULL; }
   }
-  mi_purge_holes();
+  mi_on_thread_idle();
 
   if (purged_blocks(ptrs, N) != 0) {
     fprintf(stderr, "\n  purge_holes=0 but blocks were discarded\n");
@@ -748,7 +748,7 @@ static bool test_holes_report(int mode) {
     else { kept[nkept++] = key; }
   }
 
-  mi_purge_holes();
+  mi_on_thread_idle();
 
   for (size_t i = 0; i < REPORT_N; i++) {
     if (ptrs[i] == NULL) continue;
@@ -904,7 +904,7 @@ static bool test_report_is_read_only(void) {
   // keep every 64th block: whatever the block size, the free runs between the survivors cover
   // several whole OS pages, so there is always something for the sweep to discard
   for (size_t i = 0; i < N; i++) { if ((i % 64) != 0) { mi_free(ptrs[i]); ptrs[i] = NULL; } }
-  mi_purge_holes();
+  mi_on_thread_idle();
 
   const hole_stats_t before = hole_stats();
   mi_purge_holes_report();               // the public entry point: prints the table
@@ -979,7 +979,7 @@ static bool test_report_read_only_abandoned(void) {
   if (rep == NULL) return false;
   memset(ro_ptrs, 0, sizeof(ro_ptrs));
   run_one_thread(&ro_worker);
-  mi_purge_holes();
+  mi_on_thread_idle();
 
   for (size_t i = 0; i < RO_N; i++) {
     if (ro_ptrs[i] == NULL) continue;

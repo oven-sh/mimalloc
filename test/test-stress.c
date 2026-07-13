@@ -236,7 +236,7 @@ static void stress(intptr_t tid) {
     const bool do_purge_holes = chance(1, &r);
     #ifndef USE_STD_MALLOC
     if (do_purge_holes) {
-      mi_purge_holes();   // 1% discard the free blocks inside still-used pages
+      mi_on_thread_idle();   // 1% discard the free blocks inside still-used pages
     }
     #else
     (void)do_purge_holes;
@@ -245,7 +245,7 @@ static void stress(intptr_t tid) {
 
   #ifndef USE_STD_MALLOC
   // the retained blocks are exactly the "scattered survivors" case hole purging is for
-  mi_purge_holes();
+  mi_on_thread_idle();
   #endif
 
   #ifdef MI_HEAP_WALK

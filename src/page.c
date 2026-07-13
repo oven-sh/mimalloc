@@ -1517,11 +1517,6 @@ static mi_decl_noinline mi_page_t* mi_page_queue_find_free_ex(mi_theap_t* theap,
   size_t count = 0;
   long candidate_limit = 0;          // we reset this on the first candidate to limit the search
   long page_full_retain = (pq->block_size > MI_SMALL_MAX_OBJ_SIZE ? 0 : theap->page_full_retain); // only retain small pages
-  // drain-sparse: never re-seed a nearly-empty (small) page -- let its survivors die out so the
-  // page empties and is freed, instead of each allocation generation re-pinning every page.
-  // Disabled on the retry pass so memory pressure can still use every page.
-  const long drain_div = (first_try && pq->block_size <= MI_SMALL_MAX_OBJ_SIZE ? _mi_option_get_fast(mi_option_page_drain_sparse) : 0);
-  long sparse_skips = 0;
   mi_page_t* page_candidate = NULL;  // a page with free space
   mi_page_t* page = pq->first;
 
@@ -1530,19 +1525,6 @@ static mi_decl_noinline mi_page_t* mi_page_queue_find_free_ex(mi_theap_t* theap,
     mi_page_t* next = page->next; // remember next (as this page can move to another queue)
     count++;
     candidate_limit--;
-
-    // drain-sparse: skip a nearly-empty page BEFORE collecting it. Collecting would move its
-    // local_free onto page->free, arming the pages_free_direct fast path to drain it behind our
-    // back. Left uncollected it stays unusable for allocation, and it still frees itself the
-    // moment its last block dies (`--page->used == 0` retires in mi_free). `used` is exact for
-    // local frees; pending xthread frees only make a page look fuller, which is conservative.
-    if (drain_div > 0 && page->used > 0 && !mi_page_is_expandable(page)
-        && (long)page->used * drain_div < (long)page->capacity) {
-      sparse_skips++;
-      if (sparse_skips >= 32 && page_candidate == NULL) { page = NULL; break; } // all sparse so far: give up, take a fresh page
-      page = next;
-      continue;
-    }
 
     // search up to N pages for a best candidate
 
@@ -1650,13 +1632,7 @@ static mi_page_t* mi_find_free_page(mi_theap_t* theap, mi_page_queue_t* pq) {
 
   // check the first page: we even do this with candidate search or otherwise we re-search every time
   mi_page_t* page = pq->first;
-  // drain-sparse: don't take the fast path on a nearly-empty page -- fall through to the
-  // full search, which skips sparse pages so they can drain empty and be freed.
-  const long drain_div = (pq->block_size <= MI_SMALL_MAX_OBJ_SIZE ? _mi_option_get_fast(mi_option_page_drain_sparse) : 0);
-  const bool front_sparse = (drain_div > 0 && page != NULL && page->used > 0
-                             && !mi_page_is_expandable(page)
-                             && (long)page->used * drain_div < (long)page->capacity);
-  if mi_likely(!front_sparse && page != NULL && mi_page_free_quick_collect(page)) {
+  if mi_likely(page != NULL && mi_page_free_quick_collect(page)) {
     #if (MI_SECURE>=2) // in secure mode, we extend half the time to increase randomness
     if (page->capacity < page->reserved && ((_mi_theap_random_next(theap) & 1) == 1)) {
       (void)mi_page_extend_free(theap, page);  // ok if this fails
