@@ -165,7 +165,9 @@ void mi_theap_purge_holes(mi_theap_t* theap) mi_attr_noexcept {
   if (!mi_option_is_enabled(mi_option_purge_holes)) return;
   // this rewrites the thread-local free list of every page, so only the owning thread may do it
   if (theap->tld == NULL || theap->tld->thread_id != _mi_thread_id()) return;
+  _mi_page_purge_holes_begin();
   mi_theap_visit_pages(theap, &mi_theap_page_purge_holes, true /* include full pages */, NULL, NULL);
+  _mi_page_purge_holes_end();
 }
 
 void mi_purge_holes(void) mi_attr_noexcept {
@@ -619,7 +621,7 @@ bool _mi_theap_area_visit_blocks(const mi_heap_area_t* area, mi_page_t* page, mi
   mi_assert(page != NULL);
   if (page == NULL) return true;
 
-  _mi_page_free_collect(page,true);              // collect both thread_delayed and local_free
+  _mi_page_free_collect_no_unpurge(page,true);   // collect both thread_delayed and local_free; visiting must not un-purge a hole
   mi_assert_internal(page->local_free == NULL);
   if (page->used == 0) return true;
 

@@ -193,6 +193,21 @@ mi_decl_export void mi_collect(bool force)      mi_attr_noexcept;
 // otherwise stays fully resident until every block in it is free, so a single
 // long-lived object can pin an entire 512KB page.
 mi_decl_export void mi_purge_holes(void)        mi_attr_noexcept;
+
+// How much hole punching actually reclaims (process wide, monotonic except for the
+// two `*_now` gauges). These are not part of `mi_stats_t`: hole purging also covers
+// pages that no heap owns, and `mi_stats_t` cannot grow (it is embedded in a theap,
+// which is at the meta-allocator's 8KB block limit).
+typedef struct mi_purge_holes_stats_s {
+  size_t purged_bytes;        // bytes of free blocks that are discarded right now
+  size_t purged_blocks;       // free blocks held off the free lists right now
+  size_t purged_bytes_total;  // bytes ever discarded
+  size_t discard_calls;       // discard syscalls (madvise/MEM_RESET)
+  size_t reuse_calls;         // reuse syscalls made when handing a hole back
+  size_t pages_freed;         // pages the sweep found completely free and gave back to the arena
+} mi_purge_holes_stats_t;
+
+mi_decl_export void mi_purge_holes_stats_get(mi_purge_holes_stats_t* stats) mi_attr_noexcept;
 mi_decl_export int  mi_version(void)            mi_attr_noexcept;
 mi_decl_export void mi_options_print(void)      mi_attr_noexcept;
 mi_decl_export void mi_process_info_print(void) mi_attr_noexcept;
@@ -510,6 +525,7 @@ typedef enum mi_option_e {
   mi_option_prof_sample_rate,           // bytes per heap-profile sample (=0, off). Typical: 524288. Dumps profile.proto on exit to MIMALLOC_PROF_PATH.
   mi_option_scavenger,                  // run a background scavenger thread that purges freed arena memory when due (=1)
   mi_option_purge_holes,                // discard the memory of free blocks inside a still-used page (=1)
+  mi_option_purge_holes_eager_zero,     // zero a hole before discarding it, so that an over-discard destroys data even on an OS that reclaims lazily (=0; for testing -- always on when MI_DEBUG>1)
   _mi_option_last,
   // legacy option names
   mi_option_large_os_pages = mi_option_allow_large_os_pages,

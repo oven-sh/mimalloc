@@ -499,6 +499,12 @@ static mi_decl_noinline bool mi_check_is_double_freex(const mi_page_t* page, con
 
 static inline bool mi_check_is_double_free(const mi_page_t* page, const mi_block_t* block) {
   bool is_double_free = false;
+  // A purged block is free but held off every free list and its memory is discarded, so
+  // neither the decoded-`next` heuristic nor the free-list walk below can recognize it.
+  if mi_unlikely(mi_page_block_is_purged(page, block)) {
+    _mi_error_message(EAGAIN, "double free detected of block %p with size %zu\n", block, mi_page_block_size(page));
+    return true;
+  }
   mi_block_t* n = mi_block_nextx(page, block, page->keys); // pretend it is freed, and get the decoded first field
   if (((uintptr_t)n & (MI_INTPTR_SIZE-1))==0 &&  // quick check: aligned pointer?
       (n==NULL || mi_is_in_same_page(block, n))) // quick check: in same page or NULL?

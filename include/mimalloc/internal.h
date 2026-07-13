@@ -213,7 +213,7 @@ mi_decl_nodiscard bool _mi_os_protect(void* addr, size_t size);
 bool          _mi_os_unprotect(void* addr, size_t size);
 bool          _mi_os_purge(void* p, size_t size);
 bool          _mi_os_purge_ex(void* p, size_t size, bool allow_reset, size_t stats_size, mi_commit_fun_t* commit_fun, void* commit_fun_arg);
-void          _mi_os_discard(void* p, size_t size);
+bool          _mi_os_discard(void* p, size_t size);
 
 size_t        _mi_os_secure_guard_page_size(void);
 bool          _mi_os_secure_guard_page_set_at(void* addr, mi_memid_t memid);
@@ -305,6 +305,7 @@ size_t        _mi_page_queue_append(mi_theap_t* theap, mi_page_queue_t* pq, mi_p
 void          _mi_deferred_free(mi_theap_t* theap, bool force);
 
 void          _mi_page_free_collect(mi_page_t* page, bool force);
+void          _mi_page_free_collect_no_unpurge(mi_page_t* page, bool force);   // for read-only heap inspection: never un-purges a hole
 void          _mi_page_free_collect_partly(mi_page_t* page, mi_block_t* head);
 mi_decl_nodiscard bool _mi_page_init(mi_theap_t* theap, mi_page_t* page);
 bool          _mi_page_queue_is_valid(mi_theap_t* theap, const mi_page_queue_t* pq);
@@ -791,18 +792,30 @@ static inline bool mi_page_all_free(const mi_page_t* page) {
 
 void          _mi_page_purge_holes(mi_page_t* page);
 void          _mi_page_purged_reset(mi_page_t* page);
-bool          _mi_page_unpurge_one(mi_page_t* page);
+bool          _mi_page_unpurge_run(mi_page_t* page);
+void          _mi_page_unpurge_all(mi_page_t* page);
 size_t        _mi_page_purged_count(const mi_page_t* page);
 bool          _mi_page_purge_run_range(size_t os_page_size, size_t block_size, uintptr_t page_start,
                                        size_t start, size_t len, uintptr_t* discard_start, size_t* discard_size);
+bool          _mi_page_purge_holes_in_progress(void);
+void          _mi_page_holes_count_page_freed(void);
+void          _mi_page_purge_holes_begin(void);
+void          _mi_page_purge_holes_end(void);
 
 // Eligible when the block count fits the out-of-band bitmap. There is no lower
 // bound on the block size: the discard covers only the OS-page-aligned interior
 // of a *run* of adjacent free blocks, so several small blocks can together cover
 // a whole OS page (and a run too short to contain one discards nothing).
 // `reserved` bounds every bitmap index we can ever set (idx < capacity <= reserved).
+// Pinned memory (large/huge OS pages) cannot be madvise'd away, and an arena with
+// a custom commit function owns its own commit/decommit -- like every other purge
+// site (`mi_arena_schedule_purge`, `_mi_os_purge_ex`), we stay away from both.
 static inline bool mi_page_can_purge_holes(const mi_page_t* page) {
-  return (page->reserved <= MI_PAGE_PURGE_MAX_BLOCKS && page->reserved > 1);
+  if (page->reserved > MI_PAGE_PURGE_MAX_BLOCKS || page->reserved <= 1) return false;
+  if (page->memid.is_pinned) return false;
+  const mi_arena_t* const arena = mi_memid_arena(page->memid);
+  if (arena != NULL && arena->commit_fun != NULL) return false;
+  return true;
 }
 
 static inline bool mi_page_has_purged(const mi_page_t* page) {
@@ -816,6 +829,16 @@ static inline bool mi_page_has_purged(const mi_page_t* page) {
 static inline bool mi_page_purged_at(const mi_page_t* page, size_t idx) {
   mi_assert_internal(idx < MI_PAGE_PURGE_MAX_BLOCKS);
   return ((page->purged[idx / 64] >> (idx % 64)) & 1) != 0;
+}
+
+// is `block` free-but-discarded? A purged block is on no free list, so a free-list walk
+// (as `free.c:mi_check_is_double_freex` does) cannot see that it is already free.
+static inline bool mi_page_block_is_purged(const mi_page_t* page, const void* block) {
+  if (!mi_page_has_purged(page)) return false;
+  mi_assert_internal((const uint8_t*)block >= page->page_start);
+  const size_t idx = ((size_t)((const uint8_t*)block - page->page_start)) / page->block_size;
+  if (idx >= page->capacity) return false;
+  return mi_page_purged_at(page, idx);
 }
 
 // are there immediately available blocks, i.e. blocks available on the free list.

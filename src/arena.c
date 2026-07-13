@@ -1064,6 +1064,12 @@ void _mi_arenas_page_free(mi_page_t* page, mi_theap_t* current_theapx) {
   mi_assert_internal(page->next==NULL && page->prev==NULL);
   mi_assert_internal(current_theapx == NULL || _mi_thread_id()==current_theapx->tld->thread_id);
 
+  // Undo any hole in the page: the arena can hand this memory out again as committed without
+  // any further `reuse` call, and on macOS a discarded page stays reclaimable by the kernel
+  // until it is MADV_FREE_REUSE'd. This is the single choke point for a page going back to the
+  // arena (`page.c:_mi_page_free` and the abandoned-page free in `free.c` both end up here).
+  _mi_page_unpurge_all(page);
+
   if (current_theapx != NULL) {
     mi_theap_stat_decrease(current_theapx, page_bins[_mi_page_stats_bin(page)], 1);
     mi_theap_stat_decrease(current_theapx, pages, 1);

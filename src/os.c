@@ -683,25 +683,40 @@ bool _mi_os_purge(void* p, size_t size) {
 // Unlike `_mi_os_purge`, this NEVER decommits -- whatever `purge_decommits`
 // says -- since commit is tracked per arena slice and cannot represent a
 // sub-slice hole (see the hole purging section in `page.c`).
-void _mi_os_discard(void* addr, size_t size) {
+// Returns `true` if (and only if) the physical memory was actually released.
+bool _mi_os_discard(void* addr, size_t size) {
+  #if !MI_PRIM_HAS_DISCARD
+  MI_UNUSED(addr); MI_UNUSED(size);
+  return false;   // `_mi_prim_discard` is a no-op here: nothing is released, so nothing is counted
+  #else
   // page align conservatively *within* the range: never touch a partially covered OS page
   size_t csize = 0;
   void* const start = mi_os_page_align_area_conservative(addr, size, &csize);
-  if (csize == 0) return;
-  mi_os_stat_counter_increase(purge_calls, 1);
-  mi_os_stat_counter_increase(purged, csize);
+  if (csize == 0) return false;
 
-  #if (MI_DEBUG>1) && !MI_SECURE && !MI_TRACK_ENABLED
-  // pretend the discard is eager (as `_mi_os_reset` does): on macOS
-  // MADV_FREE_REUSABLE keeps the data until the pages are actually reclaimed, so
-  // without this a range that wrongly overlaps a *live* block would go unnoticed.
-  _mi_memzero(start, csize);
+  #if !MI_TRACK_ENABLED
+  // Pretend the discard is eager (as `_mi_os_reset` does): on macOS MADV_FREE_REUSABLE
+  // keeps the data until the pages are actually reclaimed, so without this a range that
+  // wrongly overlaps a *live* block goes unnoticed. Always on in a debug build; the tests
+  // force it on with `purge_holes_eager_zero` so they are not vacuous in a release build.
+  #if (MI_DEBUG>1) && !MI_SECURE
+  const bool eager_zero = true;
+  #else
+  const bool eager_zero = mi_option_is_enabled(mi_option_purge_holes_eager_zero);
+  #endif
+  if (eager_zero) { _mi_memzero(start, csize); }
   #endif
 
   const int err = _mi_prim_discard(start, csize);
   if (err != 0) {
     _mi_warning_message("cannot discard OS memory (error: %d (0x%x), address: %p, size: 0x%zx bytes)\n", err, err, start, csize);
+    return false;
   }
+  // count only what was actually discarded
+  mi_os_stat_counter_increase(purge_calls, 1);
+  mi_os_stat_counter_increase(purged, csize);
+  return true;
+  #endif
 }
 
 

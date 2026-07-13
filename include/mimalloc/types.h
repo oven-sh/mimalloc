@@ -407,11 +407,6 @@ typedef struct mi_page_s {
   uintptr_t                 keys[2];           // const: two random keys to encode the free lists (see `_mi_block_next`) or padding canary
   #endif
 
-  // Free blocks taken OFF the free list because their memory was discarded to
-  // the OS. Out-of-band on purpose: mimalloc threads its free list through the
-  // free blocks themselves, so a discarded block cannot hold a `next` pointer.
-  uint64_t                  purged[MI_PAGE_PURGE_WORDS];
-
   mi_theap_t*               theap;             // the theap owning this page (may not be valid or NULL for abandoned pages)
   mi_heap_t*                heap;              // const: the heap owning this page
 
@@ -419,6 +414,13 @@ typedef struct mi_page_s {
   struct mi_page_s*         prev;              // previous page owned by the theap with the same `block_size`
   size_t                    slice_committed;   // committed size relative to the first arena slice of the page data (or 0 if the page is fully committed already)
   mi_memid_t                memid;             // const: provenance of the page memory
+
+  // Free blocks taken OFF the free list because their memory was discarded to
+  // the OS. Out-of-band on purpose: mimalloc threads its free list through the
+  // free blocks themselves, so a discarded block cannot hold a `next` pointer.
+  // Cold: touched only by the idle hole-purge sweep, so it must stay *after* the
+  // fields above (see `mi_page_hot_fields_first_cacheline` in `page.c`).
+  uint64_t                  purged[MI_PAGE_PURGE_WORDS];
 } mi_page_t;
 
 

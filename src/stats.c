@@ -492,6 +492,13 @@ void mi_subproc_stats_print_out(mi_subproc_id_t subproc_id, mi_output_fun* out, 
   if (mi_subproc_stats_get(subproc_id, &stats)) {
     _mi_stats_print("subproc", subproc->subproc_seq, &stats, out, arg);
   }
+  // hole purging is process wide (it also covers pages no theap owns), so it has its own counters
+  mi_purge_holes_stats_t hs;
+  mi_purge_holes_stats_get(&hs);
+  if (hs.discard_calls > 0 || hs.purged_bytes_total > 0) {
+    _mi_fprintf(out, arg, "holes: %zu bytes / %zu blocks discarded now, %zu bytes total, %zu discards, %zu reuses, %zu pages freed by the sweep\n",
+                hs.purged_bytes, hs.purged_blocks, hs.purged_bytes_total, hs.discard_calls, hs.reuse_calls, hs.pages_freed);
+  }
 }
 
 void mi_stats_print_out(mi_output_fun* out, void* arg) mi_attr_noexcept {

@@ -80,6 +80,8 @@ typedef struct mi_stat_counter_s {
   MI_STAT_COUNTER(pages_reabandon_full) \
   MI_STAT_COUNTER(pages_unabandon_busy_wait) \
   MI_STAT_COUNTER(heaps_delete_wait)
+// note: the hole-purging counters are NOT in here -- `mi_stats_t` is embedded in `mi_theap_t`,
+// whose size is already at `MI_META_MAX_SIZE` (8KB) and cannot grow. See `mi_purge_holes_stats_t`.
 
 // Size bins for chunks
 typedef enum mi_chunkbin_e {

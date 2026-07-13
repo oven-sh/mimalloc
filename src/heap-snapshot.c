@@ -122,7 +122,7 @@ static void mi_snap_emit_mi_bbitmap(mi_snap_out_t* out, mi_bbitmap_t* bm) {
 // ---------------------------------------------------------------------------
 
 static void mi_snap_emit_page_freemap(mi_snap_out_t* out, mi_page_t* page) {
-  _mi_page_free_collect(page, true);
+  _mi_page_free_collect_no_unpurge(page, true);   // inspection must not fault a hole back in
   const uint16_t cap = page->capacity;
   const size_t bsize = mi_page_block_size(page);
   uint8_t* const pstart = mi_page_start(page);

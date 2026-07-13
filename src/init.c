@@ -34,12 +34,12 @@ const mi_page_t _mi_page_empty = {
   #if (MI_PADDING || MI_ENCODE_FREELIST)
   { 0, 0 },               // keys
   #endif
-  { 0 },                  // purged
   NULL,                   // theap
   NULL,                   // heap
   NULL, NULL,             // next, prev
   MI_ARENA_SLICE_SIZE,    // page_committed
-  MI_MEMID_STATIC         // memid
+  MI_MEMID_STATIC,        // memid
+  { 0 }                   // purged
 };
 
 #define MI_PAGE_EMPTY() ((mi_page_t*)&_mi_page_empty)

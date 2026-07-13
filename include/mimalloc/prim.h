@@ -68,6 +68,13 @@ int _mi_prim_reset(void* addr, size_t size);
 // (so `rss` drops immediately) while keeping the range committed and accessible.
 // Never changes the commit state of the range (in particular, never MEM_DECOMMIT).
 // Returns error code or 0 on success.
+// `MI_PRIM_HAS_DISCARD` is 0 where the primitive cannot release anything (and is a
+// no-op that must not be counted as a purge).
+#if defined(__wasi__) || defined(__EMSCRIPTEN__)
+#define MI_PRIM_HAS_DISCARD  (0)
+#else
+#define MI_PRIM_HAS_DISCARD  (1)
+#endif
 int _mi_prim_discard(void* addr, size_t size);
 
 // Reuse memory. This is called for memory that is already committed but
