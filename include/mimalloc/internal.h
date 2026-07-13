@@ -805,6 +805,70 @@ void          _mi_page_holes_reset_ineligible(void);
 void          _mi_page_purge_holes_begin(void);
 void          _mi_page_purge_holes_end(void);
 
+// ------------------------------------------------------
+// Hole report  (`mi_purge_holes_report`, see the "Hole report" section in `page.c`)
+//
+// What is left behind after a sweep, per size class: the free bytes that share an OS page
+// with a live block cannot be discarded, and this says how much of that there is and how
+// few live blocks are holding it down.
+// ------------------------------------------------------
+
+#define MI_HOLES_HIST_BUCKETS  (5)    // live blocks per pinned OS page: 1, 2, 3-4, 5-8, 9+
+#define MI_HOLES_GRAN_COUNT    (5)    // the hypothetical OS page sizes of the granularity curve
+
+typedef struct mi_holes_bin_s {
+  size_t block_size;           // the largest block size seen in this bin
+  size_t pages;
+  size_t ineligible_pages;     // pages `mi_page_can_purge_holes` rejects (nothing in them is discardable)
+  size_t live_bytes;           // bytes of allocated blocks
+  size_t free_bytes;           // bytes of free blocks (free-listed *and* already discarded)
+  size_t undiscardable_bytes;  // free bytes in an OS page that a live block pins (or that is not entirely inside the block area)
+  size_t discarded_bytes;      // bytes of the OS pages that are discarded right now
+  size_t edge_bytes;           // of `undiscardable_bytes`: those in a partial OS page (holds the page header, or memory past `capacity`)
+  size_t pending_bytes;        // free bytes in a fully free OS page that is not discarded (no sweep yet, or the discard failed)
+  size_t pinned_ospages;       // OS pages holding >= 1 live block
+  size_t pinned_live_blocks;   // live blocks over those (a block straddling two pinned OS pages counts in both)
+  size_t pinned_free_bytes;    // free bytes trapped inside those pinned OS pages
+  size_t pinned_live_bytes;    // live bytes inside those pinned OS pages
+  size_t hist[MI_HOLES_HIST_BUCKETS];
+} mi_holes_bin_t;
+
+typedef struct mi_holes_report_s {
+  mi_holes_bin_t bin[MI_BIN_COUNT];
+  size_t total_pages;
+  size_t ineligible_pages;
+  size_t unformed_bytes;       // memory of blocks not formed yet (`capacity < reserved`); never purgeable
+  // The granularity curve: how many bytes WOULD be discardable if the OS page size were
+  // `mi_holes_granularity(g)` -- the total size of the G-aligned, G-sized spans that lie wholly
+  // inside a page's block area and hold not one live block. Nothing is discarded to measure it;
+  // it is pure counting over the same free/live classification the sweep uses.
+  size_t discardable_at[MI_HOLES_GRAN_COUNT];
+  size_t unmadvisable_pages;   // excluded from the curve: their memory cannot be discarded at ANY granularity
+
+  // Where the memory actually IS. If the curve turns out flat, the free memory is not
+  // contaminating the pages -- and then this says where it went instead.
+  //
+  // CAVEAT, and it is why these fields are named the way they are: `slices_committed` is set for
+  // the WHOLE arena at reserve time whenever the OS memory is `initially_committed` (which every
+  // POSIX mmap is), and a reset-style purge (MADV_FREE_REUSABLE on darwin) does NOT clear it. So
+  // there that bitmap is address space, not residency, and `arena_committed_bytes` must not be
+  // read as "memory we are paying for". `slices_dirty` (ever touched) and `slices_purge`
+  // (scheduled but not yet purged) are the bitmaps that carry residency information.
+  size_t page_committed_bytes;       // committed bytes of the pages this walk reached
+  size_t arena_reserved_bytes;       // total arena address space
+  size_t arena_committed_bytes;      // popcount(slices_committed) -- see the caveat: on POSIX this is ~= reserved
+  size_t arena_free_dirty_bytes;     // slices in NO page that were touched at least once: the UPPER bound on arena slack still resident
+  size_t arena_purge_pending_bytes;  // slices in NO page, scheduled for purge but not purged yet: definitely still resident (the purge delay)
+  size_t arena_meta_bytes;           // the arenas' own bitmaps (`info_slices`) -- ROUGH: excludes the `mi_meta` heaps
+} mi_holes_report_t;
+
+size_t        mi_holes_granularity(size_t g);
+void          _mi_page_holes_report_page(const mi_page_t* page, mi_holes_report_t* rep);
+void          _mi_page_holes_report_print(const mi_holes_report_t* rep);
+void          _mi_arenas_holes_report(mi_heap_t* heap, mi_holes_report_t* rep);
+void          _mi_arenas_holes_committed(mi_heap_t* heap, mi_holes_report_t* rep);
+void          _mi_purge_holes_report_collect(mi_holes_report_t* rep);
+
 // The base of the OS-page bitmap: the start of the first OS page that the block area of
 // this page overlaps. It is OS-page aligned by construction, so bit `k` always names the
 // OS-page-aligned range `[base + k*os_page_size, base + (k+1)*os_page_size)`.

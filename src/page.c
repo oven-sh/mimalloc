@@ -621,6 +621,335 @@ void _mi_page_unpurge_all(mi_page_t* page) {
   _mi_page_purged_reset(page);
 }
 
+
+/* -----------------------------------------------------------
+  Hole report
+
+  After a sweep, the memory that hole punching did *not* get back is the free blocks that
+  share an OS page with a live block: an OS page is discarded only when every block
+  overlapping it is free, so a single live block pins the whole OS page. This accounts for
+  that, per size class, and says how many live blocks each pinned OS page is holding.
+
+  Read-only: it does not purge, un-purge, collect, or touch a free list. It walks the three
+  free lists in place instead of collecting them.
+
+  A block is exactly one of:
+   - free-listed: on `free`, `local_free`, or `xthread_free`;
+   - purged: free but held off every list because its memory is discarded. This is derived
+     from the OS-page bitmap (`mi_page_block_index_is_purged`: a block is purged iff it
+     overlaps a discarded OS page), which is how the rest of the code derives it too;
+   - live: everything else. Note `page->used` counts the not-yet-collected `xthread_free`
+     blocks as used, so live is *not* `page->used` -- we take it as the complement of the
+     other two (the conservation invariant is asserted in `mi_page_is_valid_init`).
+
+  Bytes are attributed per OS page, by overlap: every byte of every block lies in exactly
+  one OS page, so nothing is double counted even for a block straddling a boundary.
+----------------------------------------------------------- */
+
+#define MI_HOLES_MAX_CAP  (1 << 16)   // `page->capacity` is a uint16_t
+
+static void mi_holes_mark_free_list(const mi_page_t* page, mi_block_t* b, uint64_t* set) {
+  const size_t cap = page->capacity;
+  for (size_t n = 0; b != NULL && n <= cap; n++) {   // `n` bounds a corrupt or cyclic list
+    const size_t idx = mi_page_block_index(page, b);
+    if (idx >= cap) break;
+    set[idx / 64] |= ((uint64_t)1 << (idx % 64));
+    b = mi_block_next((mi_page_t*)page, b);
+  }
+}
+
+static size_t mi_holes_hist_bucket(size_t nlive) {
+  if (nlive <= 1) return 0;
+  if (nlive == 2) return 1;
+  if (nlive <= 4) return 2;
+  if (nlive <= 8) return 3;
+  return 4;
+}
+
+// the hypothetical OS page sizes of the granularity curve
+size_t mi_holes_granularity(size_t g) {
+  static const size_t grans[MI_HOLES_GRAN_COUNT] = { 4*MI_KiB, 8*MI_KiB, 16*MI_KiB, 32*MI_KiB, 64*MI_KiB };
+  return (g < MI_HOLES_GRAN_COUNT ? grans[g] : 0);
+}
+
+// is the block at `idx` free? Either on a free list, or purged (free, but held off every list
+// because its memory is already discarded). Anything else is live.
+static bool mi_holes_block_is_free(const mi_page_t* page, const uint64_t* freelisted, size_t idx) {
+  if (((freelisted[idx / 64] >> (idx % 64)) & 1) != 0) return true;
+  return mi_page_block_index_is_purged(page, idx);
+}
+
+// Can this page's memory be discarded at ALL, at any granularity? Pinned (large/huge OS pages)
+// memory cannot be madvise'd away, and an arena with a custom commit function owns its own
+// decommit. Note this is deliberately weaker than `mi_page_can_purge_holes`, which also rejects
+// pages whose OS pages do not fit the bitmap -- that is a limit of our bitmap, not of the OS,
+// and the curve is a question about the OS.
+static bool mi_page_holes_madvisable(const mi_page_t* page) {
+  if (page->memid.is_pinned) return false;
+  const mi_arena_t* const arena = mi_memid_arena(page->memid);
+  return (arena == NULL || arena->commit_fun == NULL);
+}
+
+// How many bytes of this page would be discardable if the OS page size were `G`? A G-aligned,
+// G-sized span can be discarded exactly when it lies wholly inside the block area and every
+// block overlapping it is free -- the same rule the real sweep applies at `_mi_os_page_size()`.
+static void mi_page_holes_granularity_curve(const mi_page_t* page, const uint64_t* freelisted, mi_holes_report_t* rep) {
+  const size_t bs = page->block_size;
+  const size_t cap = page->capacity;
+  const uintptr_t pstart = (uintptr_t)page->page_start;
+  const uintptr_t pend = pstart + (cap * bs);
+  for (size_t g = 0; g < MI_HOLES_GRAN_COUNT; g++) {
+    const size_t gran = mi_holes_granularity(g);
+    for (uintptr_t lo = _mi_align_down(pstart, gran); lo + gran <= pend; lo += gran) {
+      if (lo < pstart) continue;   // not entirely inside the block area
+      const size_t first = (size_t)(lo - pstart) / bs;
+      const size_t last = (size_t)((lo + gran - 1) - pstart) / bs;
+      bool all_free = true;
+      for (size_t idx = first; idx <= last && idx < cap; idx++) {
+        if (!mi_holes_block_is_free(page, freelisted, idx)) { all_free = false; break; }
+      }
+      if (all_free) { rep->discardable_at[g] += gran; }
+    }
+  }
+}
+
+void _mi_page_holes_report_page(const mi_page_t* page, mi_holes_report_t* rep) {
+  if (page == NULL || rep == NULL) return;
+  const size_t bs = page->block_size;
+  const size_t cap = page->capacity;
+  if (bs == 0 || cap > MI_HOLES_MAX_CAP) return;
+  mi_holes_bin_t* const r = &rep->bin[_mi_bin(bs)];
+  r->pages++;
+  if (bs > r->block_size) { r->block_size = bs; }
+  rep->total_pages++;
+  rep->page_committed_bytes += mi_page_committed(page);
+  if (page->reserved > cap) { rep->unformed_bytes += ((size_t)page->reserved - cap) * bs; }
+  if (cap == 0) return;
+
+  uint64_t freelisted[MI_HOLES_MAX_CAP / 64];
+  const size_t nwords = _mi_divide_up(cap, 64);
+  _mi_memzero(freelisted, nwords * sizeof(uint64_t));
+  mi_holes_mark_free_list(page, page->free, freelisted);
+  mi_holes_mark_free_list(page, page->local_free, freelisted);
+  mi_holes_mark_free_list(page, mi_page_thread_free(page), freelisted);   // a concurrent free can push after this read: that block reads as live (a diagnostic, so this is fine)
+  #define mi_holes_is_free(idx)  mi_holes_block_is_free(page, freelisted, idx)
+
+  if (mi_page_holes_madvisable(page)) { mi_page_holes_granularity_curve(page, freelisted, rep); }
+  else { rep->unmadvisable_pages++; }
+
+  // An ineligible page has no discardable OS page at all (and carries no holes, see
+  // `_mi_page_is_valid`), so every free block in it is undiscardable by definition.
+  if (!mi_page_can_purge_holes(page)) {
+    size_t nlive = 0;
+    for (size_t idx = 0; idx < cap; idx++) {
+      if (!mi_holes_is_free(idx)) { nlive++; }
+    }
+    r->live_bytes += nlive * bs;
+    r->free_bytes += (cap - nlive) * bs;
+    r->undiscardable_bytes += (cap - nlive) * bs;
+    r->ineligible_pages++;
+    rep->ineligible_pages++;
+    return;
+  }
+
+  const size_t os_size = _mi_os_page_size();
+  const uintptr_t pstart = (uintptr_t)page->page_start;
+  const uintptr_t pend = pstart + (cap * bs);
+  const uintptr_t base = mi_page_purge_base(page);
+  const size_t nbits = mi_page_purge_bits(page);
+  mi_assert_internal(nbits <= MI_PAGE_PURGE_BITS);
+
+  for (size_t k = 0; k < nbits; k++) {
+    const uintptr_t lo = base + (k * os_size);
+    const uintptr_t hi = lo + os_size;
+    const uintptr_t clo = (lo < pstart ? pstart : lo);
+    const uintptr_t chi = (hi > pend ? pend : hi);
+    if (clo >= chi) continue;                            // holds no block byte at all (the page header, or memory past `capacity`)
+    const bool whole = (lo >= pstart && hi <= pend);     // entirely inside the block area -- only such an OS page can ever be discarded
+    const size_t first = (size_t)(clo - pstart) / bs;
+    const size_t last = (size_t)((chi - 1) - pstart) / bs;
+    size_t live_ov = 0, free_ov = 0, nlive = 0;
+    for (size_t idx = first; idx <= last && idx < cap; idx++) {
+      const uintptr_t blo = pstart + (idx * bs);
+      const uintptr_t bhi = blo + bs;
+      const uintptr_t olo = (blo < lo ? lo : blo);
+      const uintptr_t ohi = (bhi > hi ? hi : bhi);
+      const size_t ov = (size_t)(ohi - olo);
+      if (mi_holes_is_free(idx)) { free_ov += ov; }
+      else { live_ov += ov; nlive++; }
+    }
+    r->live_bytes += live_ov;
+    r->free_bytes += free_ov;
+    if (mi_page_os_page_purged(page, k)) {
+      mi_assert_internal(whole && live_ov == 0 && free_ov == os_size);
+      r->discarded_bytes += os_size;
+    }
+    else if (!whole) {
+      // Not entirely inside the block area (it holds the page header, or memory past `capacity`),
+      // so it is never discardable whatever lives in it. Checked BEFORE liveness on purpose:
+      // counting it as pinned would blame a live block for an OS page that freeing that block
+      // cannot release anyway, and `pinned_ospages` / the histogram are the whole point here.
+      r->undiscardable_bytes += free_ov;
+      r->edge_bytes += free_ov;
+    }
+    else if (nlive > 0) {
+      r->undiscardable_bytes += free_ov;                 // pinned: a live block in this OS page keeps it resident
+      r->pinned_ospages++;
+      r->pinned_live_blocks += nlive;
+      r->pinned_free_bytes += free_ov;
+      r->pinned_live_bytes += live_ov;
+      r->hist[mi_holes_hist_bucket(nlive)]++;
+    }
+    else {
+      r->pending_bytes += free_ov;                       // fully free and discardable, but not discarded (no sweep yet, or the discard failed)
+    }
+  }
+  #undef mi_holes_is_free
+}
+
+// bytes as "MB.hh", since the mimalloc printf has no %f
+static void mi_holes_mb(size_t bytes, char* buf, size_t bufsize) {
+  const size_t mb = bytes / MI_MiB;
+  const size_t hundredths = ((bytes % MI_MiB) * 100) / MI_MiB;
+  _mi_snprintf(buf, bufsize, "%zu.%02zu", mb, hundredths);
+}
+
+static void mi_holes_print_row(const char* name, const mi_holes_bin_t* r) {
+  char slive[32], sfree[32], sundisc[32], sdisc[32];
+  mi_holes_mb(r->live_bytes, slive, sizeof(slive));
+  mi_holes_mb(r->free_bytes, sfree, sizeof(sfree));
+  mi_holes_mb(r->undiscardable_bytes, sundisc, sizeof(sundisc));
+  mi_holes_mb(r->discarded_bytes, sdisc, sizeof(sdisc));
+  // live blocks per pinned OS page, to two decimals
+  const size_t avg100 = (r->pinned_ospages == 0 ? 0 : (r->pinned_live_blocks * 100) / r->pinned_ospages);
+  _mi_fprintf(NULL, NULL, "%10s %8zu %10s %10s %18s %13s %10zu.%02zu\n",
+              name, r->pages, slive, sfree, sundisc, sdisc, avg100 / 100, avg100 % 100);
+}
+
+void _mi_page_holes_report_print(const mi_holes_report_t* rep) {
+  if (rep == NULL) return;
+  static const char* hist_name[MI_HOLES_HIST_BUCKETS] = { "1", "2", "3-4", "5-8", "9+" };
+
+  _mi_fprintf(NULL, NULL, "\nholes report: os page = %zu bytes, %zu pages (%zu ineligible, %zu never madvise-able)\n",
+              _mi_os_page_size(), rep->total_pages, rep->ineligible_pages, rep->unmadvisable_pages);
+
+  mi_holes_bin_t total;
+  _mi_memzero(&total, sizeof(total));
+  for (size_t bin = 0; bin < MI_BIN_COUNT; bin++) {
+    const mi_holes_bin_t* const r = &rep->bin[bin];
+    total.live_bytes += r->live_bytes;
+    total.free_bytes += r->free_bytes;
+    total.pinned_ospages += r->pinned_ospages;
+    total.pinned_free_bytes += r->pinned_free_bytes;
+    total.pinned_live_bytes += r->pinned_live_bytes;
+  }
+
+  // THE measurement: what a smaller OS page would buy us. `discardable@4K - discardable@16K` is
+  // the memory the 16KB darwin page costs us, measured directly here -- no cross-platform
+  // subtraction, no RSS arithmetic. Nothing is discarded to produce these numbers.
+  char sgran[32];
+  _mi_fprintf(NULL, NULL, "  discardable bytes vs hypothetical OS page size (nothing is discarded to measure this):\n");
+  for (size_t g = 0; g < MI_HOLES_GRAN_COUNT; g++) {
+    const size_t gran = mi_holes_granularity(g);
+    mi_holes_mb(rep->discardable_at[g], sgran, sizeof(sgran));
+    _mi_fprintf(NULL, NULL, "    @%6zu : %10s MB%s\n", gran, sgran,
+                (gran == _mi_os_page_size() ? "   <-- this machine's OS page size" : ""));
+  }
+  char slive[32], sfree[32], spfree[32], splive[32];
+  mi_holes_mb(total.live_bytes, slive, sizeof(slive));
+  mi_holes_mb(total.free_bytes, sfree, sizeof(sfree));
+  mi_holes_mb(total.pinned_free_bytes, spfree, sizeof(spfree));
+  mi_holes_mb(total.pinned_live_bytes, splive, sizeof(splive));
+  _mi_fprintf(NULL, NULL, "  live %s MB, free %s MB\n", slive, sfree);
+  _mi_fprintf(NULL, NULL, "  %zu pinned OS pages (>= 1 live block): %s MB live + %s MB free trapped in them\n",
+              total.pinned_ospages, splive, spfree);
+
+  // Where the memory IS. If the curve is flat, the free memory is not sitting inside the pages --
+  // and then it is sitting here. "in-page free" is memory the PAGES are holding (contamination);
+  // "arena slack" is memory held in NO page at all (a purge/arena problem). Those want completely
+  // different fixes, so the split has to be explicit -- and so does what each number can't tell us.
+  {
+    char spage[32], soverhead[32], sslack[32], spend[32], smeta[32], scommit[32], sresv[32], sother[32];
+    const size_t page_overhead = (rep->page_committed_bytes > total.live_bytes + total.free_bytes
+                                   ? rep->page_committed_bytes - total.live_bytes - total.free_bytes : 0);
+    const size_t touched = rep->page_committed_bytes + rep->arena_free_dirty_bytes + rep->arena_meta_bytes;
+    mi_holes_mb(rep->page_committed_bytes, spage, sizeof(spage));
+    mi_holes_mb(page_overhead, soverhead, sizeof(soverhead));
+    mi_holes_mb(rep->arena_free_dirty_bytes, sslack, sizeof(sslack));
+    mi_holes_mb(rep->arena_purge_pending_bytes, spend, sizeof(spend));
+    mi_holes_mb(rep->arena_meta_bytes, smeta, sizeof(smeta));
+    mi_holes_mb(touched, sother, sizeof(sother));
+    mi_holes_mb(rep->arena_committed_bytes, scommit, sizeof(scommit));
+    mi_holes_mb(rep->arena_reserved_bytes, sresv, sizeof(sresv));
+    _mi_fprintf(NULL, NULL, "  memory partition (walking the arena bitmaps):\n");
+    _mi_fprintf(NULL, NULL, "    in pages           : %10s MB  = live %s + in-page free %s + page overhead %s (header/unformed)\n",
+                spage, slive, sfree, soverhead);
+    _mi_fprintf(NULL, NULL, "    arena slack        : %10s MB  (in NO page, touched at least once; %s MB of it is queued for purge and so certainly still resident)\n",
+                sslack, spend);
+    _mi_fprintf(NULL, NULL, "    arena meta (ROUGH) : %10s MB  (arena bitmaps only; excludes the mi_meta heaps)\n", smeta);
+    _mi_fprintf(NULL, NULL, "    ---- ever-touched  : %10s MB  (in-pages + slack + meta; the ceiling on what we can be paying for)\n", sother);
+    _mi_fprintf(NULL, NULL, "    reserved %s MB, slices_committed %s MB -- NOTE: on POSIX every slice is marked committed at reserve\n", sresv, scommit);
+    _mi_fprintf(NULL, NULL, "      time and a reset-purge never clears it, so slices_committed is address space, NOT residency.\n");
+    _mi_fprintf(NULL, NULL, "      'arena slack' is an UPPER bound: a slice purged earlier still reads as dirty here.\n");
+    _mi_fprintf(NULL, NULL, "      'in pages' misses pages owned by OTHER threads' theaps -- this walk cannot read them.\n");
+  }
+
+  _mi_fprintf(NULL, NULL, "%10s %8s %10s %10s %18s %13s %13s\n",
+              "size_class", "pages", "live_MB", "free_MB", "undiscardable_MB", "discarded_MB", "avg_live_blocks_per_pinned_ospage");
+  _mi_memzero(&total, sizeof(total));
+  char name[32];
+  for (size_t bin = 0; bin < MI_BIN_COUNT; bin++) {
+    const mi_holes_bin_t* const r = &rep->bin[bin];
+    if (r->pages == 0) continue;
+    _mi_snprintf(name, sizeof(name), "%zu", r->block_size);
+    mi_holes_print_row(name, r);
+    total.pages += r->pages;
+    total.live_bytes += r->live_bytes;
+    total.free_bytes += r->free_bytes;
+    total.undiscardable_bytes += r->undiscardable_bytes;
+    total.discarded_bytes += r->discarded_bytes;
+    total.edge_bytes += r->edge_bytes;
+    total.pending_bytes += r->pending_bytes;
+    total.pinned_ospages += r->pinned_ospages;
+    total.pinned_live_blocks += r->pinned_live_blocks;
+  }
+  mi_holes_print_row("TOTAL", &total);
+
+  char edge[32], pending[32], unformed[32];
+  mi_holes_mb(total.edge_bytes, edge, sizeof(edge));
+  mi_holes_mb(total.pending_bytes, pending, sizeof(pending));
+  mi_holes_mb(rep->unformed_bytes, unformed, sizeof(unformed));
+  _mi_fprintf(NULL, NULL, "  of undiscardable: %s MB lies in a partial OS page (page header / past capacity)\n", edge);
+  _mi_fprintf(NULL, NULL, "  free and discardable but not discarded: %s MB;  blocks not formed yet: %s MB\n", pending, unformed);
+
+  // the 3 worst size classes by undiscardable bytes: how many live blocks pin each pinned OS page?
+  size_t taken[3] = { MI_BIN_COUNT, MI_BIN_COUNT, MI_BIN_COUNT };
+  for (size_t n = 0; n < 3; n++) {
+    size_t worst = MI_BIN_COUNT;
+    for (size_t bin = 0; bin < MI_BIN_COUNT; bin++) {
+      const mi_holes_bin_t* const r = &rep->bin[bin];
+      if (r->pinned_ospages == 0 || r->undiscardable_bytes == 0) continue;
+      bool already = false;
+      for (size_t i = 0; i < n; i++) { if (taken[i] == bin) { already = true; break; } }
+      if (already) continue;
+      if (worst == MI_BIN_COUNT || r->undiscardable_bytes > rep->bin[worst].undiscardable_bytes) { worst = bin; }
+    }
+    if (worst == MI_BIN_COUNT) break;
+    taken[n] = worst;
+    const mi_holes_bin_t* const r = &rep->bin[worst];
+    char worst_undisc[32];
+    mi_holes_mb(r->undiscardable_bytes, worst_undisc, sizeof(worst_undisc));
+    _mi_fprintf(NULL, NULL, "  block_size %zu: %s MB undiscardable over %zu pinned OS pages; live blocks per pinned OS page:",
+                r->block_size, worst_undisc, r->pinned_ospages);
+    for (size_t h = 0; h < MI_HOLES_HIST_BUCKETS; h++) {
+      _mi_fprintf(NULL, NULL, "  %s: %zu", hist_name[h], r->hist[h]);
+    }
+    _mi_fprintf(NULL, NULL, "\n");
+  }
+  _mi_fprintf(NULL, NULL, "  (a live block straddling two pinned OS pages counts in both; abandoned pages are only reached when they are in the arena's abandoned map)\n");
+}
+
+
 static void mi_page_free_collect_ex(mi_page_t* page, bool force, bool allow_unpurge) {
   mi_assert_internal(page!=NULL);
 

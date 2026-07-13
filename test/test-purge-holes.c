@@ -637,6 +637,390 @@ static bool test_os_page_arithmetic(void) {
 }
 
 // ---------------------------------------------------------------------------
+// 8. the hole report (`mi_purge_holes_report`): is its "undiscardable" number the truth?
+//
+//    We build a KNOWN pinned situation -- exactly one live block per OS page -- then
+//    recompute what the report must say from first principles and from the test's OWN
+//    record of which blocks are live (never from the allocator's free lists), and compare.
+//    The report is what we will use to chase the memory JSC still retains: if it lies, it
+//    sends us after the wrong bug.
+// ---------------------------------------------------------------------------
+
+static bool bit_get(const uint64_t* s, size_t i) { return ((s[i / 64] >> (i % 64)) & 1) != 0; }
+
+typedef struct expect_s {
+  size_t live, freeb, undisc, disc, pending, pinned_ospages, pinned_live;
+  size_t hist[MI_HOLES_HIST_BUCKETS];
+} expect_t;
+
+static size_t expect_hist_bucket(size_t n) {
+  if (n <= 1) return 0;
+  if (n == 2) return 1;
+  if (n <= 4) return 2;
+  if (n <= 8) return 3;
+  return 4;
+}
+
+// `live` is the test's own live set for this page. This also asserts the allocator discarded
+// EXACTLY the OS pages that lie entirely inside the block area and hold no live block --
+// which is the definition the report's "undiscardable" rests on.
+static bool expect_page(mi_page_t* page, const uint64_t* live, expect_t* e) {
+  const size_t os = _mi_os_page_size();
+  const size_t bs = page->block_size;
+  const size_t cap = page->capacity;
+  const uintptr_t pstart = (uintptr_t)page->page_start;
+  const uintptr_t pend = pstart + (cap * bs);
+  const uintptr_t base = pstart & ~(uintptr_t)(os - 1);
+  const size_t nbits = (size_t)(((pstart + mi_page_size(page)) - base + os - 1) / os);
+
+  for (size_t k = 0; k < nbits; k++) {
+    const uintptr_t lo = base + (k * os);
+    const uintptr_t hi = lo + os;
+    const uintptr_t clo = (lo < pstart ? pstart : lo);
+    const uintptr_t chi = (hi > pend ? pend : hi);
+    if (clo >= chi) continue;   // no block byte lands in this OS page
+    const bool whole = (lo >= pstart && hi <= pend);
+    const size_t first = (size_t)(clo - pstart) / bs;
+    const size_t last = (size_t)((chi - 1) - pstart) / bs;
+    size_t live_ov = 0, free_ov = 0, nlive = 0;
+    for (size_t idx = first; idx <= last && idx < cap; idx++) {
+      const uintptr_t blo = pstart + (idx * bs);
+      const uintptr_t bhi = blo + bs;
+      const uintptr_t olo = (blo < lo ? lo : blo);
+      const uintptr_t ohi = (bhi > hi ? hi : bhi);
+      const size_t ov = (size_t)(ohi - olo);
+      if (bit_get(live, idx)) { live_ov += ov; nlive++; }
+      else { free_ov += ov; }
+    }
+    const bool want_purged = purging_enabled && whole && (nlive == 0);
+    const bool got_purged = mi_page_os_page_purged(page, k);
+    if (want_purged != got_purged) {
+      fprintf(stderr, "\n  os page %zu of page %p: purged=%d, expected %d (nlive=%zu, whole=%d)\n",
+              k, (void*)page, (int)got_purged, (int)want_purged, nlive, (int)whole);
+      return false;
+    }
+    e->live += live_ov;
+    e->freeb += free_ov;
+    if (got_purged) { e->disc += os; }
+    else if (!whole) { e->undisc += free_ov; }   // never discardable, live block in it or not -- so NOT "pinned"
+    else if (nlive > 0) {
+      e->undisc += free_ov;
+      e->pinned_ospages++;
+      e->pinned_live += nlive;
+      e->hist[expect_hist_bucket(nlive)]++;
+    }
+    else { e->pending += free_ov; }
+  }
+  return true;
+}
+
+#define REPORT_N   (2048)
+#define REPORT_SZ  (512)
+
+// mode 0: keep one live block per OS page       -> nothing is discardable (maximally pinned)
+// mode 1: keep one live block per mimalloc page -> almost everything is discardable
+static bool test_holes_report(int mode) {
+  const size_t os = _mi_os_page_size();
+  void** ptrs = (void**)calloc(REPORT_N, sizeof(void*));
+  uintptr_t* kept = (uintptr_t*)calloc(REPORT_N, sizeof(uintptr_t));
+  mi_page_t** pages = (mi_page_t**)calloc(REPORT_N, sizeof(mi_page_t*));
+  mi_holes_report_t* rep = (mi_holes_report_t*)calloc(1, sizeof(mi_holes_report_t));
+  size_t nkept = 0, npages = 0, bs = 0, block_total = 0;
+  const mi_holes_bin_t* r = NULL;
+  expect_t e;
+  bool ok = true;
+  memset(&e, 0, sizeof(e));
+  if (ptrs == NULL || kept == NULL || pages == NULL || rep == NULL) { ok = false; goto done; }
+
+  for (size_t i = 0; i < REPORT_N; i++) {
+    ptrs[i] = mi_malloc(REPORT_SZ);
+    if (ptrs[i] == NULL) { ok = false; goto done; }
+    pattern_fill(ptrs[i], REPORT_SZ, i);
+  }
+  // keep the first block that starts in each OS page (mode 0) / in each mimalloc page (mode 1)
+  for (size_t i = 0; i < REPORT_N; i++) {
+    const uintptr_t key = (mode == 0
+                             ? ((uintptr_t)ptrs[i] & ~(uintptr_t)(os - 1))
+                             : (uintptr_t)_mi_ptr_page(ptrs[i]));
+    bool seen = false;
+    for (size_t j = 0; j < nkept; j++) { if (kept[j] == key) { seen = true; break; } }
+    if (seen) { mi_free(ptrs[i]); ptrs[i] = NULL; }
+    else { kept[nkept++] = key; }
+  }
+
+  mi_purge_holes();
+
+  for (size_t i = 0; i < REPORT_N; i++) {
+    if (ptrs[i] == NULL) continue;
+    mi_page_t* const page = _mi_ptr_page(ptrs[i]);
+    bool seen = false;
+    for (size_t j = 0; j < npages; j++) { if (pages[j] == page) { seen = true; break; } }
+    if (!seen) { pages[npages++] = page; }
+  }
+  if (npages == 0) { fprintf(stderr, "\n  no pages left to report on\n"); ok = false; goto done; }
+  bs = pages[0]->block_size;
+
+  for (size_t j = 0; j < npages; j++) {
+    mi_page_t* const page = pages[j];
+    if (page->block_size != bs) { fprintf(stderr, "\n  mixed block sizes in one bin\n"); ok = false; goto done; }
+    const size_t cap = page->capacity;
+    uint64_t* const live = (uint64_t*)calloc((cap + 63) / 64, sizeof(uint64_t));
+    if (live == NULL) { ok = false; goto done; }
+    size_t nmine = 0;
+    for (size_t i = 0; i < REPORT_N; i++) {
+      if (ptrs[i] == NULL || _mi_ptr_page(ptrs[i]) != page) continue;
+      const size_t idx = (size_t)((uint8_t*)ptrs[i] - page->page_start) / bs;
+      live[idx / 64] |= ((uint64_t)1 << (idx % 64));
+      nmine++;
+    }
+    // the ground truth assumes every OTHER block in the page is free, so the page must be
+    // exclusively ours (`used` also counts uncollected thread frees; this test is single-threaded)
+    if (page->used != nmine) {
+      fprintf(stderr, "\n  page %p is not exclusively ours: used=%zu but we hold %zu\n", (void*)page, (size_t)page->used, nmine);
+      free(live);
+      ok = false; goto done;
+    }
+    const bool page_ok = expect_page(page, live, &e);
+    free(live);
+    if (!page_ok) { ok = false; goto done; }
+    _mi_page_holes_report_page(page, rep);
+    block_total += cap * bs;
+  }
+
+  r = &rep->bin[_mi_bin(bs)];
+  #define REPORT_EQ(field, want)                                                                          \
+    if ((size_t)(r->field) != (size_t)(want)) {                                                           \
+      fprintf(stderr, "\n  report." #field " = %zu but the hand-computed value is %zu (mode %d, bs %zu)\n", \
+              (size_t)(r->field), (size_t)(want), mode, bs);                                              \
+      ok = false;                                                                                         \
+    }
+  REPORT_EQ(pages, npages);
+  REPORT_EQ(live_bytes, e.live);
+  REPORT_EQ(free_bytes, e.freeb);
+  REPORT_EQ(undiscardable_bytes, e.undisc);
+  REPORT_EQ(discarded_bytes, e.disc);
+  REPORT_EQ(pending_bytes, e.pending);
+  REPORT_EQ(pinned_ospages, e.pinned_ospages);
+  REPORT_EQ(pinned_live_blocks, e.pinned_live);
+  for (size_t h = 0; h < MI_HOLES_HIST_BUCKETS; h++) { REPORT_EQ(hist[h], e.hist[h]); }
+  #undef REPORT_EQ
+  if (!ok) goto done;
+
+  // every byte of every formed block is accounted for, exactly once
+  if (r->live_bytes + r->free_bytes != block_total) {
+    fprintf(stderr, "\n  live+free = %zu but the pages hold %zu bytes of blocks\n", r->live_bytes + r->free_bytes, block_total);
+    ok = false; goto done;
+  }
+
+  // The granularity curve, checked against the accounting above at the ONE granularity where the
+  // two must agree: at the real OS page size, "would be discardable" is exactly "is discarded, or
+  // is a fully free OS page the sweep has not gotten to". If this identity does not hold, the
+  // curve -- the number the page-size hypothesis rests on -- is measuring something else.
+  {
+    const size_t os = _mi_os_page_size();
+    size_t gi = MI_HOLES_GRAN_COUNT;
+    for (size_t g = 0; g < MI_HOLES_GRAN_COUNT; g++) { if (mi_holes_granularity(g) == os) { gi = g; break; } }
+    if (gi == MI_HOLES_GRAN_COUNT) { fprintf(stderr, "\n  the curve has no entry for the real OS page size %zu\n", os); ok = false; goto done; }
+    const size_t want = r->discarded_bytes + r->pending_bytes;
+    if (rep->discardable_at[gi] != want) {
+      fprintf(stderr, "\n  curve@%zu = %zu but discarded+pending = %zu\n", os, rep->discardable_at[gi], want);
+      ok = false; goto done;
+    }
+    // and it must be monotone: a smaller granularity can only ever discard more
+    for (size_t g = 1; g < MI_HOLES_GRAN_COUNT; g++) {
+      if (rep->discardable_at[g] > rep->discardable_at[g - 1]) {
+        fprintf(stderr, "\n  curve is not monotone: @%zu = %zu > @%zu = %zu\n",
+                mi_holes_granularity(g), rep->discardable_at[g], mi_holes_granularity(g - 1), rep->discardable_at[g - 1]);
+        ok = false; goto done;
+      }
+    }
+    fprintf(stderr, "[curve 4K=%zu 8K=%zu 16K=%zu 32K=%zu 64K=%zu] ",
+            rep->discardable_at[0], rep->discardable_at[1], rep->discardable_at[2],
+            rep->discardable_at[3], rep->discardable_at[4]);
+  }
+
+  if (mode == 0) {
+    // the whole point: with one live block per OS page NOTHING is discardable, so every free
+    // byte is undiscardable -- and the amplification is what we are chasing in JSC
+    if (r->discarded_bytes != 0) {
+      fprintf(stderr, "\n  mode 0 is meant to be fully pinned but %zu bytes were discarded\n", r->discarded_bytes);
+      ok = false; goto done;
+    }
+    if (r->pending_bytes != 0 || r->undiscardable_bytes != r->free_bytes) {
+      fprintf(stderr, "\n  mode 0: undiscardable %zu != free %zu (pending %zu)\n",
+              r->undiscardable_bytes, r->free_bytes, r->pending_bytes);
+      ok = false; goto done;
+    }
+    if (r->pinned_ospages == 0) { fprintf(stderr, "\n  mode 0: no pinned OS page\n"); ok = false; goto done; }
+    fprintf(stderr, "(bs=%zu: %zu pinned OS pages hold %zu live blocks and pin %zu free bytes; %zux amplification) ",
+            bs, r->pinned_ospages, r->pinned_live_blocks, r->undiscardable_bytes,
+            (r->live_bytes == 0 ? (size_t)0 : (r->live_bytes + r->undiscardable_bytes) / r->live_bytes));
+  }
+  else if (purging_enabled) {
+    // one live block per 64KB page: most OS pages are fully free and must be gone
+    if (r->discarded_bytes == 0) {
+      fprintf(stderr, "\n  mode 1: nothing was discarded, so the report distinguishes nothing\n");
+      ok = false; goto done;
+    }
+    if (r->undiscardable_bytes >= r->discarded_bytes) {
+      fprintf(stderr, "\n  mode 1: undiscardable %zu >= discarded %zu\n", r->undiscardable_bytes, r->discarded_bytes);
+      ok = false; goto done;
+    }
+    fprintf(stderr, "(bs=%zu: %zu bytes discarded, %zu still pinned) ", bs, r->discarded_bytes, r->undiscardable_bytes);
+  }
+
+  // the report must not have moved anything: the survivors are intact
+  for (size_t i = 0; i < REPORT_N; i++) {
+    if (ptrs[i] == NULL) continue;
+    const size_t bad = pattern_check(ptrs[i], REPORT_SZ, i);
+    if (bad != REPORT_SZ) {
+      fprintf(stderr, "\n  CORRUPT survivor %zu at offset %zu after the report\n", i, bad);
+      ok = false; goto done;
+    }
+  }
+
+done:
+  if (ptrs != NULL) {
+    for (size_t i = 0; i < REPORT_N; i++) { if (ptrs[i] != NULL) mi_free(ptrs[i]); }
+    free(ptrs);
+  }
+  free(kept); free(pages); free(rep);
+  return ok;
+}
+
+// the whole-process report must not purge, un-purge, or free anything, and must be self-consistent
+static bool test_report_is_read_only(void) {
+  enum { N = 1024, SZ = 1024 };
+  void** ptrs = (void**)calloc(N, sizeof(void*));
+  mi_holes_report_t* rep = (mi_holes_report_t*)calloc(1, sizeof(mi_holes_report_t));
+  size_t total_disc = 0;
+  bool ok = true;
+  if (ptrs == NULL || rep == NULL) { free(ptrs); free(rep); return false; }
+  for (size_t i = 0; i < N; i++) {
+    ptrs[i] = mi_malloc(SZ);
+    if (ptrs[i] == NULL) { ok = false; goto done; }
+    pattern_fill(ptrs[i], SZ, i);
+  }
+  // keep every 64th block: whatever the block size, the free runs between the survivors cover
+  // several whole OS pages, so there is always something for the sweep to discard
+  for (size_t i = 0; i < N; i++) { if ((i % 64) != 0) { mi_free(ptrs[i]); ptrs[i] = NULL; } }
+  mi_purge_holes();
+
+  const hole_stats_t before = hole_stats();
+  mi_purge_holes_report();               // the public entry point: prints the table
+  _mi_purge_holes_report_collect(rep);   // and again, for the numbers
+  const hole_stats_t after = hole_stats();
+
+  if (before.bytes_now != after.bytes_now || before.discards != after.discards ||
+      before.reuses != after.reuses || before.pages_freed != after.pages_freed) {
+    fprintf(stderr, "\n  the report is not read-only: bytes %lld->%lld, discards %lld->%lld, reuses %lld->%lld, pages freed %lld->%lld\n",
+            (long long)before.bytes_now, (long long)after.bytes_now, (long long)before.discards, (long long)after.discards,
+            (long long)before.reuses, (long long)after.reuses, (long long)before.pages_freed, (long long)after.pages_freed);
+    ok = false; goto done;
+  }
+  for (size_t bin = 0; bin < MI_BIN_COUNT; bin++) {
+    const mi_holes_bin_t* const r = &rep->bin[bin];
+    if (r->undiscardable_bytes + r->discarded_bytes + r->pending_bytes > r->free_bytes) {
+      fprintf(stderr, "\n  bin %zu: undiscardable+discarded+pending %zu > free %zu\n", bin,
+              r->undiscardable_bytes + r->discarded_bytes + r->pending_bytes, r->free_bytes);
+      ok = false; goto done;
+    }
+    total_disc += r->discarded_bytes;
+  }
+  if (purging_enabled && total_disc == 0) {
+    fprintf(stderr, "\n  the report sees no discarded bytes at all\n");
+    ok = false; goto done;
+  }
+  if (!purging_enabled && total_disc != 0) {
+    fprintf(stderr, "\n  purging is off but the report claims %zu discarded bytes\n", total_disc);
+    ok = false; goto done;
+  }
+  for (size_t i = 0; i < N; i++) {
+    if (ptrs[i] == NULL) continue;
+    if (pattern_check(ptrs[i], SZ, i) != SZ) { fprintf(stderr, "\n  CORRUPT after the report\n"); ok = false; goto done; }
+    memset(ptrs[i], 0x9B, SZ);   // and still writable
+  }
+
+done:
+  if (ptrs != NULL) {
+    for (size_t i = 0; i < N; i++) { if (ptrs[i] != NULL) mi_free(ptrs[i]); }
+    free(ptrs);
+  }
+  free(rep);
+  return ok;
+}
+
+// The abandoned pages are where most of the holes are (every page that ever became full ends up
+// there), so a report that cannot see them would be describing the wrong heap. And they are where
+// the report is most at risk of not being read-only: reaching one means claiming it through the
+// arena's ownership protocol. This checks BOTH: the report reaches every abandoned page we made,
+// and it changes nothing while doing so.
+#define RO_N   (512)
+#define RO_SZ  (1024)
+static void* ro_ptrs[RO_N];
+
+static void ro_worker(void) {
+  for (size_t i = 0; i < RO_N; i++) {
+    ro_ptrs[i] = mi_malloc(RO_SZ);
+    if (ro_ptrs[i] != NULL) { pattern_fill(ro_ptrs[i], RO_SZ, i); }
+  }
+  // keep one block in every 32 and exit: the pages are abandoned, each with a live block and a
+  // long run of free blocks (so the sweep has whole OS pages to discard in them)
+  for (size_t i = 0; i < RO_N; i++) {
+    if ((i % 32) != 0) { mi_free(ro_ptrs[i]); ro_ptrs[i] = NULL; }
+  }
+}
+
+static bool test_report_read_only_abandoned(void) {
+  mi_page_t* pages[RO_N];
+  mi_holes_report_t* rep = (mi_holes_report_t*)calloc(1, sizeof(mi_holes_report_t));
+  size_t npages = 0;
+  bool ok = true;
+  if (rep == NULL) return false;
+  memset(ro_ptrs, 0, sizeof(ro_ptrs));
+  run_one_thread(&ro_worker);
+  mi_purge_holes();
+
+  for (size_t i = 0; i < RO_N; i++) {
+    if (ro_ptrs[i] == NULL) continue;
+    mi_page_t* const page = _mi_ptr_page(ro_ptrs[i]);
+    bool seen = false;
+    for (size_t j = 0; j < npages; j++) { if (pages[j] == page) { seen = true; break; } }
+    if (!seen) { pages[npages++] = page; }
+  }
+  if (npages == 0) { fprintf(stderr, "\n  the worker left no pages behind\n"); ok = false; goto done; }
+
+  const hole_stats_t before = hole_stats();
+  _mi_purge_holes_report_collect(rep);
+  const hole_stats_t after = hole_stats();
+
+  // it must have reached the abandoned pages: they are not in any theap of this thread
+  if (rep->bin[_mi_bin(pages[0]->block_size)].pages < npages) {
+    fprintf(stderr, "\n  the report only saw %zu pages of this size class but %zu are abandoned with holes\n",
+            rep->bin[_mi_bin(pages[0]->block_size)].pages, npages);
+    ok = false; goto done;
+  }
+  // and it must have changed nothing: no discard, no reuse, no page handed back
+  if (before.bytes_now != after.bytes_now || before.reuses != after.reuses ||
+      before.discards != after.discards || before.pages_freed != after.pages_freed) {
+    fprintf(stderr, "\n  the report is not read-only on abandoned pages: bytes %lld->%lld, reuses %lld->%lld, discards %lld->%lld, pages freed %lld->%lld\n",
+            (long long)before.bytes_now, (long long)after.bytes_now, (long long)before.reuses, (long long)after.reuses,
+            (long long)before.discards, (long long)after.discards, (long long)before.pages_freed, (long long)after.pages_freed);
+    ok = false; goto done;
+  }
+  for (size_t i = 0; i < RO_N; i++) {
+    if (ro_ptrs[i] == NULL) continue;
+    if (pattern_check(ro_ptrs[i], RO_SZ, i) != RO_SZ) { fprintf(stderr, "\n  CORRUPT abandoned survivor %zu\n", i); ok = false; goto done; }
+  }
+  fprintf(stderr, "(%zu abandoned pages reached) ", npages);
+
+done:
+  for (size_t i = 0; i < RO_N; i++) { if (ro_ptrs[i] != NULL) { mi_free(ro_ptrs[i]); ro_ptrs[i] = NULL; } }
+  free(rep);
+  return ok;
+}
+
+// ---------------------------------------------------------------------------
 // portable "run one thread and join" (mirrors test-stress.c)
 // ---------------------------------------------------------------------------
 
@@ -715,6 +1099,10 @@ int main(void) {
   CHECK("page-lifecycle", test_page_lifecycle());
   CHECK("abandoned-pages", test_abandoned());
   CHECK("large-pages", test_large_pages());
+  CHECK("report-pinned-ospages", test_holes_report(0));
+  CHECK("report-discardable-ospages", test_holes_report(1));
+  CHECK("report-is-read-only", test_report_is_read_only());
+  CHECK("report-is-read-only-on-abandoned", test_report_read_only_abandoned());
   CHECK("option-off-is-noop", test_option_off());
 
   // everything above is freed by now, so every hole must have been handed back

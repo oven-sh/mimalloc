@@ -211,6 +211,54 @@ void mi_purge_holes(void) mi_attr_noexcept {
   }
 }
 
+// Report what hole punching leaves behind (see the "Hole report" section in `page.c`).
+// Same traversal and same ownership rules as `mi_purge_holes` -- every theap of this thread,
+// plus the abandoned pages of the heaps behind them -- but read-only: it collects nothing,
+// purges nothing, un-purges nothing, and never touches a free list.
+static bool mi_theap_page_holes_report(mi_theap_t* theap, mi_page_queue_t* pq, mi_page_t* page, void* arg1, void* arg2) {
+  MI_UNUSED(theap); MI_UNUSED(pq); MI_UNUSED(arg2);
+  _mi_page_holes_report_page(page, (mi_holes_report_t*)arg1);
+  return true; // continue
+}
+
+void _mi_purge_holes_report_collect(mi_holes_report_t* rep) {
+  if (rep == NULL) return;
+  _mi_memzero(rep, sizeof(*rep));
+  mi_theap_t* const theap0 = _mi_theap_default();
+  if (theap0 == NULL || !mi_theap_is_initialized(theap0) || theap0->tld == NULL) return;
+  mi_tld_t* const tld = theap0->tld;
+  if (tld->thread_id != _mi_thread_id()) return;   // owner thread only, exactly as for the sweep
+
+  mi_heap_t* heaps[MI_PURGE_HOLES_MAX_HEAPS];
+  size_t heap_count = 0;
+
+  // another thread can unlink a theap from this list in `mi_heap_free`, so hold the lock
+  mi_lock(&tld->theaps_lock) {
+    for (mi_theap_t* theap = tld->theaps; theap != NULL; theap = theap->tnext) {
+      if (!mi_theap_is_initialized(theap)) continue;
+      mi_theap_visit_pages(theap, &mi_theap_page_holes_report, true /* include full pages */, rep, NULL);
+      mi_heap_t* const heap = _mi_theap_heap(theap);
+      if (heap != NULL && heap_count < MI_PURGE_HOLES_MAX_HEAPS) {
+        bool seen = false;
+        for (size_t i = 0; i < heap_count; i++) { if (heaps[i] == heap) { seen = true; break; } }
+        if (!seen) { heaps[heap_count++] = heap; }
+      }
+    }
+  }
+  for (size_t i = 0; i < heap_count; i++) {
+    _mi_arenas_holes_report(heaps[i], rep);
+  }
+  // The committed partition is a property of the subprocess's arenas, not of a heap, so count it
+  // once: every heap of this thread reaches the same arenas.
+  if (heap_count > 0) { _mi_arenas_holes_committed(heaps[0], rep); }
+}
+
+void mi_purge_holes_report(void) mi_attr_noexcept {
+  mi_holes_report_t rep;
+  _mi_purge_holes_report_collect(&rep);
+  _mi_page_holes_report_print(&rep);
+}
+
 void mi_theap_collect(mi_theap_t* theap, bool force) mi_attr_noexcept {
   mi_theap_collect_ex(theap, (force ? MI_FORCE : MI_NORMAL));
 }

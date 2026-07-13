@@ -214,6 +214,14 @@ typedef struct mi_purge_holes_stats_s {
 } mi_purge_holes_stats_t;
 
 mi_decl_export void mi_purge_holes_stats_get(mi_purge_holes_stats_t* stats) mi_attr_noexcept;
+
+// Print, per size class, what hole punching leaves behind: the free bytes that share an OS
+// page with a live block and therefore cannot be discarded, and how few live blocks pin each
+// such OS page. Read-only (it purges nothing, and mutates no free list). Like `mi_purge_holes`
+// it only covers what the calling thread may safely read: its own theaps, plus the abandoned
+// pages of the heaps behind them. Call it right after a sweep.
+mi_decl_export void mi_purge_holes_report(void) mi_attr_noexcept;
+
 mi_decl_export int  mi_version(void)            mi_attr_noexcept;
 mi_decl_export void mi_options_print(void)      mi_attr_noexcept;
 mi_decl_export void mi_process_info_print(void) mi_attr_noexcept;
