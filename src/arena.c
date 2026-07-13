@@ -875,8 +875,11 @@ static mi_page_t* mi_arenas_page_alloc_fresh(mi_theap_t* theap, size_t slice_cou
     if (arena->pages_meta != NULL) {
       mi_assert_internal(MI_PAGE_META_IS_SEPARATED!=0);
       mi_page_t* const page_meta = &arena->pages_meta[memid.mem.arena.slice_index];
-      mi_assert_internal(page_meta->block_size == 0);
       #if MI_PAGE_META_ALIGNED_FREE_SMALL
+      // Only pre-zeroed in this configuration; see the `pages_meta` note in
+      // `mi_arena_initialize`. Otherwise an unclaimed entry may hold anything
+      // (external memory we were not told was zero) until the memzero below.
+      mi_assert_internal(page_meta->block_size == 0);
       // if `block_size <= MI_SMALL_SIZE_MAX` we put the page info in front of the slice,
       // (note: it is important that `page_meta->block_size == 0` for `mi_arena_page_at_slice`)
       if (block_size > MI_SMALL_SIZE_MAX)
@@ -891,7 +894,6 @@ static mi_page_t* mi_arenas_page_alloc_fresh(mi_theap_t* theap, size_t slice_cou
         if (block_size >= MI_INTPTR_SIZE && block_size <= MI_PAGE_BLOCK_START_MAX_OFFSET && _mi_is_power_of_two(block_size)) {
           block_start += block_size;
         }
-        mi_assert_internal(page->block_size == 0);
         _mi_memzero_aligned(page, sizeof(*page));
       }
     }
@@ -1618,7 +1620,7 @@ static size_t mi_arena_pages_size(size_t slice_count, size_t* bitmap_base) {
   return size;
 }
 
-static size_t mi_arena_info_slices_needed(size_t slice_count, size_t* bitmap_base) {
+static size_t mi_arena_info_slices_needed(size_t slice_count, size_t* bitmap_base, size_t* pages_meta_offset) {
   if (slice_count == 0) slice_count = MI_BCHUNK_BITS;
   mi_assert_internal((slice_count % MI_BCHUNK_BITS) == 0);
   const size_t base_size = _mi_align_up(sizeof(mi_arena_t), MI_BCHUNK_SIZE);
@@ -1636,6 +1638,7 @@ static size_t mi_arena_info_slices_needed(size_t slice_count, size_t* bitmap_bas
   const size_t info_slices = mi_slice_count_of_size(info_size);
 
   if (bitmap_base != NULL) *bitmap_base = base_size;
+  if (pages_meta_offset != NULL) *pages_meta_offset = base_size + bitmaps_size;
   return info_slices;
 }
 
@@ -1681,7 +1684,8 @@ static mi_arena_t* mi_arena_initialize(mi_subproc_t* subproc, void* start,
   }
 
   size_t bitmap_base;
-  const size_t info_slices = mi_arena_info_slices_needed(slice_count, &bitmap_base);
+  size_t pages_meta_offset;
+  const size_t info_slices = mi_arena_info_slices_needed(slice_count, &bitmap_base, &pages_meta_offset);
   if (slice_count < info_slices+1) {
     _mi_warning_message("cannot use OS memory since it is not large enough (size %zu KiB, minimum required is %zu KiB)", mi_size_of_slices(slice_count)/MI_KiB, mi_size_of_slices(info_slices+1)/MI_KiB);
     return NULL;
@@ -1716,7 +1720,19 @@ static mi_arena_t* mi_arena_initialize(mi_subproc_t* subproc, void* start,
     _mi_os_secure_guard_page_set_before((uint8_t*)arena + mi_size_of_slices(info_slices), memid);
   }
   if (!memid.initially_zero) {
-    _mi_memzero(arena, mi_size_of_slices(info_slices) - _mi_os_secure_guard_page_size());
+    size_t zero_size = mi_size_of_slices(info_slices) - _mi_os_secure_guard_page_size();
+    #if MI_PAGE_META_IS_SEPARATED && !MI_PAGE_META_ALIGNED_FREE_SMALL
+    // Only the header and the bitmaps have to start out zeroed. `pages_meta` is one
+    // mi_page_t per slice -- ~2.5 MiB per GiB of arena -- and every entry is zeroed
+    // when its slice is claimed (`mi_arenas_page_alloc_fresh`); no one reads an entry
+    // for a slice that was never claimed. Zeroing it here would fault in megabytes of
+    // meta-info the arena may never use. (Under MI_PAGE_META_ALIGNED_FREE_SMALL,
+    // `mi_arena_page_at_slice` does read `block_size` of unclaimed entries, so the
+    // array must be zeroed up front and this shortcut does not apply.)
+    mi_assert_internal(pages_meta_offset <= zero_size);
+    if (pages_meta_offset <= zero_size) { zero_size = pages_meta_offset; }
+    #endif
+    _mi_memzero(arena, zero_size);
   }
 
   // init
