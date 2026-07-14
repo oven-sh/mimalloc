@@ -226,6 +226,15 @@ static HANDLE _mi_scavenger_thread;
 
 static DWORD WINAPI mi_scavenger_thread_main(LPVOID arg) {
   MI_UNUSED(arg);
+  // SetThreadDescription is Windows 10 1607+ and absent from older SDK import
+  // libraries, so resolve it at runtime; naming the thread is best-effort.
+  typedef HRESULT (WINAPI *mi_set_thread_description_t)(HANDLE, PCWSTR);
+  const HMODULE kernel32 = GetModuleHandleA("kernel32.dll");
+  if (kernel32 != NULL) {
+    const mi_set_thread_description_t set_desc =
+      (mi_set_thread_description_t)(void*)GetProcAddress(kernel32, "SetThreadDescription");
+    if (set_desc != NULL) { set_desc(GetCurrentThread(), L"mi-scavenger"); }
+  }
   mi_scavenger_run();
   return 0;
 }
@@ -257,12 +266,20 @@ void _mi_scavenger_stop(void) {
 
 #include <pthread.h>
 #include <signal.h>
+#if defined(__linux__)
+#include <sys/prctl.h>
+#endif
 
 static pthread_t          _mi_scavenger_thread;
 static _Atomic(uintptr_t) _mi_scavenger_joinable;
 
 static void* mi_scavenger_thread_main(void* arg) {
   MI_UNUSED(arg);
+  #if defined(__APPLE__)
+  pthread_setname_np("mi-scavenger");
+  #elif defined(__linux__)
+  prctl(PR_SET_NAME, "mi-scavenger", 0, 0, 0);
+  #endif
   mi_scavenger_run();
   return NULL;
 }
