@@ -118,7 +118,11 @@ static void mi_theap_merge_stats(mi_theap_t* theap) {
   _mi_stats_merge_into(&heap->stats, &theap->stats);
 }
 
-static void mi_theap_collect_ex(mi_theap_t* theap, mi_collect_t collect)
+// `collect_arenas` runs the arena collect at the end. That is the only part of this
+// function that can madvise on the calling thread: everything above it just frees pages
+// back to the arena, which schedules their purge and wakes the scavenger. Pass false
+// from a latency-sensitive thread -- see `mi_collect_deferred`.
+static void mi_theap_collect_ex(mi_theap_t* theap, mi_collect_t collect, bool collect_arenas)
 {
   if (theap==NULL || !mi_theap_is_initialized(theap)) return;
   mi_assert_expensive(mi_theap_is_valid(theap));
@@ -137,14 +141,16 @@ static void mi_theap_collect_ex(mi_theap_t* theap, mi_collect_t collect)
 
   // collect arenas (this is program wide so don't force purges on abandonment of threads)
   //mi_atomic_storei64_release(&theap->tld->subproc->purge_expire, 1);
-  _mi_arenas_collect(collect == MI_FORCE /* force purge? */, collect >= MI_FORCE /* visit all? */, theap->tld);
+  if (collect_arenas) {
+    _mi_arenas_collect(collect == MI_FORCE /* force purge? */, collect >= MI_FORCE /* visit all? */, theap->tld);
+  }
 
   // merge statistics
   mi_theap_merge_stats(theap);
 }
 
 void _mi_theap_collect_abandon(mi_theap_t* theap) {
-  mi_theap_collect_ex(theap, MI_ABANDON);
+  mi_theap_collect_ex(theap, MI_ABANDON, true /* collect arenas */);
 }
 
 // Visit every page (INCLUDING the full queue, which a normal collect skips --
@@ -286,12 +292,21 @@ void mi_purge_holes_report(void) mi_attr_noexcept {
 }
 
 void mi_theap_collect(mi_theap_t* theap, bool force) mi_attr_noexcept {
-  mi_theap_collect_ex(theap, (force ? MI_FORCE : MI_NORMAL));
+  mi_theap_collect_ex(theap, (force ? MI_FORCE : MI_NORMAL), true /* collect arenas */);
 }
 
 void mi_collect(bool force) mi_attr_noexcept {
   // cannot really collect process wide, just a theap..
   mi_theap_collect(_mi_theap_default(), force);
+}
+
+// As `mi_collect(false)`, but never purges on this thread: pages emptied by the collect go
+// back to the arena with their purge scheduled, and the scavenger does the madvise. The
+// arena collect that `mi_collect` ends with can purge a large arena inline (tens of ms) if
+// one is already due and the scavenger has not reached it yet.
+// Owner thread only, like any collect: it rewrites this thread's free lists.
+void mi_collect_deferred(void) mi_attr_noexcept {
+  mi_theap_collect_ex(_mi_theap_default(), MI_NORMAL, false /* let the scavenger purge */);
 }
 
 void mi_heap_collect(mi_heap_t* heap, bool force) {

@@ -188,6 +188,17 @@ mi_decl_export void mi_register_error(mi_error_fun* fun, void* arg);
 
 mi_decl_export void mi_collect(bool force)      mi_attr_noexcept;
 
+// As `mi_collect(false)`, but never purges on the calling thread: the pages it empties go
+// back to the arena with their purge scheduled, and the scavenger makes the madvise calls.
+// `mi_collect` ends with an arena collect that, when a purge is already due and the
+// scavenger has not reached it yet, purges inline -- tens of milliseconds for a large
+// arena. Use this from a thread that must not make purge syscalls (a JS event loop).
+// Owner thread only, like any collect: it rewrites the calling thread's free lists.
+// It only ever SCHEDULES: with `scavenger=0` the scheduled purge waits for the next
+// `mi_collect`/`mi_on_thread_idle` instead, so a caller that disables the scavenger must
+// still reach one of those or the freed pages stay resident.
+mi_decl_export void mi_collect_deferred(void)   mi_attr_noexcept;
+
 // Call whenever a thread goes idle (an event loop about to park, a worker with an
 // empty queue, a JIT/GC helper out of work): collects the thread's pending frees,
 // discards the memory of free blocks inside its still-used pages ("hole punching" --

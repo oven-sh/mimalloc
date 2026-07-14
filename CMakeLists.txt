@@ -832,7 +832,7 @@ if (MI_BUILD_TESTS)
   enable_testing()
 
   # static link tests
-  set(mi_static_tests api api-fill stress heap-mt heap-delete-race heap-churn fork-user-heap snapshot prof prof-adversarial theap-sentinel purge-holes purge-zero)
+  set(mi_static_tests api api-fill stress heap-mt heap-delete-race heap-churn fork-user-heap snapshot prof prof-adversarial theap-sentinel purge-holes purge-zero collect-deferred)
   if (MI_DEBUG_FULL OR CMAKE_BUILD_TYPE MATCHES "Debug")
     list(APPEND mi_static_tests commit-fail)  # uses mi_debug_fail_os_commit_after (MI_DEBUG>0 only)
   endif()
@@ -853,6 +853,10 @@ if (MI_BUILD_TESTS)
 
   # the same hole-purging tests with the feature turned off: it must be a no-op
   add_test(NAME test-purge-holes-off COMMAND ${CMAKE_COMMAND} -E env MIMALLOC_PURGE_HOLES=0 $<TARGET_FILE:mimalloc-test-purge-holes>)
+
+  # test-collect-deferred proves it made no purge syscall via RSS, so nothing else may
+  # purge; it asserts the scavenger is off rather than passing vacuously without it.
+  set_tests_properties(test-collect-deferred PROPERTIES ENVIRONMENT "MIMALLOC_SCAVENGER=0")
 
   # heap snapshot reader CLI (standalone, no mimalloc dependency)
   add_executable(mi-heapview tools/mi-heapview.c)
