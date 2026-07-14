@@ -2,6 +2,7 @@
 // and let the CLI verify it parses. Intended to be run as:
 //   ./mimalloc-test-snapshot /tmp/snap.bin && ./mi-heapview /tmp/snap.bin summary
 
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
