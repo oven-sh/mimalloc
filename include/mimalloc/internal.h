@@ -276,6 +276,8 @@ void          _mi_prof_theap_init(mi_theap_t* theap);
 
 // scavenger.c
 void          _mi_scavenger_start(void);
+void          _mi_scavenger_forked_child(void);
+void          _mi_scavenger_start_if_forked(void);
 void          _mi_scavenger_stop(void);
 void          _mi_scavenger_wake(mi_subproc_t* subproc);
 bool          _mi_scavenger_is_running(void);

@@ -1227,11 +1227,15 @@ void _mi_process_fork_child(void) {
   if (!_mi_process_is_initialized) return;
   if (mi_atomic_exchange_acq_rel(&mi_fork_depth, 0) == 0) return;
   _mi_process_is_forked_child = true;
+  _mi_scavenger_forked_child();   // the thread did not survive; clear the state that says it did
   // single-threaded here: just reinitialize every lock we know about
   mi_lock_init(&subprocs_lock);
   for (mi_subproc_t* sp = subprocs; sp != NULL; sp = sp->next) {
     mi_lock_init(&sp->arena_reserve_lock);
     mi_lock_init(&sp->heaps_lock);
+    // a wake that was in flight at fork() leaves this at 1 with nobody to clear it, and the
+    // 0->1 edge in `_mi_scavenger_wake` would then never fire again
+    mi_atomic_store_relaxed(&sp->scavenger_wake, (uint32_t)0);
     for (mi_heap_t* h = sp->heaps; h != NULL; h = h->next) {
       mi_lock_init(&h->theaps_lock);
       mi_lock_init(&h->arena_pages_lock);
