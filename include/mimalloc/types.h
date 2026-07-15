@@ -569,7 +569,7 @@ struct mi_theap_s {
   mi_theap_t*           hprev;
 
   long                  page_full_retain;                    // how many full pages can be retained per queue (before abandoning them)
-  bool                  allow_page_reclaim;                  // `true` if this theap should not reclaim abandoned pages
+  bool                  allow_page_reclaim;                  // `true` if this theap can reclaim abandoned pages
   bool                  allow_page_abandon;                  // `true` if this theap can abandon pages to reduce memory footprint
   bool                  prof_force_slow;                     // if profiling is enabled: keep `pages_free_direct` poisoned so every malloc routes through `_mi_malloc_generic`
   intptr_t              prof_countdown;                      // bytes until next profiling sample (only consulted in `_mi_malloc_generic`; 0 if profiling is off)

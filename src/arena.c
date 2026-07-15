@@ -749,20 +749,11 @@ static mi_page_t* mi_arenas_page_try_find_abandoned(mi_theap_t* theap, size_t sl
   return NULL;
 }
 
-// Undo the arena_pages->pages bit set in mi_arenas_page_alloc_fresh when a later step
-// (_mi_page_init) fails. _mi_arenas_free does not clear this bit, so without this the next
-// fresh alloc of the slice trips the is_clear assert and mi_heap_visit_blocks / _mi_ptr_page
-// treat the freed slice as a live page.
-static void mi_arena_pages_clear_for_memid(mi_heap_t* heap, mi_memid_t memid) {
-  if (memid.memkind != MI_MEM_ARENA || heap == NULL) return;
-  mi_arena_pages_t* const arena_pages = mi_heap_arena_pages(heap, memid.mem.arena.arena);
-  if (arena_pages != NULL) {
-    mi_bitmap_clearN(arena_pages->pages, memid.mem.arena.slice_index, 1);
-  }
-}
-
-static uint8_t* mi_arenas_page_alloc_fresh_area(mi_theap_t* theap, size_t slice_count, size_t block_size, size_t block_alignment, bool os_align, bool commit, mi_memid_t* memid) {
+static uint8_t* mi_arenas_page_alloc_fresh_area(mi_theap_t* theap, size_t slice_count, size_t block_size, size_t block_alignment, bool os_align, bool commit, mi_memid_t* memid, mi_arena_pages_t** parena_pages ) {
   MI_UNUSED_RELEASE(block_size);
+  mi_assert_internal(parena_pages!=NULL);
+
+  *parena_pages = NULL;
   const bool allow_large = (MI_SECURE < 5); // 5 = guard page at end of each arena page
   const size_t page_alignment = MI_ARENA_SLICE_ALIGN;
 
@@ -782,6 +773,7 @@ static uint8_t* mi_arenas_page_alloc_fresh_area(mi_theap_t* theap, size_t slice_
     start = (uint8_t*)mi_arenas_try_alloc(heap, slice_count, page_alignment, commit, allow_large, req_arena, tld->thread_seq, numa_node, memid);
     if (start != NULL) {
       mi_arena_pages_t* const arena_pages = mi_heap_ensure_arena_pages(heap, memid->mem.arena.arena);
+      *parena_pages = arena_pages;
       if (arena_pages==NULL) {
         _mi_arenas_free(start, mi_size_of_slices(slice_count), *memid); // roll back
         start = NULL;
@@ -790,9 +782,7 @@ static uint8_t* mi_arenas_page_alloc_fresh_area(mi_theap_t* theap, size_t slice_
         // note: the following assert should hold if we could check it atomically, but in a concurrent setting we may already allocate in slice_count
         // mi_assert_internal(mi_bitmap_is_clearN(arena_pages->pages, memid->mem.arena.slice_index, memid->mem.arena.slice_count));
         mi_assert_internal(mi_bitmap_is_clear(arena_pages->pages, memid->mem.arena.slice_index));
-        // do NOT set arena_pages->pages here: defer until after the page struct is initialized and the
-        // page-map is registered (in mi_arenas_page_alloc_fresh). Setting it earlier publishes the page
-        // to mi_heap_visit_page_at while _mi_ptr_page would still return NULL, which a fork() can freeze.
+        // don't set yet: mi_bitmap_set(arena_pages->pages, memid->mem.arena.slice_index);
       }
     }
   }
@@ -844,22 +834,23 @@ static size_t mi_page_block_start(size_t block_size, bool os_align)
   }
 }
 
+// Free a page without modifying page_bin stats
+static void mi_arenas_page_free_prim(mi_page_t* page);
+
 // Allocate a fresh page
 static mi_page_t* mi_arenas_page_alloc_fresh(mi_theap_t* theap, size_t slice_count, size_t block_size, size_t block_alignment, bool commit)
 {
-  const bool os_align        = (block_alignment > MI_PAGE_MAX_OVERALLOC_ALIGN);
-  const size_t alloc_size    = mi_size_of_slices(slice_count);
-  mi_memid_t memid           = _mi_memid_none();
-  uint8_t* const slice_start = mi_arenas_page_alloc_fresh_area(theap,slice_count,block_size,block_alignment,os_align,commit,&memid);
+  const bool os_align           = (block_alignment > MI_PAGE_MAX_OVERALLOC_ALIGN);
+  const size_t alloc_size       = mi_size_of_slices(slice_count);
+  mi_memid_t memid              = _mi_memid_none();
+  mi_arena_pages_t* arena_pages = NULL;
+  uint8_t* const slice_start    = mi_arenas_page_alloc_fresh_area(theap,slice_count,block_size,block_alignment,os_align,commit,&memid,&arena_pages);
   if (!slice_start) return NULL;
 
   // guard page at the end of mimalloc page?
   #if MI_SECURE>=5
   mi_assert(alloc_size > _mi_os_secure_guard_page_size());
   const size_t page_noguard_size = alloc_size - _mi_os_secure_guard_page_size();
-  if (memid.initially_committed) {
-    _mi_os_secure_guard_page_set_at(slice_start + page_noguard_size, memid);
-  }
   #else
   const size_t page_noguard_size = alloc_size;
   #endif
@@ -915,10 +906,20 @@ static mi_page_t* mi_arenas_page_alloc_fresh(mi_theap_t* theap, size_t slice_cou
       return NULL;
     }
   }
+  // now we can finish initalization and use `mi_arenas_free_page_prim` on error
+  
+  // zero initialize the page meta data
   if (!memid.initially_zero && !page_meta_is_separate) {
     _mi_memzero_aligned(page, sizeof(*page));
   }
 
+  // set the guard page
+  #if MI_SECURE>=5
+  if (memid.initially_committed) {
+    _mi_os_secure_guard_page_set_at(slice_start + page_noguard_size, memid);
+  }
+  #endif
+  
   // claimed free slices: initialize the page partly
   if (!memid.initially_zero && memid.initially_committed) {
     mi_track_mem_undefined(slice_start, slice_count * MI_ARENA_SLICE_SIZE);
@@ -945,7 +946,7 @@ static mi_page_t* mi_arenas_page_alloc_fresh(mi_theap_t* theap, size_t slice_cou
   mi_assert_internal((offset % MI_SIZE_SIZE) == 0 && (offset / MI_SIZE_SIZE) < UINT32_MAX);
   page->page_woffset = (uint32_t)(offset / MI_SIZE_SIZE);
 
-  // initialize
+  // initialize page meta-data
   page->reserved = (uint16_t)reserved;  
   page->block_size = block_size;
   page->memid = memid;
@@ -958,12 +959,18 @@ static mi_page_t* mi_arenas_page_alloc_fresh(mi_theap_t* theap, size_t slice_cou
   mi_assert_internal(page_meta_is_separate == mi_page_meta_is_separated(page));
   mi_assert_internal(mi_page_slice_start(page) == slice_start);
 
+  // now register in the arena_pages
+  if (arena_pages!=NULL) {
+    mi_assert_internal(memid.memkind == MI_MEM_ARENA);
+    mi_bitmap_set(arena_pages->pages, memid.mem.arena.slice_index);
+  }
+
   // and own it
   mi_page_claim_ownership(page);
 
   // register in the page map
   if mi_unlikely(!_mi_page_map_register(page)) {
-    _mi_arenas_free( slice_start, alloc_size, memid );
+    mi_arenas_page_free_prim(page);
     return NULL;
   }
 
@@ -1007,9 +1014,7 @@ static mi_page_t* mi_arenas_page_regular_alloc(mi_theap_t* theap, size_t slice_c
 
   mi_assert_internal(page->memid.memkind != MI_MEM_ARENA || page->memid.mem.arena.slice_count == slice_count);
   if (!_mi_page_init(theap, page)) {
-    mi_arena_pages_clear_for_memid(_mi_theap_heap(theap), page->memid);
-    _mi_page_map_unregister(page);
-    _mi_arenas_free( page, mi_page_full_size(page), page->memid);
+    mi_arenas_page_free_prim(page);
     return NULL;
   }
 
@@ -1032,9 +1037,7 @@ static mi_page_t* mi_arenas_page_singleton_alloc(mi_theap_t* theap, size_t block
 
   mi_assert(page->reserved == 1);
   if (!_mi_page_init(theap, page)) {
-    mi_arena_pages_clear_for_memid(_mi_theap_heap(theap), page->memid);
-    _mi_page_map_unregister(page);
-    _mi_arenas_free( page, mi_page_full_size(page), page->memid);
+    mi_arenas_page_free_prim(page);
     return NULL;
   }
 
@@ -1075,31 +1078,13 @@ mi_page_t* _mi_arenas_page_alloc(mi_theap_t* theap, size_t block_size, size_t bl
   return page;
 }
 
-void _mi_arenas_page_free(mi_page_t* page, mi_theap_t* current_theapx) {
+static void mi_arenas_page_free_prim(mi_page_t* page) {
   mi_assert_internal(_mi_is_aligned(mi_page_slice_start(page), MI_PAGE_ALIGN));
   mi_assert_internal(_mi_ptr_page(mi_page_start(page))==page);
   mi_assert_internal(mi_page_is_owned(page));
   mi_assert_internal(mi_page_all_free(page));
-  mi_assert_internal(mi_page_is_abandoned(page));
   mi_assert_internal(page->next==NULL && page->prev==NULL);
-  mi_assert_internal(current_theapx == NULL || _mi_thread_id()==current_theapx->tld->thread_id);
-
-  // Undo any hole in the page: the arena can hand this memory out again as committed without
-  // any further `reuse` call, and on macOS a discarded page stays reclaimable by the kernel
-  // until it is MADV_FREE_REUSE'd. This is the single choke point for a page going back to the
-  // arena (`page.c:_mi_page_free` and the abandoned-page free in `free.c` both end up here).
-  _mi_page_unpurge_all(page);
-
-  if (current_theapx != NULL) {
-    mi_theap_stat_decrease(current_theapx, page_bins[_mi_page_stats_bin(page)], 1);
-    mi_theap_stat_decrease(current_theapx, pages, 1);
-  }
-  else {
-    mi_heap_t* const heap = mi_page_heap(page);
-    mi_heap_stat_decrease(heap, page_bins[_mi_page_stats_bin(page)], 1);
-    mi_heap_stat_decrease(heap, pages, 1);
-  }
-
+  
   #if MI_DEBUG>1
   if (page->memid.memkind==MI_MEM_ARENA && !mi_page_is_full(page)) {
     size_t bin = _mi_bin(mi_page_block_size(page));
@@ -1155,9 +1140,37 @@ void _mi_arenas_page_free(mi_page_t* page, mi_theap_t* current_theapx) {
       mi_assert_internal(mi_bitmap_is_setN(arena->slices_committed, slice_index, slice_count));
     }
   }
+  // unregister page (after the arena_pages bitmap clear above)
   _mi_page_map_unregister(page);
   if (mi_page_meta_is_separated(page)) { page->block_size = 0; }  // for assertion checking
+
   _mi_arenas_free( mi_page_slice_start(page), mi_page_full_size(page), page->memid);
+}
+
+void _mi_arenas_page_free(mi_page_t* page, mi_theap_t* current_theapx) {
+  mi_assert_internal(_mi_is_aligned(mi_page_slice_start(page), MI_PAGE_ALIGN));
+  mi_assert_internal(_mi_ptr_page(mi_page_start(page))==page);
+  mi_assert_internal(mi_page_is_owned(page));
+  mi_assert_internal(mi_page_all_free(page));
+  mi_assert_internal(mi_page_is_abandoned(page));
+  mi_assert_internal(page->next==NULL && page->prev==NULL);
+  mi_assert_internal(current_theapx == NULL || _mi_thread_id()==current_theapx->tld->thread_id);
+
+  // Undo any hole in the page: the arena can hand this memory out again as committed without
+  // any further `reuse` call, and on macOS a discarded page stays reclaimable by the kernel
+  // until it is MADV_FREE_REUSE'd.
+  _mi_page_unpurge_all(page);
+
+  if (current_theapx != NULL) {
+    mi_theap_stat_decrease(current_theapx, page_bins[_mi_page_stats_bin(page)], 1);
+    mi_theap_stat_decrease(current_theapx, pages, 1);
+  }
+  else {
+    mi_heap_t* const heap = mi_page_heap(page);
+    mi_heap_stat_decrease(heap, page_bins[_mi_page_stats_bin(page)], 1);
+    mi_heap_stat_decrease(heap, pages, 1);
+  }
+  mi_arenas_page_free_prim(page);
 }
 
 /* -----------------------------------------------------------
@@ -2222,7 +2235,14 @@ int mi_reserve_huge_os_pages(size_t pages, double max_secs, size_t* pages_reserv
 
 static long mi_arena_purge_delay(void) {
   // <0 = no purging allowed, 0=immediate purging, >0=milli-second delay
-  return (mi_option_get(mi_option_purge_delay) * mi_option_get(mi_option_arena_purge_mult));
+  const long delay = mi_option_get(mi_option_purge_delay);
+  const long mult  = mi_option_get(mi_option_arena_purge_mult);
+  if (delay<0 || mult<0)   { return -1; }
+  if (delay==0 || mult==0) { return 0; }
+  size_t total;
+  if (mi_mul_overflow((size_t)delay, (size_t)mult, &total)) { return delay; }
+  if (total > LONG_MAX) { return delay; }
+  return (long)total;
 }
 
 // reset or decommit in an arena and update the commit bitmap
