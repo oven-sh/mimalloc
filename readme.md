@@ -357,7 +357,7 @@ Advanced options:
    as well (like Windows or macOS) which may improve performance (as the whole arena is committed at once).
    Note that eager commit only increases the commit but not the actual the peak resident set
    (rss) so it is generally ok to enable this.
-- `MIMALLOC_PURGE_DELAY=N`: the delay in `N` milli-seconds (by default `1000` in v3) after which mimalloc will purge
+- `MIMALLOC_PURGE_DELAY=N`: the delay in `N` milli-seconds (by default `100`) after which mimalloc will purge
    OS pages that are not in use. This signals to the OS that the underlying physical memory can be reused which
    can reduce memory fragmentation especially in long running (server) programs. Setting `N` to `0` purges immediately when
    a page becomes unused which can improve memory usage but also decreases performance.

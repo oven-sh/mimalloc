@@ -19,6 +19,8 @@ void _mi_scavenger_start(void) { }
 void _mi_scavenger_stop(void)  { }
 void _mi_scavenger_wake(mi_subproc_t* subproc) { MI_UNUSED(subproc); }
 bool _mi_scavenger_is_running(void) { return false; }
+void _mi_scavenger_forked_child(void) { }
+void _mi_scavenger_start_if_forked(void) { }
 
 #else
 
@@ -160,6 +162,18 @@ static void mi_scav_wake_one(_Atomic(uint32_t)* addr) {
   pthread_mutex_unlock(&_mi_scav_mutex);
 }
 
+// fork() can land with `_mi_scav_mutex` held by a thread that no longer exists in the child.
+#define MI_SCAV_HAS_FORK_RESET  1
+static void mi_scav_fork_child_reset(void) {
+  pthread_mutex_init(&_mi_scav_mutex, NULL);
+  pthread_cond_init(&_mi_scav_cond, NULL);
+}
+
+#endif
+
+#if !defined(MI_SCAV_HAS_FORK_RESET)
+// futex / __ulock / WaitOnAddress hold no state of ours across fork()
+static void mi_scav_fork_child_reset(void) { }
 #endif
 
 // -----------------------------------------------------------------------------
@@ -226,6 +240,15 @@ static HANDLE _mi_scavenger_thread;
 
 static DWORD WINAPI mi_scavenger_thread_main(LPVOID arg) {
   MI_UNUSED(arg);
+  // SetThreadDescription is Windows 10 1607+ and absent from older SDK import
+  // libraries, so resolve it at runtime; naming the thread is best-effort.
+  typedef HRESULT (WINAPI *mi_set_thread_description_t)(HANDLE, PCWSTR);
+  const HMODULE kernel32 = GetModuleHandleA("kernel32.dll");
+  if (kernel32 != NULL) {
+    const mi_set_thread_description_t set_desc =
+      (mi_set_thread_description_t)(void*)GetProcAddress(kernel32, "SetThreadDescription");
+    if (set_desc != NULL) { set_desc(GetCurrentThread(), L"mi-scavenger"); }
+  }
   mi_scavenger_run();
   return 0;
 }
@@ -253,16 +276,28 @@ void _mi_scavenger_stop(void) {
   }
 }
 
+void _mi_scavenger_forked_child(void) { }    // no fork on Windows
+void _mi_scavenger_start_if_forked(void) { }
+
 #else  // POSIX
 
 #include <pthread.h>
 #include <signal.h>
+#if defined(__linux__)
+#include <sys/prctl.h>
+#endif
 
 static pthread_t          _mi_scavenger_thread;
 static _Atomic(uintptr_t) _mi_scavenger_joinable;
+static _Atomic(uintptr_t) _mi_scavenger_needs_restart;   // fork() took our thread; start one on next use
 
 static void* mi_scavenger_thread_main(void* arg) {
   MI_UNUSED(arg);
+  #if defined(__APPLE__)
+  pthread_setname_np("mi-scavenger");
+  #elif defined(__linux__)
+  prctl(PR_SET_NAME, "mi-scavenger", 0, 0, 0);
+  #endif
   mi_scavenger_run();
   return NULL;
 }
@@ -297,6 +332,24 @@ void _mi_scavenger_stop(void) {
   if (mi_atomic_exchange_acq_rel(&_mi_scavenger_joinable, (uintptr_t)0) != 0) {
     pthread_join(_mi_scavenger_thread, NULL);
   }
+}
+
+// The thread does not survive fork(), but every flag saying it does is inherited. Left alone the
+// child would: take the wake path in `_mi_arenas_purge_now` and signal nobody (so never purge at
+// all), and `pthread_join` a `pthread_t` that names no thread at exit.
+void _mi_scavenger_forked_child(void) {
+  mi_atomic_store_release(&_mi_scavenger_joinable, (uintptr_t)0);
+  mi_atomic_store_release(&_mi_scavenger_running, (uintptr_t)0);
+  mi_scav_fork_child_reset();
+  mi_atomic_store_release(&_mi_scavenger_needs_restart, (uintptr_t)1);
+}
+
+// Restart once, on the first purge that wanted a scavenger. Not in the fork handler: most children
+// exec immediately, and starting a thread there would charge every spawn for one it throws away.
+void _mi_scavenger_start_if_forked(void) {
+  if (mi_atomic_load_relaxed(&_mi_scavenger_needs_restart) == 0) return;
+  if (mi_atomic_exchange_acq_rel(&_mi_scavenger_needs_restart, (uintptr_t)0) == 0) return;
+  _mi_scavenger_start();
 }
 
 #endif

@@ -1243,12 +1243,12 @@ typedef enum mi_option_e {
   mi_option_eager_commit_delay,       ///< __v2__: the first N segments per thread are not eagerly committed (but per page in the segment on demand)
   mi_option_arena_eager_commit,       ///< eager commit arenas? Use 2 to enable just on overcommit systems (=2)
   mi_option_abandoned_page_purge,     ///< __v1__,__v2__: immediately purge delayed purges on thread termination
-  mi_option_purge_delay,              ///< memory purging is delayed by N milli seconds; use 0 for immediate purging or -1 for no purging at all. (=10)
+  mi_option_purge_delay,              ///< memory purging is delayed by N milli seconds; use 0 for immediate purging or -1 for no purging at all. (=100)
   mi_option_use_numa_nodes,           ///< 0 = use all available numa nodes, otherwise use at most N nodes.
   mi_option_disallow_os_alloc,        ///< 1 = do not use OS memory for allocation (but only programmatically reserved arenas)  
   mi_option_max_segment_reclaim,        ///< __v2__: max. percentage of the abandoned segments can be reclaimed per try (=10%)
   mi_option_destroy_on_exit,            ///< if set, release all memory on exit; sometimes used for dynamic unloading but can be unsafe
-  mi_option_arena_purge_mult,           ///< multiplier for `purge_delay` for the purging delay for arenas (=10)
+  mi_option_arena_purge_mult,           ///< multiplier for `purge_delay` for the purging delay for arenas (=1)
   mi_option_abandoned_reclaim_on_free,  ///< __v1__,__v2__: allow to reclaim an abandoned segment on a free (=1)
   mi_option_purge_extend_delay,         ///< __v1__,__v2__: extend purge delay on each subsequent delay (=1)
   mi_option_disallow_arena_alloc,       ///< 1 = do not use arena's for allocation (except if using specific arena id's)
@@ -1649,7 +1649,7 @@ Advanced options:
    as well (like Windows or macOS) which may improve performance (as the whole arena is committed at once).
    Note that eager commit only increases the commit but not the actual the peak resident set
    (rss) so it is generally ok to enable this.
-- `MIMALLOC_PURGE_DELAY=N`: the delay in `N` milli-seconds (by default `1000` in v3) after which mimalloc will purge
+- `MIMALLOC_PURGE_DELAY=N`: the delay in `N` milli-seconds (by default `100`) after which mimalloc will purge
    OS pages that are not in use. This signals to the OS that the underlying physical memory can be reused which
    can reduce memory fragmentation especially in long running (server) programs. Setting `N` to `0` purges immediately when
    a page becomes unused which can improve memory usage but also decreases performance.

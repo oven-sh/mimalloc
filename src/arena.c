@@ -2419,6 +2419,7 @@ void _mi_arenas_purge_now(mi_subproc_t* subproc) {
   if (!any_scheduled) return;
   const mi_msecs_t sexpire = mi_atomic_loadi64_relaxed(&subproc->purge_expire);
   if (sexpire == 0 || sexpire > now) { mi_atomic_storei64_release(&subproc->purge_expire, now); }
+  if (!_mi_scavenger_is_running()) { _mi_scavenger_start_if_forked(); }
   if (_mi_scavenger_is_running()) {
     _mi_scavenger_wake(subproc);
   }

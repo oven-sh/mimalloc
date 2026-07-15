@@ -17,6 +17,11 @@ terms of the MIT license.
    _mi_theap_init), the child deadlocks the first time it touches that tld
    via mi_heap_delete -> _mi_theap_free -> theap.c:322.
 
+   Case C: the scavenger thread does not survive fork(), but fork_child left
+   `_mi_scavenger_running` set. `_mi_arenas_purge_now` then takes the wake path
+   and signals a thread that does not exist instead of purging inline, so a
+   forked child never returns memory to the OS at all.
+
    Case A is probabilistic. Case B is made deterministic via the
    MI_DEBUG-gated mi_debug_stall_in_theap_init hook (see src/theap.c).
 
@@ -32,6 +37,8 @@ int main(void) { fprintf(stderr, "test-fork-user-heap: skipped on Windows\n"); r
 #include <stdlib.h>
 #include <pthread.h>
 #include <unistd.h>
+#include <string.h>
+#include <fcntl.h>
 #include <signal.h>
 #include <sys/wait.h>
 #include <stdatomic.h>
@@ -146,9 +153,59 @@ static int case_b(void) {
 }
 #endif
 
+static size_t rss_mb(void) {
+  // no stdio: it allocates, and an allocation can purge inline -- the very channel case_c must not use
+  char buf[128];
+  int fd = open("/proc/self/statm", O_RDONLY);
+  if (fd < 0) return 0;
+  ssize_t n = read(fd, buf, sizeof(buf) - 1);
+  close(fd);
+  if (n <= 0) return 0;
+  buf[n] = 0;
+  const char* p = buf;
+  while (*p && *p != ' ') p++;            // skip total size
+  long res = strtol(p, NULL, 10);         // resident pages
+  return (size_t)res * (size_t)sysconf(_SC_PAGESIZE) / (1024 * 1024);
+}
+
+// Case C: a forked child must still purge. With the scavenger flags inherited, `_mi_arenas_purge_now`
+// wakes a thread that no longer exists and the memory stays resident forever.
+static int case_c(void) {
+  enum { N = 400, BLOCK = 256 * 1024 };   // 100MB: unmissable in RSS either way
+  void** p = (void**)malloc(N * sizeof(void*));
+  if (p == NULL) return 0;
+
+  fflush(stderr);
+  pid_t pid = fork();
+  if (pid == 0) {
+    for (int i = 0; i < N; i++) { p[i] = mi_malloc(BLOCK); memset(p[i], 1, BLOCK); }
+    const size_t live = rss_mb();
+    for (int i = 0; i < N; i++) { mi_free(p[i]); }
+    // Deliberately do NOT wait out the purge delay: voiding it is exactly what
+    // `_mi_arenas_purge_now` is for, and it is the only channel a scavenger-less child has here.
+    // Sleeping first would let the ordinary due-purge do the work and the case would prove nothing.
+    mi_on_thread_idle();
+    // `purge_now` sets the arenas due, so a live scavenger purges promptly; a stale flag means it
+    // signalled nobody and nothing ever will. Poll instead of assuming, and allocate nothing while
+    // polling -- an allocation would purge inline and hide the difference.
+    size_t after = rss_mb();
+    for (int i = 0; i < 200 && after + 40 > live; i++) { usleep(10 * 1000); after = rss_mb(); }
+    fprintf(stderr, "case_c: child RSS %zuMB -> %zuMB\n", live, after);
+    _exit(live >= 50 && after + 40 > live ? 3 : 0);   // 3 = freed 100MB and none came back
+  }
+  int status = 0;
+  waitpid(pid, &status, 0);
+  free(p);
+  int rc = (!WIFEXITED(status) || WEXITSTATUS(status) != 0) ? 1 : 0;
+  fprintf(stderr, "case_c: child status=0x%x (%s)\n", status,
+          rc ? "FAIL (forked child never purged)" : "ok");
+  return rc;
+}
+
 int main(void) {
   int rc = 0;
   rc |= (case_a() > 0 ? 1 : 0);
+  rc |= case_c();
   #if MI_DEBUG > 0
   rc |= case_b();
   #else
