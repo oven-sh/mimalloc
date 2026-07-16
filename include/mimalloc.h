@@ -197,6 +197,8 @@ mi_decl_export void mi_collect(bool force)      mi_attr_noexcept;
 // its heaps -- no other thread can do it for us. Safe on any thread; on a thread that
 // never allocated it is a no-op. purge_delay still applies to the arena drain.
 mi_decl_export void mi_on_thread_idle(void)     mi_attr_noexcept;
+mi_decl_export bool mi_on_thread_idle_start(void) mi_attr_noexcept;  // about to block: hand the theaps to the scavenger. false = nothing handed off, no _end needed
+mi_decl_export void mi_on_thread_idle_end(void)   mi_attr_noexcept;  // awake again: take them back (pairs with a true from _start)
 
 // How much hole punching actually reclaims (process wide, monotonic except for the
 // two `*_now` gauges). These are not part of `mi_stats_t`: hole purging also covers
@@ -555,6 +557,7 @@ typedef enum mi_option_e {
   mi_option_scavenger,                  // run a background scavenger thread that purges freed arena memory when due (=1)
   mi_option_purge_holes,                // discard the memory of free blocks inside a still-used page (=1)
   mi_option_purge_holes_eager_zero,     // zero a hole before discarding it, so that an over-discard destroys data even on an OS that reclaims lazily (=0; for testing -- always on when MI_DEBUG>1)
+  mi_option_purge_holes_min_interval,  // min milliseconds between idle sweeps of one thread's heaps (=100, 0=every park). See `_mi_theap_sweep_parked`.
   mi_option_purge_holes_full_every,     // every N'th idle sweep walks every page instead of skipping the unchanged ones (=64, 0=never). See `_mi_page_purge_holes`.
   _mi_option_last,
   // legacy option names
