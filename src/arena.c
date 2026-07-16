@@ -603,7 +603,7 @@ void* _mi_arenas_alloc(mi_heap_t* heap, size_t size, bool commit, bool allow_lar
 static bool mi_abandoned_page_unown(mi_page_t* page, mi_theap_t* current_theap /* can be NULL */) {
   mi_assert_internal(mi_page_is_owned(page));
   mi_assert_internal(mi_page_is_abandoned(page));
-  mi_assert_internal(current_theap==NULL || _mi_thread_id()==current_theap->tld->thread_id);
+  mi_assert_internal(_mi_theap_can_touch(current_theap));
   mi_thread_free_t tf_new;
   mi_thread_free_t tf_old = mi_atomic_load_relaxed(&page->xthread_free);
   do {
@@ -1154,7 +1154,7 @@ void _mi_arenas_page_free(mi_page_t* page, mi_theap_t* current_theapx) {
   mi_assert_internal(mi_page_all_free(page));
   mi_assert_internal(mi_page_is_abandoned(page));
   mi_assert_internal(page->next==NULL && page->prev==NULL);
-  mi_assert_internal(current_theapx == NULL || _mi_thread_id()==current_theapx->tld->thread_id);
+  mi_assert_internal(_mi_theap_can_touch(current_theapx));
 
   // Undo any hole in the page: the arena can hand this memory out again as committed without
   // any further `reuse` call, and on macOS a discarded page stays reclaimable by the kernel
@@ -1265,7 +1265,7 @@ void _mi_arenas_page_unabandon(mi_page_t* page, mi_theap_t* current_theapx) {
   mi_assert_internal(_mi_ptr_page(mi_page_start(page))==page);
   mi_assert_internal(mi_page_is_owned(page));
   mi_assert_internal(mi_page_is_abandoned(page));
-  mi_assert_internal(current_theapx==NULL || _mi_thread_id()==current_theapx->tld->thread_id);
+  mi_assert_internal(_mi_theap_can_touch(current_theapx));
 
   mi_heap_t* const heap = mi_page_heap(page);
   if (mi_page_is_abandoned_mapped(page)) {
@@ -1316,9 +1316,18 @@ void _mi_arenas_page_unabandon(mi_page_t* page, mi_theap_t* current_theapx) {
   We claim each page with the arena's ownership protocol before touching its free list.
 ----------------------------------------------------------- */
 
+typedef struct mi_purge_holes_arg_s {
+  mi_bitmap_t* bitmap;
+  mi_tld_t*    tld;      // whose park we are sweeping under; NULL when not a parked sweep
+} mi_purge_holes_arg_t;
+
 static bool mi_arena_page_purge_holes_at(size_t slice_index, size_t slice_count, mi_arena_t* arena, void* arg) {
   MI_UNUSED(slice_count);
-  mi_bitmap_t* const bitmap = (mi_bitmap_t*)arg;
+  mi_purge_holes_arg_t* const parg = (mi_purge_holes_arg_t*)arg;
+  // this pass holds every page that ever became full, so it is most of a cold sweep: an owner
+  // waiting in `_mi_park_leave` cannot allocate until we stop
+  if (parg->tld != NULL && mi_atomic_load_relaxed(&parg->tld->park_reclaim) != 0) return false;
+  mi_bitmap_t* const bitmap = parg->bitmap;
 
   // Take the page out of the abandoned map first: this is the reader side of the protocol in
   // `mi_arena_try_claim_abandoned`. A concurrent `_mi_arenas_page_unabandon` busy-waits for the
@@ -1351,7 +1360,7 @@ static bool mi_arena_page_purge_holes_at(size_t slice_index, size_t slice_count,
 // note: this only reaches the *mapped* abandoned pages (the ones in `pages_abandoned`).
 // A page abandoned while full is not mapped; it has no free blocks at that point, and once
 // enough blocks are freed in it, `_mi_arenas_page_try_reabandon_to_mapped` puts it in the map.
-void _mi_arenas_purge_abandoned_holes(mi_heap_t* heap) {
+void _mi_arenas_purge_abandoned_holes(mi_heap_t* heap, mi_tld_t* tld) {
   if (heap == NULL) return;
   if (!mi_option_is_enabled(mi_option_purge_holes)) return;
   _mi_page_purge_holes_begin();
@@ -1363,7 +1372,8 @@ void _mi_arenas_purge_abandoned_holes(mi_heap_t* heap) {
       for (size_t bin = 0; bin < MI_ARENA_BIN_COUNT; bin++) {
         if (mi_atomic_load_relaxed(&heap->abandoned_count[bin]) == 0) continue;
         mi_bitmap_t* const bitmap = arena_pages->pages_abandoned[bin];
-        (void)_mi_bitmap_forall_set(bitmap, &mi_arena_page_purge_holes_at, arena, bitmap);
+        mi_purge_holes_arg_t parg = { bitmap, tld };
+        (void)_mi_bitmap_forall_set(bitmap, &mi_arena_page_purge_holes_at, arena, &parg);
       }
     }
   }

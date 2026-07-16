@@ -652,6 +652,10 @@ struct mi_subproc_s {
   mi_heap_t*            heaps;                          // heaps belonging to this sub-process
   mi_lock_t             heaps_lock;
 
+  mi_tld_t*             tlds;                           // list of tlds of this sub-process (walked by the scavenger for parked threads)
+  mi_lock_t             tlds_lock;                      // guards the `tlds` list structure only -- never held across a sweep
+  _Atomic(size_t)       parked_count;                   // threads currently parked; lets the scavenger skip the walk entirely
+
   _Atomic(size_t)       thread_count;                   // current threads associated with this sub-process
   _Atomic(size_t)       thread_total_count;             // total created threads associated with this sub-process
   _Atomic(size_t)       heap_count;                     // current heaps in this sub-process (== |heaps|)
@@ -672,6 +676,14 @@ struct mi_subproc_s {
 typedef int64_t  mi_msecs_t;
 
 // Thread local data
+// Park state of a thread, for the idle handoff (`mi_on_thread_idle_start`). The sweep rewrites
+// the plain `page->free`/`used` fields of this thread's pages, so it may only run while the owner
+// is provably not allocating. RUNNING->PARKED is published by the owner as its last act before it
+// blocks; only the scavenger takes PARKED->SWEEPING, and only it puts it back.
+#define MI_PARK_RUNNING   (0)
+#define MI_PARK_PARKED    (1)
+#define MI_PARK_SWEEPING  (2)
+
 struct mi_tld_s {
   mi_threadid_t         thread_id;            // thread id of this thread
   size_t                thread_seq;           // thread sequence id (linear count of created threads)
@@ -682,6 +694,17 @@ struct mi_tld_s {
   bool                  recurse;              // true if deferred was called; used to prevent infinite recursion.
   bool                  is_in_threadpool;     // true if this thread is part of a threadpool (and can run arbitrary tasks)
   mi_memid_t            memid;                // provenance of the tld memory itself (meta or OS)
+
+  // Idle handoff (`mi_on_thread_idle_start`). Kept at the tail: `tld_main`/`tld_empty` are
+  // initialized positionally, so a field inserted above silently shifts them. Zero is the
+  // correct initial value for every one of these (MI_PARK_RUNNING / NULL / unregistered).
+  _Atomic(uint32_t)     park_state;           // MI_PARK_*: whether another thread may sweep our theaps right now
+  _Atomic(uint32_t)     park_reclaim;         // set by the owner to get its theaps back; the sweep stops at the next page
+  mi_theap_t*           park_theap0;          // default theap, captured at the park (the scavenger has no TLS to find it)
+  _Atomic(uint32_t)     park_swept;           // this park's sweep is done: don't claim it again until the thread re-parks
+  mi_tld_t*             subproc_next;         // list of tlds in the subproc, so the scavenger can find parked threads
+  size_t                holes_sweep_seq;      // idle sweeps run over THIS tld's heaps (paces `purge_holes_full_every`)
+  mi_msecs_t            holes_sweep_last;     // when this tld's heaps were last swept (paces `purge_holes_min_interval`)
 };
 
 

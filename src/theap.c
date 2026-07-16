@@ -97,6 +97,7 @@ static bool mi_theap_page_collect(mi_theap_t* theap, mi_page_queue_t* pq, mi_pag
   // (`mi_page_queue_find_free_ex`) hands a hole back when a page is actually needed. Otherwise
   // `mi_on_thread_idle`, which collects before it sweeps, un-purges a run of every page whose free
   // blocks are all discarded and then re-discards it: two syscalls per page per park, forever.
+  if (theap->tld != NULL && mi_atomic_load_relaxed(&theap->tld->park_reclaim) != 0) return false;
   _mi_page_free_collect_no_unpurge(page, collect >= MI_FORCE);
   if (mi_page_all_free(page)) {
     // no more used blocks, possibly free the page.
@@ -135,9 +136,15 @@ static void mi_theap_collect_ex(mi_theap_t* theap, mi_collect_t collect)
   // collect all pages owned by this thread
   mi_theap_visit_pages(theap, &mi_theap_page_collect, (collect!=MI_NORMAL), &collect, NULL);  // dont normally visit full pages, see issue #1220
 
-  // collect arenas (this is program wide so don't force purges on abandonment of threads)
+  // collect arenas (this is program wide so don't force purges on abandonment of threads).
+  // Not from a claimed parked sweep though: a woken owner spins in `_mi_park_leave` for the
+  // whole of it and nothing in the arena purge reads `park_reclaim`, so the "bounded by one page"
+  // wait would become an unbounded subproc-wide madvise pass. The sweep's caller runs the arena
+  // purge itself as a reclaim-gated phase (`_mi_arenas_purge_now`).
   //mi_atomic_storei64_release(&theap->tld->subproc->purge_expire, 1);
-  _mi_arenas_collect(collect == MI_FORCE /* force purge? */, collect >= MI_FORCE /* visit all? */, theap->tld);
+  if (theap->tld == NULL || mi_atomic_load_relaxed(&theap->tld->park_state) != MI_PARK_SWEEPING) {
+    _mi_arenas_collect(collect == MI_FORCE /* force purge? */, collect >= MI_FORCE /* visit all? */, theap->tld);
+  }
 
   // merge statistics
   mi_theap_merge_stats(theap);
@@ -153,7 +160,11 @@ void _mi_theap_collect_abandon(mi_theap_t* theap) {
 // it is idle (e.g. from an event loop about to park): it costs a few madvise
 // calls and nothing on the alloc/free hot path.
 static bool mi_theap_page_purge_holes(mi_theap_t* theap, mi_page_queue_t* pq, mi_page_t* page, void* arg1, void* arg2) {
-  MI_UNUSED(theap); MI_UNUSED(arg1); MI_UNUSED(arg2);
+  MI_UNUSED(arg1); MI_UNUSED(arg2);
+  // When the scavenger is doing this for a parked thread, the owner may wake at any moment and
+  // has to wait for us. Stopping between pages bounds that wait to one page's walk; the pages we
+  // skip are simply swept at the next park (`swept_state` makes the re-walk cheap).
+  if (theap->tld != NULL && mi_atomic_load_relaxed(&theap->tld->park_reclaim) != 0) return false;
   _mi_page_free_collect(page, true);   // force: fold local_free (and thread_free) into `free` first
   if (mi_page_all_free(page)) {
     // the forced collect emptied the page: hand it back instead of leaving it resident
@@ -169,8 +180,13 @@ static bool mi_theap_page_purge_holes(mi_theap_t* theap, mi_page_queue_t* pq, mi
 static void mi_theap_purge_holes(mi_theap_t* theap) mi_attr_noexcept {
   if (theap == NULL || !mi_theap_is_initialized(theap)) return;
   if (!mi_option_is_enabled(mi_option_purge_holes)) return;
-  // this rewrites the thread-local free list of every page, so only the owning thread may do it
-  if (theap->tld == NULL || theap->tld->thread_id != _mi_thread_id()) return;
+  // This rewrites the thread-local free list of every page, so it may only run when the owner is
+  // not allocating. Two ways to know that: we ARE the owner, or the owner published MI_PARK_PARKED
+  // and the scavenger claimed it (MI_PARK_SWEEPING) -- the same "owner is quiesced" precondition
+  // `mi_theap_collect` already relies on for its non-owner callers (see python/cpython#112532).
+  if (theap->tld == NULL) return;
+  if (theap->tld->thread_id != _mi_thread_id() &&
+      mi_atomic_load_acquire(&theap->tld->park_state) != MI_PARK_SWEEPING) return;
   _mi_page_purge_holes_begin();
   mi_theap_visit_pages(theap, &mi_theap_page_purge_holes, true /* include full pages */, NULL, NULL);
   _mi_page_purge_holes_end();
@@ -186,13 +202,11 @@ static void mi_theap_purge_holes(mi_theap_t* theap) mi_attr_noexcept {
 // `mi_heap_new_in_arena`), which is why we sweep every theap and not just the default one.
 #define MI_PURGE_HOLES_MAX_HEAPS  (8)
 
-static void mi_purge_holes(void) mi_attr_noexcept {
+static void mi_purge_holes_of(mi_tld_t* tld) mi_attr_noexcept {
   if (!mi_option_is_enabled(mi_option_purge_holes)) return;
-  _mi_page_purge_holes_sweep_begin();  // decides whether this sweep skips unchanged pages
+  if (tld == NULL) return;
+  _mi_page_purge_holes_sweep_begin(tld);  // decides whether this sweep skips unchanged pages
   _mi_page_holes_reset_ineligible();   // the ineligible counters are a gauge over this sweep
-  mi_theap_t* const theap0 = _mi_theap_default();
-  if (theap0 == NULL || !mi_theap_is_initialized(theap0) || theap0->tld == NULL) return;
-  mi_tld_t* const tld = theap0->tld;
 
   mi_heap_t* heaps[MI_PURGE_HOLES_MAX_HEAPS];
   size_t heap_count = 0;
@@ -214,27 +228,128 @@ static void mi_purge_holes(void) mi_attr_noexcept {
       }
     }
     for (size_t i = 0; i < heap_count; i++) {
-      _mi_arenas_purge_abandoned_holes(heaps[i]);
+      if (mi_atomic_load_relaxed(&tld->park_reclaim) != 0) break;
+      _mi_arenas_purge_abandoned_holes(heaps[i], tld);
     }
   }
 }
 
-// The one public entry point: call whenever a thread goes idle. Collects this thread's
-// pending frees, discards the holes in its still-used pages, and drains the arena purge
-// queue so freed slices are returned now instead of at the scavenger's next wake.
-// Owner-thread rules make each thread's own idle point the ONLY safe place to sweep its
-// heaps -- no other thread can do it for us. purge_delay still applies to the arena drain.
+// Fold in pending frees, discard the holes in still-used pages, drain the arena purge queue.
+// Runs on the owner (`mi_on_thread_idle`) or on the scavenger for a parked thread; both require
+// that the owner of `tld` is not allocating while we rewrite its free lists.
+void _mi_thread_idle_work(mi_tld_t* tld, mi_theap_t* theap0) mi_attr_noexcept {
+  if (tld == NULL) return;
+  // each phase is a full walk: an owner waiting in `_mi_park_leave` cannot allocate until we stop
+  if (mi_atomic_load_relaxed(&tld->park_reclaim) != 0) return;
+  if (theap0 != NULL && mi_theap_is_initialized(theap0)) {
+    mi_theap_collect(theap0, false /* not forced */);
+  }
+  if (mi_atomic_load_relaxed(&tld->park_reclaim) != 0) return;
+  mi_purge_holes_of(tld);   // every theap of this thread + the abandoned pages
+  if (mi_atomic_load_relaxed(&tld->park_reclaim) != 0) return;
+  _mi_arenas_purge_now(tld->subproc);
+}
+
+// Take the theaps of `tld` back from the scavenger. Also called from teardown: a thread can leave
+// a park without reaching `mi_on_thread_idle_end` (`epoll_wait` is a cancellation point), and
+// freeing the tld while the sweeper walks it is a use-after-free.
+void _mi_park_leave(mi_tld_t* tld) {
+  if (tld == NULL) return;
+  for (;;) {
+    uint32_t expected = MI_PARK_PARKED;
+    if (mi_atomic_cas_strong_acq_rel(&tld->park_state, &expected, MI_PARK_RUNNING)) break;
+    if (expected == MI_PARK_RUNNING) return;   // not parked: nothing to take back
+    // it may re-claim the moment it releases, so re-race rather than store: only a CAS from
+    // PARKED may reach RUNNING
+    mi_assert_internal(expected == MI_PARK_SWEEPING);
+    mi_atomic_store_release(&tld->park_reclaim, 1);
+    while (mi_atomic_load_acquire(&tld->park_state) == MI_PARK_SWEEPING) {
+      _mi_prim_thread_yield();   // it stops at its next page or phase; if descheduled, yield to it
+    }
+  }
+  mi_atomic_store_release(&tld->park_reclaim, 0);
+  mi_atomic_decrement_relaxed(&tld->subproc->parked_count);
+}
+
+// The original entry point: do the work inline, on the calling thread. Kept for callers that
+// have no wake-up side to pair with (and as the fallback when no scavenger is running).
 void mi_on_thread_idle(void) mi_attr_noexcept {
   mi_theap_t* const theap0 = _mi_theap_default();
   if (theap0 == NULL || !mi_theap_is_initialized(theap0) || theap0->tld == NULL) return;
   if (theap0->tld->thread_id != _mi_thread_id()) return;
-  mi_theap_collect(theap0, false /* not forced */);
-  mi_purge_holes();  // every theap of this thread + the abandoned pages
-  // Everything above is owner-thread-only (it rewrites this thread's free lists). The arena
-  // purge is not: those slices are in no page and belong to no thread. So don't pay for the
-  // madvise here -- tell the scavenger the delay is void because we are idle, and let it do
-  // the syscalls off-thread.
-  _mi_arenas_purge_now(theap0->tld->subproc);
+  _mi_thread_idle_work(theap0->tld, theap0);
+}
+
+// Declare that this thread will not allocate or free until `mi_on_thread_idle_end` -- the sweep's
+// precondition -- so the scavenger can do it while we block.
+//
+// Returns false when nothing was handed off, and then `mi_on_thread_idle_end` is not required.
+// It deliberately does NOT sweep inline in that case: a caller parks far more often than it is
+// idle, and sweeping on every park is what it is trying to avoid. Only the caller knows whether
+// this park is idle enough to afford `mi_on_thread_idle()` instead.
+bool mi_on_thread_idle_start(void) mi_attr_noexcept {
+  mi_theap_t* const theap0 = _mi_theap_default();
+  if (theap0 == NULL || !mi_theap_is_initialized(theap0) || theap0->tld == NULL) return false;
+  mi_tld_t* const tld = theap0->tld;
+  if (tld->thread_id != _mi_thread_id()) return false;
+  // the scavenger only sweeps the main subproc, so a thread elsewhere would never be swept
+  if (!_mi_scavenger_is_running() || tld->subproc != _mi_subproc_main()) return false;
+
+  // The scavenger has no TLS of ours to find the default theap with, so leave it here.
+  tld->park_theap0 = theap0;
+  mi_atomic_store_release(&tld->park_reclaim, 0);
+  mi_atomic_store_release(&tld->park_swept, 0);
+  uint32_t expected = MI_PARK_RUNNING;
+  if (!mi_atomic_cas_strong_acq_rel(&tld->park_state, &expected, MI_PARK_PARKED)) return false;
+  mi_atomic_increment_relaxed(&tld->subproc->parked_count);
+  _mi_scavenger_wake(tld->subproc);
+  return true;
+}
+
+// The other half: we are awake and about to allocate again, so take the theaps back. Usually an
+// uncontended CAS. If the scavenger is mid-sweep we ask it to stop (it checks between pages) and
+// spin until it does -- bounded by one page's walk, and a syscall-free wait either way.
+void mi_on_thread_idle_end(void) mi_attr_noexcept {
+  mi_theap_t* const theap0 = _mi_theap_default();
+  if (theap0 == NULL || !mi_theap_is_initialized(theap0) || theap0->tld == NULL) return;
+  mi_tld_t* const tld = theap0->tld;
+  if (tld->thread_id != _mi_thread_id()) return;
+  _mi_park_leave(tld);
+}
+
+// Sweep the theaps of every parked thread of `subproc`; scavenger only.
+//
+// MI_PARK_SWEEPING is what keeps `tld` alive across the sweep without holding `tlds_lock`: every
+// path out of a park (`mi_on_thread_idle_end`, and teardown via `_mi_park_leave`) waits for it to
+// clear before freeing anything. So the lock covers the walk, not the work.
+void _mi_theap_sweep_parked(mi_subproc_t* subproc) {
+  if (subproc == NULL) return;
+  if (mi_atomic_load_relaxed(&subproc->parked_count) == 0) return;
+  for (;;) {
+    mi_tld_t* claimed = NULL;
+    mi_theap_t* theap0 = NULL;
+    mi_lock(&subproc->tlds_lock) {
+      const mi_msecs_t now = _mi_clock_now();
+      const mi_msecs_t interval = (mi_msecs_t)mi_option_get_clamp(mi_option_purge_holes_min_interval, 0, 3600000);
+      for (mi_tld_t* tld = subproc->tlds; tld != NULL; tld = tld->subproc_next) {
+        if (mi_atomic_load_acquire(&tld->park_swept) != 0) continue;   // already done for this park
+        if (interval > 0 && tld->holes_sweep_last != 0 && now - tld->holes_sweep_last < interval) continue;
+        uint32_t expected = MI_PARK_PARKED;
+        if (mi_atomic_cas_strong_acq_rel(&tld->park_state, &expected, MI_PARK_SWEEPING)) {
+          claimed = tld; theap0 = tld->park_theap0; break;
+        }
+      }
+    }
+    if (claimed == NULL) return;   // nothing parked (any more)
+    claimed->holes_sweep_last = _mi_clock_now();
+    _mi_thread_idle_work(claimed, theap0);
+    // Mark BEFORE releasing: a `park_swept` set after the store could land on the thread's *next*
+    // park and silently skip that sweep. Cleared by `mi_on_thread_idle_start`. If we bailed out
+    // early on `park_reclaim`, the owner is leaving the park anyway, so the rest is its next park's.
+    mi_atomic_store_release(&claimed->park_swept, 1);
+    // Back to PARKED, not RUNNING: the owner is still blocked and still owns the transition out.
+    mi_atomic_store_release(&claimed->park_state, MI_PARK_PARKED);
+  }
 }
 
 // Report what hole punching leaves behind (see the "Hole report" section in `page.c`).

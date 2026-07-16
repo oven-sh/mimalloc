@@ -185,7 +185,15 @@ static void mi_scavenger_run(void) {
   // initialise a theap/tld via _mi_subproc()'s TLS path.
   mi_subproc_t* const subproc = _mi_subproc_main();
   while (mi_atomic_load_acquire(&_mi_scavenger_running) != 0) {
-    mi_atomic_store_release(&subproc->scavenger_wake, (uint32_t)0);
+    // Clear with an RMW, not a plain store: it must be totally ordered against the parker's
+    // coalescing `exchange(wake, 1)` in `_mi_scavenger_wake`. With a store, our clear and the later
+    // `parked_count` read below can pass the parker's increment and its exchange in opposite
+    // directions (store-buffering) -- we see no parked thread, it sees a stale wake==1 and issues
+    // no syscall, and that park is silently deferred to the safety timeout.
+    mi_atomic_exchange_acq_rel(&subproc->scavenger_wake, (uint32_t)0);
+    // Do the idle work of any thread that parked and handed us its theaps. This is the expensive
+    // part (the hole punch is ~99% madvise) and it is why the owner gets to skip it.
+    _mi_theap_sweep_parked(subproc);
     mi_msecs_t expire = mi_atomic_loadi64_acquire(&subproc->purge_expire);
     mi_msecs_t timeout_ms;
     if (expire == 0) {

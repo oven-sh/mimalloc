@@ -15,6 +15,7 @@ terms of the MIT license. A copy of the license can be found in the file
 #include "mimalloc/internal.h"
 #include "mimalloc/atomic.h"
 #include "mimalloc/prim.h"
+#include <stdio.h>
 
 /* -----------------------------------------------------------
   Definition of page queues for each block size
@@ -474,9 +475,9 @@ static mi_decl_thread bool mi_purging_holes;
 static mi_decl_thread size_t mi_holes_sweep_skipped;
 static mi_decl_thread size_t mi_holes_sweep_visited;
 
-// Sweeps this thread has run, and whether THIS one ignores `page->swept_state` (see
-// `_mi_page_purge_holes`). Set once per idle sweep, in `_mi_page_purge_holes_sweep_begin`.
-static mi_decl_thread size_t mi_holes_sweep_seq;
+// Whether THIS sweep ignores `page->swept_state` (see `_mi_page_purge_holes`). Set once per idle
+// sweep, in `_mi_page_purge_holes_sweep_begin`; the sequence it is paced by lives on the tld being
+// swept, since one scavenger thread runs the sweeps of many.
 static mi_decl_thread bool   mi_holes_sweep_full;
 
 bool _mi_page_purge_holes_in_progress(void) { return mi_purging_holes; }
@@ -495,11 +496,11 @@ void _mi_page_purge_holes_end(void) {
   }
 }
 
-// Called once per idle sweep, before its passes (`mi_purge_holes`).
-void _mi_page_purge_holes_sweep_begin(void) {
+// Called once per idle sweep of `tld`'s heaps, before its passes (`mi_purge_holes_of`).
+void _mi_page_purge_holes_sweep_begin(mi_tld_t* tld) {
   const long every = mi_option_get(mi_option_purge_holes_full_every);
-  mi_holes_sweep_seq++;
-  mi_holes_sweep_full = (every > 0 && (mi_holes_sweep_seq % (size_t)every) == 0);
+  const size_t seq = ++tld->holes_sweep_seq;
+  mi_holes_sweep_full = (every > 0 && (seq % (size_t)every) == 0);
   if (mi_holes_sweep_full) { mi_atomic_addi64_relaxed(&mi_holes_full_sweeps, 1); }
 }
 
@@ -1886,6 +1887,8 @@ static _Atomic(void*) deferred_free; // is `mi_deferred_free_fun*` (but some pla
 static _Atomic(void*) deferred_arg;   
 
 void _mi_deferred_free(mi_theap_t* theap, bool force) {
+  // owner only: `heartbeat` and `recurse` are plain fields, and the handler is thread-affine
+  if (theap->tld != NULL && theap->tld->thread_id != _mi_thread_id()) return;
   theap->heartbeat++;
   mi_deferred_free_fun* const fun = (mi_deferred_free_fun*)mi_atomic_load_ptr_acquire(void,&deferred_free);
   if (fun != NULL && !theap->tld->recurse) {

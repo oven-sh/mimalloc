@@ -307,17 +307,24 @@ static void mi_subproc_main_init(void) {
     mi_stats_header_init(&subproc_main.stats);
     mi_lock_init(&subproc_main.arena_reserve_lock);
     mi_lock_init(&subproc_main.heaps_lock);
+    mi_lock_init(&subproc_main.tlds_lock);
     mi_lock_init(&subprocs_lock);
     mi_lock_init(&tld_empty.theaps_lock); 
   }
 }
 
 // Initialize main tld
+static void mi_tld_register(mi_tld_t* tld);   // defined below, with the rest of the registry
+
 static void mi_tld_main_init(void) {
   if (tld_main.thread_id == 0) {
     tld_main.thread_id = _mi_prim_thread_id();
     mi_lock_init(&tld_main.theaps_lock);
   }
+  // The main thread's tld is static and never goes through `mi_tld_alloc`, so register it here
+  // instead -- otherwise it can never hand its theaps to the scavenger. `mi_subproc_main_init`
+  // runs just before this and initializes the lock the registry takes.
+  mi_tld_register(&tld_main);
 }
 
 void _mi_theap_options_init(mi_theap_t* theap) {
@@ -364,10 +371,43 @@ static void mi_heap_main_init(void) {
   Thread local data
 ----------------------------------------------------------- */
 
+// Register a tld with its subproc so the scavenger can find it when it parks
+// (`mi_on_thread_idle_start`). Idempotent: the main thread's static tld can come through
+// `mi_tld_alloc` more than once if the thread is re-initialized after `_mi_thread_done`.
+static void mi_tld_register(mi_tld_t* tld) {
+  if (tld == NULL) return;
+  mi_subproc_t* const subproc = tld->subproc;
+  mi_lock(&subproc->tlds_lock) {
+    for (mi_tld_t* t = subproc->tlds; t != NULL; t = t->subproc_next) {
+      if (t == tld) goto done;   // already registered
+    }
+    tld->subproc_next = subproc->tlds;
+    subproc->tlds = tld;
+  done: ;
+  }
+}
+
+// Unlink before the tld memory goes away. The tld cannot be mid-sweep here: only a PARKED tld is
+// ever claimed, and a thread running its own teardown is RUNNING by definition -- assert it.
+static void mi_tld_unregister(mi_tld_t* tld) {
+  if (tld == NULL) return;
+  mi_assert_internal(mi_atomic_load_acquire(&tld->park_state) != MI_PARK_SWEEPING);
+  mi_subproc_t* const subproc = tld->subproc;
+  mi_lock(&subproc->tlds_lock) {
+    mi_tld_t** prev = &subproc->tlds;
+    while (*prev != NULL) {
+      if (*prev == tld) { *prev = tld->subproc_next; break; }
+      prev = &(*prev)->subproc_next;
+    }
+    tld->subproc_next = NULL;
+  }
+}
+
 // Allocate fresh tld
 static mi_tld_t* mi_tld_alloc(void) {
   if (_mi_is_main_thread()) {
     mi_atomic_increment_relaxed(&tld_main.subproc->thread_count);
+    mi_tld_register(&tld_main);
     return &tld_main;
   }
   else {
@@ -389,6 +429,7 @@ static mi_tld_t* mi_tld_alloc(void) {
     tld->thread_seq = mi_atomic_increment_relaxed(&tld->subproc->thread_total_count);
     tld->is_in_threadpool = _mi_prim_thread_is_in_threadpool();
     mi_atomic_increment_relaxed(&tld->subproc->thread_count);
+    mi_tld_register(tld);
     return tld;
   }
 }
@@ -397,6 +438,7 @@ static mi_tld_t* mi_tld_alloc(void) {
 
 mi_decl_noinline static void mi_tld_free(mi_tld_t* tld) {
   if (tld==NULL || tld==MI_TLD_INVALID) return; 
+  mi_tld_unregister(tld);
   mi_atomic_decrement_relaxed(&tld->subproc->thread_count);
   tld->thread_id = MI_THREADID_INVALID;              // note: not 0 as that would re-initialize tld_main
                                                      // we also need to set an invalid tid for tld_main as sometimes the same thread-id
@@ -506,6 +548,7 @@ mi_subproc_id_t mi_subproc_new(void) {
   mi_stats_header_init(&subproc->stats);
   mi_lock_init(&subproc->arena_reserve_lock);
   mi_lock_init(&subproc->heaps_lock);
+  mi_lock_init(&subproc->tlds_lock);
   mi_lock(&subprocs_lock) {
     // push on subproc list
     subproc->next = subprocs;
@@ -589,7 +632,10 @@ void mi_subproc_add_current_thread(mi_subproc_id_t subproc_id) {
     _mi_warning_message("unable to add thread to the subprocess as it was already in another subprocess (id: %p)\n", subproc);
     return;
   }
+  // the registry is keyed by subproc: move the tld between the two lists
+  mi_tld_unregister(tld);
   tld->subproc = subproc;
+  mi_tld_register(tld);
   tld->thread_seq = mi_atomic_increment_relaxed(&subproc->thread_total_count);
   mi_atomic_decrement_relaxed(&subproc_main.thread_count);
   mi_atomic_increment_relaxed(&subproc->thread_count);
@@ -771,17 +817,27 @@ void _mi_thread_done(mi_theap_t* _theap_main)
     return;
   }
 
-  // release dynamic thread_local's
-  _mi_thread_locals_thread_done();
-
   // note: we store the tld as we should avoid reading `thread_tld` at this point (to avoid reinitializing the thread local storage)
   mi_tld_t* const tld = _theap_main->tld;
 
   // adjust stats
   mi_heap_stat_decrease(_mi_subproc_heap_main(tld->subproc), threads, 1);  // todo: or `_theap_main->heap`?
 
-  // check thread-id as on Windows shutdown with FLS the main (exit) thread may call this on thread-local theaps...
-  if (tld->thread_id != _mi_prim_thread_id()) return;
+  // check thread-id as on Windows shutdown with FLS the main (exit) thread may call this on
+  // thread-local theaps: `tld` is another thread's, so its park is not ours to leave -- but the
+  // dynamic thread_local's are the *calling* thread's own, so still release those.
+  if (tld->thread_id != _mi_prim_thread_id()) {
+    _mi_thread_locals_thread_done();
+    return;
+  }
+
+  // a thread can reach teardown still parked: leave the park (waiting out any in-flight sweep of
+  // our theaps) before ANY owner-side free below -- everything after this frees or rewrites what
+  // the scavenger would otherwise still be walking.
+  _mi_park_leave(tld);
+
+  // release dynamic thread_local's -- this is an `mi_free`, so it must come after the park leave
+  _mi_thread_locals_thread_done();
 
   // delete the thread local theaps
   mi_thread_theaps_done(tld);
@@ -1184,6 +1240,14 @@ bool _mi_process_is_forked_child;          // set once in fork_child, never clea
 void _mi_process_fork_prepare(void) {
   if (!_mi_process_is_initialized) return;
   if (mi_atomic_increment_acq_rel(&mi_fork_depth) != 0) return;
+  // fork() does not allocate, so a caller may reach it still parked with the scavenger mid-way
+  // through rewriting this thread's own pages. The clone would freeze that torn heap into a child
+  // where no thread will ever finish the sweep -- take our heaps back first, while we hold none
+  // of the locks below and the scavenger we wait on is still live in this (the parent) process.
+  {
+    mi_theap_t* const theap = _mi_theap_default();
+    if (theap != NULL && mi_theap_is_initialized(theap)) { _mi_park_leave(theap->tld); }
+  }
   mi_subproc_t* const subproc = _mi_subproc_main();
   // Acquire outermost-first: locks that can be held across an allocation (and so may
   // nest into arena_reserve_lock) must be taken before arena_reserve_lock.
@@ -1201,6 +1265,7 @@ void _mi_process_fork_prepare(void) {
   }
   mi_lock_acquire(&heap_main.theaps_lock);
   mi_lock_acquire(&heap_main.os_abandoned_pages_lock);
+  mi_lock_acquire(&subproc->tlds_lock);   // leaf: never held across an allocation or a sweep
   mi_lock_acquire(&subproc->arena_reserve_lock);
 }
 
@@ -1209,6 +1274,7 @@ void _mi_process_fork_parent(void) {
   if (mi_atomic_decrement_acq_rel(&mi_fork_depth) != 1) return;
   mi_subproc_t* const subproc = _mi_subproc_main();
   mi_lock_release(&subproc->arena_reserve_lock);
+  mi_lock_release(&subproc->tlds_lock);
   mi_lock_release(&heap_main.os_abandoned_pages_lock);
   mi_lock_release(&heap_main.theaps_lock);
   for (mi_heap_t* h = subproc->heaps; h != NULL; h = h->next) {
@@ -1233,9 +1299,17 @@ void _mi_process_fork_child(void) {
   for (mi_subproc_t* sp = subprocs; sp != NULL; sp = sp->next) {
     mi_lock_init(&sp->arena_reserve_lock);
     mi_lock_init(&sp->heaps_lock);
+    mi_lock_init(&sp->tlds_lock);
     // a wake that was in flight at fork() leaves this at 1 with nobody to clear it, and the
     // 0->1 edge in `_mi_scavenger_wake` would then never fire again
     mi_atomic_store_relaxed(&sp->scavenger_wake, (uint32_t)0);
+    // no scavenger in the child: nothing will ever finish a claimed sweep
+    mi_atomic_store_relaxed(&sp->parked_count, 0);
+    for (mi_tld_t* t = sp->tlds; t != NULL; t = t->subproc_next) {
+      mi_atomic_store_relaxed(&t->park_state, (uint32_t)MI_PARK_RUNNING);
+      mi_atomic_store_relaxed(&t->park_reclaim, (uint32_t)0);
+      mi_atomic_store_relaxed(&t->park_swept, (uint32_t)0);
+    }
     for (mi_heap_t* h = sp->heaps; h != NULL; h = h->next) {
       mi_lock_init(&h->theaps_lock);
       mi_lock_init(&h->arena_pages_lock);

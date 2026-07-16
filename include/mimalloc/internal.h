@@ -253,7 +253,7 @@ void*         _mi_arenas_alloc_aligned(mi_heap_t* heap, size_t size, size_t alig
 void          _mi_arenas_free(void* p, size_t size, mi_memid_t memid);
 bool          _mi_arenas_contain(const void* p);
 void          _mi_arenas_collect(bool force_purge, bool visit_all, mi_tld_t* tld);
-void          _mi_arenas_purge_abandoned_holes(mi_heap_t* heap);
+void          _mi_arenas_purge_abandoned_holes(mi_heap_t* heap, mi_tld_t* tld);
 void          _mi_arenas_try_purge(bool force, bool visit_all, mi_subproc_t* subproc, size_t tseq);
 void          _mi_arenas_unsafe_destroy_all(mi_subproc_t* subproc);
 
@@ -327,6 +327,19 @@ void          _mi_theap_default_set(mi_theap_t* theap);
 void          _mi_theap_cached_set(mi_theap_t* theap);
 void          _mi_theap_collect_retired(mi_theap_t* theap, bool force);
 void          _mi_theap_collect_abandon(mi_theap_t* theap);
+// May the calling thread touch the owner-only state of `theap` (its plain free lists, page
+// queues and non-atomic stats)? Either we own it, or its owner parked and handed it to us for
+// the duration of a sweep (see `mi_on_thread_idle_start`). Both mean: no concurrent owner.
+static inline bool _mi_theap_can_touch(const mi_theap_t* theap) {
+  if (theap == NULL || theap->tld == NULL) return true;
+  if (theap->tld->thread_id == _mi_thread_id()) return true;
+  return (mi_atomic_load_acquire(&theap->tld->park_state) == MI_PARK_SWEEPING);
+}
+
+void          _mi_thread_idle_work(mi_tld_t* tld, mi_theap_t* theap0) mi_attr_noexcept;
+void          _mi_theap_sweep_parked(mi_subproc_t* subproc);
+void          _mi_park_leave(mi_tld_t* tld);
+void          _mi_scavenger_forked_child(void);
 bool          _mi_theap_area_visit_blocks(const mi_heap_area_t* area, mi_page_t* page, mi_block_visit_fun* visitor, void* arg);
 void          _mi_theap_page_reclaim(mi_theap_t* theap, mi_page_t* page);
 bool          _mi_theap_free(mi_theap_t* theap, bool acquire_heap_theaps_lock, bool acquire_tld_theaps_lock);
@@ -816,7 +829,7 @@ void          _mi_page_holes_count_ineligible(const mi_page_t* page);
 void          _mi_page_holes_reset_ineligible(void);
 void          _mi_page_purge_holes_begin(void);
 void          _mi_page_purge_holes_end(void);
-void          _mi_page_purge_holes_sweep_begin(void);   // once per idle sweep, before its passes
+void          _mi_page_purge_holes_sweep_begin(mi_tld_t* tld);   // once per idle sweep, before its passes
 
 // ------------------------------------------------------
 // Hole report  (`mi_purge_holes_report`, see the "Hole report" section in `page.c`)
