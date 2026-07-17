@@ -1223,7 +1223,8 @@ static void mi_process_init_once(void) mi_attr_noexcept {
       mi_reserve_os_memory((size_t)ksize*MI_KiB, true, true);
     }
   }
-  _mi_scavenger_start();
+  // The background scavenger is deliberately not started here: process init must not create a
+  // thread. The application opts in with `mi_scavenger_start()`.
 }
 
 /* -----------------------------------------------------------

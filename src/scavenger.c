@@ -262,10 +262,12 @@ static DWORD WINAPI mi_scavenger_thread_main(LPVOID arg) {
 }
 
 void _mi_scavenger_start(void) {
-  if (mi_atomic_load_acquire(&_mi_scavenger_running) != 0) return;
   if (!mi_option_is_enabled(mi_option_scavenger)) return;
   if (mi_option_get(mi_option_purge_delay) <= 0) return;
-  mi_atomic_store_release(&_mi_scavenger_running, (uintptr_t)1);
+  // CAS: this is reachable from a public entry point and the after-fork restart, which may
+  // race; only the caller that claims the flag creates the thread.
+  uintptr_t expected = 0;
+  if (!mi_atomic_cas_strong_acq_rel(&_mi_scavenger_running, &expected, (uintptr_t)1)) return;
   _mi_scavenger_thread = CreateThread(NULL, 0, &mi_scavenger_thread_main, NULL, 0, NULL);
   if (_mi_scavenger_thread == NULL) {
     mi_atomic_store_release(&_mi_scavenger_running, (uintptr_t)0);
@@ -311,10 +313,12 @@ static void* mi_scavenger_thread_main(void* arg) {
 }
 
 void _mi_scavenger_start(void) {
-  if (mi_atomic_load_acquire(&_mi_scavenger_running) != 0) return;
   if (!mi_option_is_enabled(mi_option_scavenger)) return;
   if (mi_option_get(mi_option_purge_delay) <= 0) return;
-  mi_atomic_store_release(&_mi_scavenger_running, (uintptr_t)1);
+  // CAS: this is reachable from a public entry point and the after-fork restart, which may
+  // race; only the caller that claims the flag creates the thread.
+  uintptr_t expected = 0;
+  if (!mi_atomic_cas_strong_acq_rel(&_mi_scavenger_running, &expected, (uintptr_t)1)) return;
   // Block all signals on the scavenger thread. It runs before the host has set
   // up its own signal masking, and a thread that leaves (e.g.) SIGCHLD
   // unblocked will have process-directed signals dispatched to it and silently
@@ -346,10 +350,12 @@ void _mi_scavenger_stop(void) {
 // child would: take the wake path in `_mi_arenas_purge_now` and signal nobody (so never purge at
 // all), and `pthread_join` a `pthread_t` that names no thread at exit.
 void _mi_scavenger_forked_child(void) {
+  // Only re-arm a start the parent actually made: the application decides whether a
+  // scavenger runs, and a child of a scavenger-less parent must stay scavenger-less.
+  const bool was_running = (mi_atomic_exchange_acq_rel(&_mi_scavenger_running, (uintptr_t)0) != 0);
   mi_atomic_store_release(&_mi_scavenger_joinable, (uintptr_t)0);
-  mi_atomic_store_release(&_mi_scavenger_running, (uintptr_t)0);
   mi_scav_fork_child_reset();
-  mi_atomic_store_release(&_mi_scavenger_needs_restart, (uintptr_t)1);
+  if (was_running) mi_atomic_store_release(&_mi_scavenger_needs_restart, (uintptr_t)1);
 }
 
 // Restart once, on the first purge that wanted a scavenger. Not in the fork handler: most children
@@ -363,3 +369,13 @@ void _mi_scavenger_start_if_forked(void) {
 #endif
 
 #endif
+
+// -----------------------------------------------------------------------------
+// Public API. The scavenger is never started by process init; the application
+// opts in here (a no-op where there is no scavenger thread at all).
+// -----------------------------------------------------------------------------
+
+void mi_scavenger_start(void) mi_attr_noexcept {
+  mi_process_init();      // idempotent; the scavenger reads the options and the main subproc
+  _mi_scavenger_start();
+}

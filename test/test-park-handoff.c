@@ -98,6 +98,12 @@ static void test_handoff_sweeps(void) {
   churn(p);
   const size_t before = discards();
   const bool parked = mi_on_thread_idle_start();
+  // main started the scavenger; when the option lets it run, the park MUST hand off. Without this
+  // a scavenger that failed to come up would take the else-branch below and pass, silently losing
+  // the handoff coverage. Gated exactly as `_mi_scavenger_start` gates thread creation.
+  if (mi_option_is_enabled(mi_option_scavenger) && mi_option_get(mi_option_purge_delay) > 0) {
+    check("a running scavenger takes the handoff", parked);
+  }
   if (parked) {
     // Stand in for a blocking syscall: the sweep is asynchronous, so wait for it rather than
     // assuming it happened. Bounded so a broken handoff fails instead of hanging.
@@ -418,6 +424,7 @@ static void test_exit_while_swept_with_dyn_tls(void) {
 }
 
 int main(void) {
+  mi_scavenger_start();   // the handoff needs a scavenger to hand off to; it is opt-in
   test_handoff_sweeps();
   test_survivors_intact();
   test_unbalanced();

@@ -181,7 +181,7 @@ static mi_option_desc_t mi_options[_mi_option_last] =
   { 0,   MI_OPTION_UNINIT, MI_OPTION(arena_is_numa_local) },      // associate local numa node with an initial arena allocation
   { 0,   MI_OPTION_UNINIT, MI_OPTION(snapshot_on_exit) },         // write a heap snapshot on process exit (=0). 1=on, 2=on+blocks.
   { 0,   MI_OPTION_UNINIT, MI_OPTION(prof_sample_rate) },         // bytes per heap-profile sample (=0, off). Typical: 524288.
-  { 1,   MI_OPTION_UNINIT, MI_OPTION(scavenger) },                // run a background scavenger thread that purges freed arena memory when due (=1)
+  { 1,   MI_OPTION_UNINIT, MI_OPTION(scavenger) },                // allow the background scavenger thread (started by `mi_scavenger_start`) that purges freed arena memory when due (=1)
   { 1,   MI_OPTION_UNINIT, MI_OPTION(purge_holes) },              // discard free blocks inside a still-used page (=1)
   { 0,   MI_OPTION_UNINIT, MI_OPTION(purge_holes_eager_zero) },   // zero a hole before discarding it (=0; for testing)
   { 100, MI_OPTION_UNINIT, MI_OPTION(purge_holes_min_interval) },  // min msecs between idle sweeps of one thread's heaps (=100)

@@ -200,6 +200,13 @@ mi_decl_export void mi_on_thread_idle(void)     mi_attr_noexcept;
 mi_decl_export bool mi_on_thread_idle_start(void) mi_attr_noexcept;  // about to block: hand the theaps to the scavenger. false = nothing handed off, no _end needed
 mi_decl_export void mi_on_thread_idle_end(void)   mi_attr_noexcept;  // awake again: take them back (pairs with a true from _start)
 
+// Start the background scavenger thread (`mi_option_scavenger`) that purges freed arena
+// memory when due and takes the handoff from `mi_on_thread_idle_start`. The library never
+// starts it on its own: the application decides if and when a background thread may exist.
+// Until it runs, purging stays allocation-driven and `mi_on_thread_idle_start` reports
+// false. Idempotent; a no-op when the option is off or `purge_delay <= 0`.
+mi_decl_export void mi_scavenger_start(void)      mi_attr_noexcept;
+
 // How much hole punching actually reclaims (process wide, monotonic except for the
 // two `*_now` gauges). These are not part of `mi_stats_t`: hole purging also covers
 // pages that no heap owns, and `mi_stats_t` cannot grow (it is embedded in a theap,
@@ -554,7 +561,7 @@ typedef enum mi_option_e {
   mi_option_arena_is_numa_local,        // experimental
   mi_option_snapshot_on_exit,           // write a heap snapshot on process exit (=0). 1=on, 2=on with per-block freemaps. Path from MIMALLOC_SNAPSHOT_PATH or "mimalloc-snapshot.<pid>.bin".
   mi_option_prof_sample_rate,           // bytes per heap-profile sample (=0, off). Typical: 524288. Dumps profile.proto on exit to MIMALLOC_PROF_PATH.
-  mi_option_scavenger,                  // run a background scavenger thread that purges freed arena memory when due (=1)
+  mi_option_scavenger,                  // allow the background scavenger thread (started by `mi_scavenger_start`) that purges freed arena memory when due (=1)
   mi_option_purge_holes,                // discard the memory of free blocks inside a still-used page (=1)
   mi_option_purge_holes_eager_zero,     // zero a hole before discarding it, so that an over-discard destroys data even on an OS that reclaims lazily (=0; for testing -- always on when MI_DEBUG>1)
   mi_option_purge_holes_min_interval,  // min milliseconds between idle sweeps of one thread's heaps (=100, 0=every park). See `_mi_theap_sweep_parked`.

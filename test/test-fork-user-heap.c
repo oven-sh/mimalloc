@@ -204,6 +204,7 @@ static int case_c(void) {
 
 int main(void) {
   int rc = 0;
+  mi_scavenger_start();   // case_c is about the scavenger's state across fork(); it is opt-in
   rc |= (case_a() > 0 ? 1 : 0);
   rc |= case_c();
   #if MI_DEBUG > 0

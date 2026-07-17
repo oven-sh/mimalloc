@@ -382,6 +382,9 @@ int main(int argc, char** argv) {
     // mi_option_set(mi_option_purge_delay,-1);
     mi_option_set(mi_option_page_reclaim_on_free, 0);
   #endif
+  #if !defined(USE_STD_MALLOC)
+    mi_scavenger_start();   // stress the allocator with the background scavenger running as well
+  #endif
 
   // > mimalloc-test-stress [THREADS] [SCALE] [ITER]
   if (argc >= 2) {
