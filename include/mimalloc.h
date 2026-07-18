@@ -199,6 +199,7 @@ mi_decl_export void mi_collect(bool force)      mi_attr_noexcept;
 mi_decl_export void mi_on_thread_idle(void)     mi_attr_noexcept;
 mi_decl_export bool mi_on_thread_idle_start(void) mi_attr_noexcept;  // about to block: hand the theaps to the scavenger. false = nothing handed off, no _end needed
 mi_decl_export void mi_on_thread_idle_end(void)   mi_attr_noexcept;  // awake again: take them back (pairs with a true from _start)
+mi_decl_export void mi_scavenger_stop(void)      mi_attr_noexcept;  // stop and join the background scavenger thread; a no-op if it is not running
 
 // How much hole punching actually reclaims (process wide, monotonic except for the
 // two `*_now` gauges). These are not part of `mi_stats_t`: hole purging also covers

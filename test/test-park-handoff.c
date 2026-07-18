@@ -417,6 +417,20 @@ static void test_exit_while_swept_with_dyn_tls(void) {
   check("exit while swept, with dtor frees and dynamic thread-locals, is race-free", true);
 }
 
+// ---------------------------------------------------------------------------
+// Stopping the scavenger joins the thread: a park after it has nobody to hand off to and reports
+// false, and the process stays fully usable. Runs last, since it takes the scavenger away.
+// ---------------------------------------------------------------------------
+static void test_scavenger_stop(void) {
+  mi_scavenger_stop();
+  check("no handoff once the scavenger is stopped", !mi_on_thread_idle_start());
+  mi_scavenger_stop();   // a second stop is a no-op
+  void* q = mi_malloc(64);
+  check("the thread still allocates after the stop", q != NULL);
+  mi_free(q);
+  mi_on_thread_idle();   // and can still sweep for itself
+}
+
 int main(void) {
   test_handoff_sweeps();
   test_survivors_intact();
@@ -427,6 +441,7 @@ int main(void) {
   test_park_then_exit();
   test_exit_while_swept_with_dyn_tls();
   test_park_stress();
+  test_scavenger_stop();
   fprintf(stderr, "\n%s\n", failures == 0 ? "all tests passed." : "SOME TESTS FAILED.");
   return failures == 0 ? 0 : 1;
 }
