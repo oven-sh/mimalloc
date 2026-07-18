@@ -363,3 +363,7 @@ void _mi_scavenger_start_if_forked(void) {
 #endif
 
 #endif
+
+void mi_scavenger_stop(void) mi_attr_noexcept {
+  _mi_scavenger_stop();
+}
