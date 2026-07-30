@@ -524,7 +524,7 @@ typedef enum mi_option_e {
   mi_option_purge_delay,                // memory purging is delayed by N milli seconds; use 0 for immediate purging or -1 for no purging at all. (=100)
   mi_option_use_numa_nodes,             // 0 = use all available numa nodes, otherwise use at most N nodes.
   mi_option_disallow_os_alloc,          // 1 = do not use OS memory for allocation (but only programmatically reserved arenas)
-  mi_option_os_tag,                     // tag used for OS logging (macOS only for now) (=100)
+  mi_option_os_tag,                     // tag used for OS logging (macOS only for now) (=240)
   mi_option_max_errors,                 // issue at most N error messages
   mi_option_max_warnings,               // issue at most N warning messages
   mi_option_deprecated_max_segment_reclaim,  // max. percentage of the abandoned segments can be reclaimed per try (=10%)
