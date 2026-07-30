@@ -29,7 +29,7 @@ static void mi_page_map_cannot_commit(void) {
 static uint8_t mi_page_map_empty[1] = { 1 };      // _mi_ptr_page(NULL) == NULL
 
 mi_decl_hidden mi_decl_cache_align _Atomic(uint8_t*) _mi_page_map   = mi_page_map_empty;
-mi_decl_hidden _Atomic(void*)  _mi_page_map_max_address = NULL;
+mi_decl_hidden _Atomic(void*)  _mi_page_map_max_address;   // = NULL (static zero-init; a `= NULL` initializer does not compile as C++)
 static mi_memid_t   mi_page_map_memid;
 
 #define MI_PAGE_MAP_ENTRIES_PER_COMMIT_BIT   MI_ARENA_SLICE_SIZE
@@ -217,7 +217,7 @@ static mi_page_t*            mi_submap_empty[1]    = { NULL };
 static _Atomic(mi_submap_t)  mi_page_map_empty[1]  = { MI_ATOMIC_VAR_INIT(mi_submap_empty) };
 
 mi_decl_hidden mi_decl_cache_align _Atomic(mi_submap_t)* _mi_page_map = mi_page_map_empty;
-mi_decl_hidden _Atomic(void*) _mi_page_map_max_address = NULL;
+mi_decl_hidden _Atomic(void*) _mi_page_map_max_address;   // = NULL (static zero-init; a `= NULL` initializer does not compile as C++)
 static size_t       mi_page_map_count;
 static mi_memid_t   mi_page_map_memid;
 static mi_lock_t    mi_page_map_lock;
