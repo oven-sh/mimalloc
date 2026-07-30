@@ -23,6 +23,7 @@ terms of the MIT license. A copy of the license can be found in the file
 #include "mimalloc/internal.h"
 #include "mimalloc/atomic.h"
 #include "mimalloc/prim.h"
+#include "mimalloc/prim-tls.h"
 
 #if defined(_WIN32)
   #include <windows.h>
@@ -106,7 +107,7 @@ static void mi_prof_ht_grow(size_t want) {
   size_t cap = (want < 1024 ? 1024 : want);
   // use OS memory directly so we don't recurse into mimalloc
   mi_memid_t memid;
-  uintptr_t* nk = (uintptr_t*)_mi_os_zalloc(cap * (sizeof(uintptr_t) + sizeof(uint32_t)), &memid);
+  uintptr_t* nk = (uintptr_t*)_mi_os_zalloc(_mi_subproc_main(), cap * (sizeof(uintptr_t) + sizeof(uint32_t)), &memid);
   if (nk == NULL) return;
   mi_prof.ht_keys = nk;
   mi_prof.ht_vals = (uint32_t*)(nk + cap);
@@ -143,7 +144,7 @@ static mi_prof_sample_t* mi_prof_samples_push(void) {
   if (mi_prof.sample_count == mi_prof.sample_cap) {
     size_t ncap = (mi_prof.sample_cap == 0 ? 1024 : mi_prof.sample_cap * 2);
     mi_memid_t memid;
-    mi_prof_sample_t* ns = (mi_prof_sample_t*)_mi_os_zalloc(ncap * sizeof(mi_prof_sample_t), &memid);
+    mi_prof_sample_t* ns = (mi_prof_sample_t*)_mi_os_zalloc(_mi_subproc_main(), ncap * sizeof(mi_prof_sample_t), &memid);
     if (ns == NULL) return NULL;
     if (mi_prof.samples != NULL) {
       _mi_memcpy(ns, mi_prof.samples, mi_prof.sample_count * sizeof(mi_prof_sample_t));
@@ -574,7 +575,7 @@ static int mi_prof_dump_pb(mi_pb_t* wp) {
   // Unique-address collection:
   size_t loc_cap = 4096;
   mi_memid_t lm;
-  mi_prof_loc_t* locs = (mi_prof_loc_t*)_mi_os_zalloc(loc_cap * sizeof(mi_prof_loc_t), &lm);
+  mi_prof_loc_t* locs = (mi_prof_loc_t*)_mi_os_zalloc(_mi_subproc_main(), loc_cap * sizeof(mi_prof_loc_t), &lm);
   size_t nlocs = 0;
 
   mi_lock(&mi_prof.lock) {

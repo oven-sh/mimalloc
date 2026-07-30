@@ -1,5 +1,5 @@
 /* ----------------------------------------------------------------------------
-Copyright (c) 2018-2025, Microsoft Research, Daan Leijen
+Copyright (c) 2018-2026, Microsoft Research, Daan Leijen
 This is free software; you can redistribute it and/or modify it under the
 terms of the MIT license. A copy of the license can be found in the file
 "LICENSE" at the root of this distribution.
@@ -8,7 +8,8 @@ terms of the MIT license. A copy of the license can be found in the file
 #include "mimalloc-stats.h"
 #include "mimalloc/internal.h"
 #include "mimalloc/atomic.h"
-#include "mimalloc/prim.h"
+#include "mimalloc/prim.h"       // _mi_prim_clock_now, mi_process_info_t
+#include "mimalloc/prim-tls.h"
 
 #include <string.h> // memset
 
@@ -455,8 +456,9 @@ static const mi_stats_t* mi_heap_get_stats(mi_heap_t* heap) {
 // deprecated
 void mi_stats_reset(void) mi_attr_noexcept {
   if (!mi_theap_is_initialized(_mi_theap_default())) return;
-  mi_heap_get_stats(mi_heap_main());
-  mi_heap_stats_merge_to_subproc(mi_heap_main());
+  mi_heap_t* heap_main = mi_heap_main();
+  mi_heap_get_stats(heap_main);
+  mi_heap_stats_merge_to_subproc(heap_main);
 }
 
 

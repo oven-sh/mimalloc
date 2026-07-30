@@ -15,6 +15,7 @@ terms of the MIT license. A copy of the license can be found in the file
 #include "mimalloc/internal.h"
 #include "mimalloc/atomic.h"
 #include "mimalloc/prim.h"
+#include "mimalloc/prim-tls.h"
 #include <stdio.h>
 
 /* -----------------------------------------------------------
@@ -171,6 +172,10 @@ static bool mi_page_is_valid_init(mi_page_t* page) {
   mi_assert_internal(mi_page_block_size(page) > 0);
   mi_assert_internal(page->used <= page->capacity);
   mi_assert_internal(page->capacity <= page->reserved);
+  
+  mi_assert_internal(page->heap!=NULL);
+  mi_theap_t* const page_theap = _mi_heap_theap_peek(page->heap);
+  mi_assert_internal(page_theap == NULL || mi_page_theap(page)==page_theap);
 
   // const size_t bsize = mi_page_block_size(page);
   // uint8_t* start = mi_page_start(page);
@@ -186,7 +191,7 @@ static bool mi_page_is_valid_init(mi_page_t* page) {
       mi_assert_expensive(mi_mem_is_zero(block + 1, ubsize - sizeof(mi_block_t)));
     }
   }
-  #endif
+  #endif 
 
   #if !MI_TRACK_ENABLED && !MI_TSAN
   mi_block_t* tfree = mi_page_thread_free(page);
@@ -232,6 +237,9 @@ bool _mi_page_is_valid(mi_page_t* page) {
   }
   if (!mi_page_is_abandoned(page)) {
     //mi_assert_internal(!_mi_process_is_initialized);
+    mi_assert_internal(page->heap!=NULL);
+    mi_theap_t* const page_theap = _mi_heap_theap_peek(page->heap);
+    mi_assert_internal(page_theap == NULL || mi_page_theap(page)==page_theap);
     {
       mi_page_queue_t* pq = mi_page_queue_of(page);
       mi_assert_internal(mi_page_queue_contains(pq, page));
@@ -529,7 +537,7 @@ static void mi_page_unpurge_range(mi_page_t* page, size_t k0, size_t k1, bool di
   const size_t os_size = _mi_os_page_size();
   const uintptr_t dstart = mi_page_purge_base(page) + (k0 * os_size);
   const size_t dsize = ((k1 - k0) + 1) * os_size;
-  if (discarded) { _mi_os_reuse((void*)dstart, dsize); }
+  if (discarded) { _mi_os_reuse(mi_page_subproc(page), (void*)dstart, dsize); }
 
   // clear the bits first: `mi_page_block_index_is_purged` then tells us exactly which
   // blocks are whole again
@@ -634,7 +642,7 @@ static void mi_page_purge_unformed_tail(mi_page_t* page) {
   }
   if (dlo >= hi) return;   // nothing new
 
-  if (!_mi_os_discard((void*)dlo, (size_t)(hi - dlo))) return;   // the discard failed: leave the page as it was
+  if (!_mi_os_discard(mi_page_subproc(page), (void*)dlo, (size_t)(hi - dlo))) return;   // the discard failed: leave the page as it was
   page->unformed_purged_lo = (uint32_t)(lo - pstart);
   page->unformed_purged_hi = (uint32_t)(hi - pstart);
   mi_atomic_addi64_relaxed(&mi_holes_unformed_discard_calls, 1);
@@ -659,7 +667,7 @@ void _mi_page_unpurge_unformed_upto(mi_page_t* page, uintptr_t end) {
   }
   if (rend <= rlo) return;   // nothing of the discarded tail is needed yet
 
-  _mi_os_reuse((void*)rlo, (size_t)(rend - rlo));
+  _mi_os_reuse(mi_page_subproc(page), (void*)rlo, (size_t)(rend - rlo));
   if (rend >= rhi) { page->unformed_purged_lo = 0; page->unformed_purged_hi = 0; }
   else { page->unformed_purged_lo = (uint32_t)(rend - pstart); }
   mi_atomic_addi64_relaxed(&mi_holes_unformed_reuse_calls, 1);
@@ -748,7 +756,7 @@ static bool mi_page_purge_holes_walk(mi_page_t* page) {
     const size_t k0 = k;
     while (k < nbits && mi_page_bits_at(todo, k)) { k++; }
     const size_t dsize = (k - k0) * os_size;
-    if (_mi_os_discard((void*)(mi_page_purge_base(page) + (k0 * os_size)), dsize)) {
+    if (_mi_os_discard(mi_page_subproc(page), (void*)(mi_page_purge_base(page) + (k0 * os_size)), dsize)) {
       mi_holes_count_discard(dsize);
     }
     else {
@@ -836,7 +844,7 @@ void _mi_page_unpurge_all(mi_page_t* page) {
     const size_t k0 = k;
     while (k < MI_PAGE_PURGE_BITS && mi_page_os_page_purged(page, k)) { k++; }
     const size_t dsize = (k - k0) * os_size;
-    _mi_os_reuse((void*)(base + (k0 * os_size)), dsize);
+    _mi_os_reuse(mi_page_subproc(page), (void*)(base + (k0 * os_size)), dsize);
     size_t first, last, first1, last1;
     if (mi_page_os_page_blocks(page, k0, &first, &last) &&
         mi_page_os_page_blocks(page, k - 1, &first1, &last1)) {
@@ -1248,24 +1256,6 @@ void _mi_page_free_collect_partly(mi_page_t* page, mi_block_t* head) {
   Page fresh and retire
 ----------------------------------------------------------- */
 
-/*
-// called from segments when reclaiming abandoned pages
-void _mi_page_reclaim(mi_theap_t* theap, mi_page_t* page) {
-  // mi_page_set_theap(page, theap);
-  // _mi_page_use_delayed_free(page, MI_USE_DELAYED_FREE, true); // override never (after theap is set)
-  _mi_page_free_collect(page, false); // ensure used count is up to date
-
-  mi_assert_expensive(mi_page_is_valid_init(page));
-  // mi_assert_internal(mi_page_theap(page) == theap);
-  // mi_assert_internal(mi_page_thread_free_flag(page) != MI_NEVER_DELAYED_FREE);
-
-  // TODO: push on full queue immediately if it is full?
-  mi_page_queue_t* pq = mi_theap_page_queue_of(theap, page);
-  mi_page_queue_push(theap, pq, page);
-  mi_assert_expensive(_mi_page_is_valid(page));
-}
-*/
-
 // called from `mi_free` on a reclaim, and fresh_alloc if we get an abandoned page
 void _mi_theap_page_reclaim(mi_theap_t* theap, mi_page_t* page)
 {
@@ -1655,7 +1645,7 @@ static bool mi_page_extend_free(mi_theap_t* theap, mi_page_t* page) {
     const size_t needed_commit = _mi_align_up( mi_page_slice_offset_of(page, needed_size), MI_PAGE_MIN_COMMIT_SIZE );
     if (needed_commit > page->slice_committed) {
       mi_assert_internal(((needed_commit - page->slice_committed) % _mi_os_page_size()) == 0);
-      if (!_mi_os_commit(mi_page_slice_start(page) + page->slice_committed, needed_commit - page->slice_committed, NULL)) {
+      if (!_mi_os_commit(_mi_theap_subproc(theap), mi_page_slice_start(page) + page->slice_committed, needed_commit - page->slice_committed, NULL)) {
         return false;
       }
       mi_assert_internal(needed_commit < UINT32_MAX);
@@ -1688,8 +1678,8 @@ static bool mi_page_extend_free(mi_theap_t* theap, mi_page_t* page) {
 mi_decl_nodiscard bool _mi_page_init(mi_theap_t* theap, mi_page_t* page) {
   mi_assert(page != NULL);
   mi_assert(theap!=NULL);
-  page->heap = (_mi_is_heap_main(_mi_theap_heap(theap)) ? NULL : _mi_theap_heap(theap)); // faster for `mi_page_associated_theap`
-  mi_page_set_theap(page, theap);
+  // page->heap = (_mi_is_heap_main(_mi_theap_heap(theap)) ? NULL : _mi_theap_heap(theap)); // faster for `mi_page_associated_theap`
+  // mi_page_set_theap(page, theap);
 
   _mi_page_purged_reset(page);   // fresh page: no holes
 
@@ -1709,6 +1699,8 @@ mi_decl_nodiscard bool _mi_page_init(mi_theap_t* theap, mi_page_t* page) {
   }
   #endif
 
+  mi_assert_internal(page->heap != NULL);
+  mi_assert_internal(page->heap == _mi_theap_heap(theap));
   mi_assert_internal(page->theap!=NULL);
   mi_assert_internal(page->theap == mi_page_theap(page));
   mi_assert_internal(page->capacity == 0);
@@ -1983,10 +1975,8 @@ void* _mi_malloc_generic(mi_theap_t* theap, size_t size, size_t zero_huge_alignm
       return NULL;
     }
     // otherwise we initialize the thread and its default theap
-    mi_thread_init();
-    theap = _mi_theap_default();
-    if mi_unlikely(!mi_theap_is_initialized(theap)) { return NULL; }
-    mi_assert_internal(_mi_theap_default()==theap);
+    theap = _mi_thread_init();
+    if mi_unlikely(!mi_theap_is_initialized(theap)) { return NULL; }    
   }
   mi_assert_internal(mi_theap_is_initialized(theap));
 

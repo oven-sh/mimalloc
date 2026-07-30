@@ -1,6 +1,6 @@
 
 /* ----------------------------------------------------------------------------
-Copyright (c) 2018-2025, Microsoft Research, Daan Leijen
+Copyright (c) 2018-2026, Microsoft Research, Daan Leijen
 This is free software; you can redistribute it and/or modify it under the
 terms of the MIT license. A copy of the license can be found in the file
 "LICENSE" at the root of this distribution.
@@ -12,7 +12,7 @@ terms of the MIT license. A copy of the license can be found in the file
 #include "mimalloc.h"
 #include "mimalloc/internal.h"
 #include "mimalloc/atomic.h"
-#include "mimalloc/prim.h"   // _mi_prim_thread_id()
+#include "mimalloc/prim-tls.h"   // _mi_prim_thread_id()
 
 #include <string.h>      // memset, strlen (for mi_strdup)
 #include <stdlib.h>      // malloc, abort
@@ -252,7 +252,7 @@ mi_decl_nodiscard extern inline mi_decl_restrict void* mi_theap_malloc(mi_theap_
 }
 
 mi_decl_nodiscard mi_decl_restrict void* mi_malloc(size_t size) mi_attr_noexcept {
-   return mi_theap_malloc(_mi_theap_default(), size);
+  return mi_theap_malloc(_mi_theap_default(), size);
 }
 
 mi_decl_nodiscard mi_decl_restrict void* mi_heap_malloc(mi_heap_t* heap, size_t size) mi_attr_noexcept {
@@ -305,7 +305,7 @@ mi_decl_nodiscard mi_decl_restrict void* mi_heap_calloc(mi_heap_t* heap, size_t 
 // Return usable size
 mi_decl_nodiscard mi_decl_restrict void* mi_umalloc_small(size_t size, size_t* usable) mi_attr_noexcept {
   return mi_theap_malloc_small_zero(_mi_theap_default(), size, false, usable);
-}
+} 
 
 mi_decl_nodiscard mi_decl_restrict void* mi_theap_umalloc(mi_theap_t* theap, size_t size, size_t* usable) mi_attr_noexcept {
   return _mi_theap_malloc_zero_ex(theap, size, false, 0, usable);
@@ -369,8 +369,13 @@ void* _mi_theap_realloc_zero(mi_theap_t* theap, void* p, size_t newsize, bool ze
     size = 0;
     if (usable_pre!=NULL) { *usable_pre = 0; }
   }
-  else {
-    page = mi_validate_ptr_page(p,"mi_realloc");
+  else {    
+    page = mi_validate_ptr_page(p,"mi_realloc"); 
+    if mi_unlikely(page==NULL) {  // invalid pointer
+      if (usable_pre!=NULL) { *usable_pre = 0; }
+      if (usable_post!=NULL) { *usable_post = 0; }  
+      return NULL;
+    } 
     size = _mi_usable_size(p,page);
     if (usable_pre!=NULL) { *usable_pre = mi_page_usable_block_size(page); }
   }
@@ -786,8 +791,8 @@ mi_decl_nodiscard void* mi_new_reallocn(void* p, size_t newcount, size_t size) {
 // We then set the first word of the block to `0` for regular offset aligned allocations (in `alloc-aligned.c`)
 // and the first word to `~0` for guarded allocations to have a correct `mi_usable_size`
 
-static void* mi_block_ptr_set_guarded(mi_block_t* block, size_t obj_size) {
-  // TODO: we can still make padding work by moving it out of the guard page area
+static void* mi_block_ptr_set_guarded(mi_block_t* block, size_t obj_size, size_t* usable_size) {
+  // todo: we can still make padding work by moving it out of the guard page area
   mi_page_t* const page = _mi_ptr_page(block);
   mi_page_set_has_interior_pointers(page, true);
   block->next = MI_BLOCK_TAG_GUARDED;
@@ -824,7 +829,8 @@ static void* mi_block_ptr_set_guarded(mi_block_t* block, size_t obj_size) {
     offset = MI_PAGE_MAX_OVERALLOC_ALIGN;
   }
   uint8_t* const p = (uint8_t*)block + offset;
-  mi_assert_internal(p == guard_page - obj_size);
+  mi_assert_internal(p == guard_page - obj_size || offset >= MI_PAGE_MAX_OVERALLOC_ALIGN);
+  if (usable_size != NULL) { *usable_size = (guard_page - p); mi_assert_internal(mi_usable_size(p)==*usable_size); }
   mi_track_align(block, p, offset, obj_size);
   mi_track_mem_defined(block, sizeof(mi_block_t));
   return p;
@@ -844,14 +850,15 @@ mi_decl_restrict void* _mi_theap_malloc_guarded(mi_theap_t* theap, size_t size, 
   const size_t req_size = _mi_align_up(bsize + os_page_size, os_page_size);  
   mi_block_t* const block = (mi_block_t*)_mi_malloc_generic(theap, req_size, 0 /* don't zero */, NULL);
   if (block==NULL) return NULL;
-  void* const p = mi_block_ptr_set_guarded(block, obj_size);
+  size_t usable_size = 0;
+  void* const p = mi_block_ptr_set_guarded(block, obj_size, &usable_size);
   if (p == NULL) return p;
   if (zero) { 
     _mi_memzero_aligned(p,obj_size);  // we have to zero here as padding might have written here (if the blocksize > reqsize + os_page_size)
   }
 
   // stats
-  mi_track_malloc(p, obj_size, zero);    
+  mi_track_malloc(p, usable_size, zero);    
   if (!mi_theap_is_initialized(theap)) { theap = _mi_theap_default(); }
   mi_theap_stat_counter_increase(theap, malloc_guarded_count, 1);
   #if MI_STAT>1
