@@ -1,5 +1,5 @@
 /* ----------------------------------------------------------------------------
-Copyright (c) 2018-2025, Microsoft Research, Daan Leijen
+Copyright (c) 2018-2026, Microsoft Research, Daan Leijen
 This is free software; you can redistribute it and/or modify it under the
 terms of the MIT license. A copy of the license can be found in the file
 "LICENSE" at the root of this distribution.
@@ -277,6 +277,7 @@ static inline bool mi_memkind_needs_no_free(mi_memkind_t memkind) {
   return (memkind <= MI_MEM_STATIC);
 }
 
+typedef struct mi_meta_page_s mi_meta_page_t;
 
 typedef struct mi_memid_os_info {
   void*         base;               // actual base address of the block (used for offset aligned allocations)
@@ -291,9 +292,9 @@ typedef struct mi_memid_arena_info {
 } mi_memid_arena_info_t;
 
 typedef struct mi_memid_meta_info {
-  void*         meta_page;          // meta-page that contains the block
-  uint32_t      block_index;        // block index in the meta-data page
-  uint32_t      block_count;        // allocated blocks
+  mi_meta_page_t* meta_page;        // meta-page that contains the block
+  uint32_t        block_index;      // block index in the meta-data page
+  uint32_t        block_count;      // allocated blocks
 } mi_memid_meta_info_t;
 
 typedef struct mi_memid_s {
@@ -551,6 +552,7 @@ typedef struct mi_padding_s {
 struct mi_theap_s {
   mi_tld_t*             tld;                                 // thread-local data
   _Atomic(mi_heap_t*)   heap;                                // the heap this theap belongs to.
+  _Atomic(mi_subproc_t*)subproc;                             // subproc this belongs too (always `subproc == heap->subproc` but needed for safe destruction)
   _Atomic(size_t)       refcount;                            // reference count
   _Atomic(size_t)       freed;                               // ensure atomic free-ing
   unsigned long long    heartbeat;                           // monotonic heartbeat count
@@ -640,6 +642,7 @@ struct mi_subproc_s {
   size_t                subproc_seq;                    // unique id for sub-processes
   mi_subproc_t*         next;                           // list of all sub-processes
   mi_subproc_t*         prev;
+  _Atomic(mi_meta_page_t*) meta_pages;                  // meta data pages
 
   _Atomic(size_t)       arena_count;                    // current count of arena's
   _Atomic(mi_arena_t*)  arenas[MI_MAX_ARENAS];          // arena's of this sub-process
@@ -662,6 +665,7 @@ struct mi_subproc_s {
   _Atomic(size_t)       heap_total_count;               // total created heaps in this sub-process
 
   mi_memid_t            memid;                          // provenance of this memory block (meta or static)
+  mi_subproc_t*         parent;                         // subproc in which this one was allocated
   mi_decl_align(8)                                      // needed on some 32-bit platforms
   mi_stats_t            stats;                          // subprocess statistics; updated for arena/OS stats like committed,
                                                         // and otherwise merged with heap stats when those are deleted

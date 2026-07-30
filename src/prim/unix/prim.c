@@ -1,5 +1,5 @@
 /* ----------------------------------------------------------------------------
-Copyright (c) 2018-2025, Microsoft Research, Daan Leijen
+Copyright (c) 2018-2026, Microsoft Research, Daan Leijen
 This is free software; you can redistribute it and/or modify it under the
 terms of the MIT license. A copy of the license can be found in the file
 "LICENSE" at the root of this distribution.
@@ -79,7 +79,7 @@ terms of the MIT license. A copy of the license can be found in the file
 #define MADV_FREE  POSIX_MADV_FREE
 #endif
 
-#define MI_UNIX_LARGE_PAGE_SIZE (2*MI_MiB) // TODO: can we query the OS for this?
+#define MI_UNIX_LARGE_PAGE_SIZE (2*MI_MiB) // todo: can we query the OS for this?
 
 //------------------------------------------------------------------------------------
 // Use syscalls for some primitives to allow for libraries that override open/read/close etc.
@@ -235,7 +235,7 @@ static size_t unix_detect_virtual_address_bits(void) {
     if (fd >= 0) {
       char buf[2048];
       const ssize_t nread = mi_prim_read(fd, &buf, sizeof(buf));
-      mi_prim_close(fd);      
+      mi_prim_close(fd);
       if ((nread >= 1) && (nread <= (ssize_t)sizeof(buf))) {
         if (_mi_strnstr(buf, nread, "sv39")) { return 39; }
         else if (_mi_strnstr(buf, nread, "sv48")) { return 48; }
@@ -702,7 +702,7 @@ int _mi_prim_alloc_huge_os_pages(void* hint_addr, size_t size, int numa_node, bo
   *addr = unix_mmap(hint_addr, size, MI_ARENA_SLICE_ALIGN, PROT_READ | PROT_WRITE, true, true, &is_large);
   if (*addr != NULL && numa_node >= 0 && numa_node < 8*MI_INTPTR_SIZE) { // at most 64 nodes
     unsigned long numa_mask = (1UL << numa_node);
-    // TODO: does `mbind` work correctly for huge OS pages? should we
+    // todo: does `mbind` work correctly for huge OS pages? should we
     // use `set_mempolicy` before calling mmap instead?
     // see: <https://lkml.org/lkml/2017/2/9/875>
     long err = mi_prim_mbind(*addr, size, MPOL_PREFERRED, &numa_mask, 8*MI_INTPTR_SIZE, 0);
@@ -777,7 +777,7 @@ size_t _mi_prim_numa_node_count(void) {
 #elif defined(__DragonFly__)
 
 size_t _mi_prim_numa_node(void) {
-  // TODO: DragonFly does not seem to provide any userland means to get this information.
+  // todo: DragonFly does not seem to provide any userland means to get this information.
   return 0ul;
 }
 
@@ -810,7 +810,7 @@ size_t _mi_prim_numa_node_count(void) {
 // low resolution timer
 static mi_msecs_t mi_prim_clock_now_lowres(void) {
   const int64_t ticks = (int64_t)clock();
-  #if !defined(CLOCKS_PER_SEC) 
+  #if !defined(CLOCKS_PER_SEC)
     return ticks;
   #else
     if (CLOCKS_PER_SEC <= 0 || CLOCKS_PER_SEC == 1000) {
@@ -832,12 +832,12 @@ mi_msecs_t _mi_prim_clock_now(void) {
     #else
     const clockid_t clockid = CLOCK_REALTIME;
     #endif
-    struct timespec t;  
+    struct timespec t;
     if (clock_gettime(clockid,&t) == 0) {
       return ((mi_msecs_t)t.tv_sec * 1000) + ((mi_msecs_t)t.tv_nsec / 1000000L);
     }
-  #endif  
-  return mi_prim_clock_now_lowres();  
+  #endif
+  return mi_prim_clock_now_lowres();
 }
 
 
@@ -1095,7 +1095,7 @@ bool _mi_prim_random_buf(void* buf, size_t buf_len) {
 
 // use pthread local storage keys to detect thread ending
 // (and used with MI_TLS_PTHREADS for the default theap)
-pthread_key_t _mi_heap_default_key = (pthread_key_t)(-1);
+pthread_key_t _mi_heap_default_key = MI_PTHREAD_KEY_INVALID;
 
 static void mi_pthread_done(void* value) {
   if (value!=NULL) {
@@ -1104,25 +1104,24 @@ static void mi_pthread_done(void* value) {
 }
 
 void _mi_prim_thread_init_auto_done(void) {
-  mi_assert_internal(_mi_heap_default_key == (pthread_key_t)(-1));
-  const int err = pthread_key_create(&_mi_heap_default_key, &mi_pthread_done);
-  if (err!=0) {
-    _mi_error_message(err,"unable to create a pthread thread local key (error %d (0x%x))", err, err);
-    _mi_heap_default_key = (pthread_key_t)(-1);
-  };
+  mi_assert_internal(_mi_heap_default_key == MI_PTHREAD_KEY_INVALID);
+  pthread_key_create(&_mi_heap_default_key, &mi_pthread_done);
 }
 
 void _mi_prim_thread_done_auto_done(void) {
-  if (_mi_heap_default_key != (pthread_key_t)(-1)) {  // do not leak the key, see issue #809
-    pthread_key_delete(_mi_heap_default_key);
+  pthread_key_t key = _mi_heap_default_key;
+  if (key != MI_PTHREAD_KEY_INVALID) {  // do not leak the key, see issue #809
+    _mi_heap_default_key = MI_PTHREAD_KEY_INVALID;
+    pthread_key_delete(key);
   }
 }
 
 void _mi_prim_thread_associate_default_theap(mi_theap_t* theap) {
-  if (_mi_heap_default_key != (pthread_key_t)(-1)) {  // can happen during recursive invocation on freeBSD
+  if (_mi_heap_default_key != MI_PTHREAD_KEY_INVALID) {  // can happen during recursive invocation on freeBSD
     pthread_setspecific(_mi_heap_default_key, theap);
   }
 }
+
 
 #else
 
