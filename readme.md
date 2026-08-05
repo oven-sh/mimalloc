@@ -376,7 +376,9 @@ Advanced options:
 Further options for large workloads and services:
 
 - `MIMALLOC_ALLOW_THP=1`: By default always allow transparent huge pages (THP) on Linux systems. On Android only this is
-   by default off. When set to `0`, THP is disabled for the process that mimalloc runs in. If enabled, mimalloc also sets
+   by default off. When set to `0`, mimalloc opts the memory it maps itself out of
+   THP (per mapping, so this does not affect programs spawned by the process, nor memory handed to mimalloc via
+   `mi_manage_os_memory`). If enabled, mimalloc also sets
    the `MIMALLOC_MINIMAL_PURGE_SIZE` in v3 to 2MiB to avoid potentially breaking up transparent huge pages when purging memory.
 - `MIMALLOC_USE_NUMA_NODES=N`: pretend there are at most `N` NUMA nodes. If not set, the actual NUMA nodes are detected
    at runtime. Setting `N` to 1 may avoid problems in some virtual environments. Also, setting it to a lower number than

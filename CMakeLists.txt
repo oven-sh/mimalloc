@@ -44,7 +44,7 @@ option(MI_SKIP_COLLECT_ON_EXIT "Skip collecting memory on program exit" OFF)
 option(MI_NO_PROCESS_DETACH "Skip automatic mi_process_done at process exit (embedder calls it manually or not at all)" OFF)
 option(MI_NO_PADDING        "Force no use of padding even in DEBUG mode etc." OFF)
 option(MI_INSTALL_TOPLEVEL  "Install directly into $CMAKE_INSTALL_PREFIX instead of PREFIX/lib/mimalloc-version" OFF)
-option(MI_NO_THP            "Disable transparent huge pages support on Linux/Android for the mimalloc process only" OFF)
+option(MI_NO_THP            "Opt the memory mimalloc maps out of transparent huge pages on Linux/Android (sets MI_DEFAULT_ALLOW_THP=0)" OFF)
 option(MI_EXTRA_CPPDEFS     "Extra pre-processor definitions (use as `-DMI_EXTRA_CPPDEFS=\"opt1=val1;opt2=val2\"`)" "")
 option(MI_SEE_ASM           "Generate assembly files" OFF)
 

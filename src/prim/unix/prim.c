@@ -31,7 +31,7 @@ terms of the MIT license. A copy of the license can be found in the file
 
 #if defined(__linux__)
   #include <features.h>
-  #include <sys/prctl.h>    // THP disable, PR_SET_VMA
+  #include <sys/prctl.h>    // PR_SET_VMA
   #include <sys/sysinfo.h>  // sysinfo
   #if defined(__GLIBC__) && !defined(PR_SET_VMA)
   #include <linux/prctl.h>
@@ -262,18 +262,14 @@ void _mi_prim_mem_init( mi_os_mem_config_t* config )
   config->has_transparent_huge_pages = unix_detect_thp();
   config->virtual_address_bits = unix_detect_virtual_address_bits();
 
-  // disable transparent huge pages for this process?
-  #if (defined(__linux__) || defined(__ANDROID__)) && defined(PR_GET_THP_DISABLE)
-  if (!mi_option_is_enabled(mi_option_allow_thp)) // disable THP if requested through an option
-  {
+  // If THP is not allowed, mimalloc's own mappings opt out individually with
+  // `MADV_NOHUGEPAGE` (see `unix_mmap`). We deliberately do not use
+  // `prctl(PR_SET_THP_DISABLE)`: that flag is process-wide, inherited by `fork`, and
+  // preserved across `execve`, so it would also disable THP (including explicit
+  // `MADV_HUGEPAGE` requests) in every program this process ever spawns.
+  if (!mi_option_is_enabled(mi_option_allow_thp)) {
     config->has_transparent_huge_pages = false;
-    if (prctl(PR_GET_THP_DISABLE, 0, 0, 0, 0) == 0) {   // -1 on error, 1 if already disabled
-      // Most likely since distros often come with always/madvise settings.
-      // Disabling only for mimalloc process rather than touching system wide settings
-      (void)prctl(PR_SET_THP_DISABLE, 1, 0, 0, 0);
-    }
   }
-  #endif
 }
 
 
@@ -472,6 +468,16 @@ static void* unix_mmap(void* addr, size_t size, size_t try_alignment, int protec
         // *is_large = true; // possibly
       }
       #endif
+    }
+    #endif
+    #if defined(__linux__) && defined(MADV_NOHUGEPAGE)
+    if (p != NULL && !mi_option_is_enabled(mi_option_allow_thp)) {
+      // Otherwise, under THP mode `always` (or a per-size mTHP `always`), the kernel backs this
+      // mapping with huge pages on fault and via khugepaged, inflating RSS for sparsely used
+      // regions and splitting huge pages on every sub-2MiB purge. Opt out per mapping (a VMA
+      // flag, dropped at `execve`) rather than per process so spawned programs keep the system
+      // THP policy. Under `madvise`/`never` this only sets the flag and is otherwise a no-op.
+      (void)unix_madvise(p, size, MADV_NOHUGEPAGE);
     }
     #endif
   }
