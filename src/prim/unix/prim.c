@@ -262,11 +262,9 @@ void _mi_prim_mem_init( mi_os_mem_config_t* config )
   config->has_transparent_huge_pages = unix_detect_thp();
   config->virtual_address_bits = unix_detect_virtual_address_bits();
 
-  // If THP is not allowed, mimalloc's own mappings opt out individually with
-  // `MADV_NOHUGEPAGE` (see `unix_mmap`). We deliberately do not use
-  // `prctl(PR_SET_THP_DISABLE)`: that flag is process-wide, inherited by `fork`, and
-  // preserved across `execve`, so it would also disable THP (including explicit
-  // `MADV_HUGEPAGE` requests) in every program this process ever spawns.
+  // With THP disallowed, mimalloc's mappings opt out individually via MADV_NOHUGEPAGE in
+  // `unix_mmap` -- not prctl(PR_SET_THP_DISABLE), which is process-wide and inherited across
+  // fork/execve, so it would also disable THP in every program this process spawns.
   if (!mi_option_is_enabled(mi_option_allow_thp)) {
     config->has_transparent_huge_pages = false;
   }
@@ -472,11 +470,9 @@ static void* unix_mmap(void* addr, size_t size, size_t try_alignment, int protec
     #endif
     #if defined(__linux__) && defined(MADV_NOHUGEPAGE)
     if (p != NULL && !mi_option_is_enabled(mi_option_allow_thp)) {
-      // Otherwise, under THP mode `always` (or a per-size mTHP `always`), the kernel backs this
-      // mapping with huge pages on fault and via khugepaged, inflating RSS for sparsely used
-      // regions and splitting huge pages on every sub-2MiB purge. Opt out per mapping (a VMA
-      // flag, dropped at `execve`) rather than per process so spawned programs keep the system
-      // THP policy. Under `madvise`/`never` this only sets the flag and is otherwise a no-op.
+      // VMA-level opt-out (dropped at execve, so children keep the system policy). Under THP
+      // `always`/mTHP this avoids 2MiB faults into sparse regions and huge-page splits on
+      // sub-2MiB purges, and keeps khugepaged from re-collapsing purged ranges; else a no-op.
       (void)unix_madvise(p, size, MADV_NOHUGEPAGE);
     }
     #endif
