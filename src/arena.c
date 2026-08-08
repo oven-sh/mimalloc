@@ -1362,7 +1362,7 @@ static bool mi_arena_page_purge_holes_at(size_t slice_index, size_t slice_count,
     _mi_page_holes_count_page_freed();
     return true;
   }
-  _mi_page_purge_holes(page);
+  _mi_page_purge_holes(page, parg->tld);
   mi_bitmap_set(bitmap, slice_index);     // back in the map *before* unowning: unown may free the page
   mi_abandoned_page_unown(page, NULL);
   return true;
@@ -1374,7 +1374,7 @@ static bool mi_arena_page_purge_holes_at(size_t slice_index, size_t slice_count,
 void _mi_arenas_purge_abandoned_holes(mi_heap_t* heap, mi_tld_t* tld) {
   if (heap == NULL) return;
   if (!mi_option_is_enabled(mi_option_purge_holes)) return;
-  _mi_page_purge_holes_begin();
+  _mi_page_purge_holes_begin(tld);
   mi_forall_arenas(heap, ((mi_arena_t*)NULL), 0, arena) {
     mi_arena_pages_t* const arena_pages = mi_heap_arena_pages(heap, arena);
     if (arena_pages != NULL) {
@@ -1389,7 +1389,7 @@ void _mi_arenas_purge_abandoned_holes(mi_heap_t* heap, mi_tld_t* tld) {
     }
   }
   mi_forall_arenas_end();
-  _mi_page_purge_holes_end();
+  _mi_page_purge_holes_end(tld);
 }
 
 // The read-only counterpart of the sweep above: account for the holes in the abandoned pages
@@ -1459,6 +1459,72 @@ void _mi_arenas_holes_committed(mi_heap_t* heap, mi_holes_report_t* rep) {
   mi_forall_arenas_end();
 }
 
+
+// Heap-image restore: every arena that exists right now holds image memory. Make them exclusive (to nobody) so no
+// theap on any thread places new blocks in their free space; new memory comes from arenas created after this call.
+void mi_arenas_seal_existing(void) mi_attr_noexcept {
+  mi_subproc_t* subproc = _mi_subproc_main();
+  const size_t n = mi_arenas_get_count(subproc);
+  for (size_t i = 0; i < n; i++) {
+    mi_arena_t* arena = mi_arena_from_index(subproc, i);
+    if (arena != NULL) { arena->is_exclusive = true; }
+  }
+}
+
+static bool mi_arena_abandoned_bit_clear(size_t slice_index, size_t slice_count, mi_arena_t* arena, void* arg) {
+  MI_UNUSED(slice_count); MI_UNUSED(arena);
+  mi_bitmap_clear((mi_bitmap_t*)arg, slice_index);
+  return true;
+}
+
+static bool mi_arena_page_freeze(size_t slice_index, size_t slice_count, mi_arena_t* arena, void* arg) {
+  MI_UNUSED(slice_count); MI_UNUSED(arg);
+  mi_page_t* page = mi_arena_page_at_slice(arena, slice_index);
+  mi_atomic_store_release(&page->xthread_id, (mi_threadid_t)MI_THREADID_FROZEN);
+  return true;
+}
+
+// Heap image build: every page that exists right now is about to be written into the image. Owned by MI_THREADID_FROZEN,
+// frees of their blocks in the restored process (or in what is left of this one) take the cross-thread path and are dropped
+// there, so image pages are never dirtied by the allocator. Done here, in the builder, so the restore writes nothing.
+void mi_arenas_freeze_pages(void) mi_attr_noexcept {
+  mi_subproc_t* subproc = _mi_subproc_main();
+  const size_t n = mi_arenas_get_count(subproc);
+  mi_lock(&subproc->heaps_lock) {
+    for (mi_heap_t* heap = subproc->heaps; heap != NULL; heap = heap->next) {   // page bitmaps are kept per heap
+      for (size_t i = 0; i < n; i++) {
+        mi_arena_t* arena = mi_arena_from_index(subproc, i);
+        if (arena == NULL) continue;
+        mi_arena_pages_t* arena_pages = mi_heap_arena_pages(heap, arena);
+        if (arena_pages == NULL) continue;
+        (void)_mi_bitmap_forall_set(arena_pages->pages, &mi_arena_page_freeze, arena, NULL);
+        // A frozen page must not be findable as abandoned either: reclaiming it (or sweeping its holes) would allocate into
+        // and rewrite image memory. Everything abandoned at this point is image memory, so the heap's counts go to zero.
+        for (size_t bin = 0; bin < MI_ARENA_BIN_COUNT; bin++) {
+          mi_bitmap_t* const abandoned = arena_pages->pages_abandoned[bin];
+          (void)_mi_bitmap_forall_set(abandoned, &mi_arena_abandoned_bit_clear, arena, abandoned);
+        }
+      }
+      for (size_t bin = 0; bin < MI_BIN_COUNT; bin++) { mi_atomic_store_relaxed(&heap->abandoned_count[bin], 0); }
+    }
+  }
+}
+
+// Visit every maximal run of free slices (belonging to no page) across all arenas of `heap`'s subproc.
+void mi_arenas_visit_free_ranges(mi_heap_t* heap, void (*visit)(void* start, size_t size, void* arg), void* arg) mi_attr_noexcept {
+  if (heap == NULL || visit == NULL) return;
+  mi_forall_arenas(heap, ((mi_arena_t*)NULL), 0, arena) {
+    const size_t slice_count = arena->slice_count;
+    size_t i = 0;
+    while (i < slice_count) {
+      if (!mi_bbitmap_is_setN(arena->slices_free, i, 1)) { i++; continue; }
+      size_t j = i; while (j < slice_count && mi_bbitmap_is_setN(arena->slices_free, j, 1)) j++;
+      visit(mi_arena_slice_start(arena, i), mi_size_of_slices(j - i), arg);
+      i = j;
+    }
+  }
+  mi_forall_arenas_end();
+}
 
 /* -----------------------------------------------------------
   Arena free

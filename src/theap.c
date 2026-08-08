@@ -99,6 +99,7 @@ static bool mi_theap_page_collect(mi_theap_t* theap, mi_page_queue_t* pq, mi_pag
   MI_UNUSED(theap);
   mi_assert_expensive(mi_theap_page_is_valid(theap, pq, page, NULL, NULL));
   mi_collect_t collect = *((mi_collect_t*)arg_collect);
+  if (mi_page_thread_id(page) == MI_THREADID_FROZEN) return true;   // heap-image page: never freed, abandoned or rewritten
   // A collect has no allocation to serve, so it must not un-purge: the allocation path
   // (`mi_page_queue_find_free_ex`) hands a hole back when a page is actually needed. Otherwise
   // `mi_on_thread_idle`, which collects before it sweeps, un-purges a run of every page whose free
@@ -171,6 +172,7 @@ static bool mi_theap_page_purge_holes(mi_theap_t* theap, mi_page_queue_t* pq, mi
   // has to wait for us. Stopping between pages bounds that wait to one page's walk; the pages we
   // skip are simply swept at the next park (`swept_state` makes the re-walk cheap).
   if (theap->tld != NULL && mi_atomic_load_relaxed(&theap->tld->park_reclaim) != 0) return false;
+  if (mi_page_thread_id(page) == MI_THREADID_FROZEN) return true;   // heap-image page: its bytes are the image file's
   _mi_page_free_collect(page, true);   // force: fold local_free (and thread_free) into `free` first
   if (mi_page_all_free(page)) {
     // the forced collect emptied the page: hand it back instead of leaving it resident
@@ -178,7 +180,7 @@ static bool mi_theap_page_purge_holes(mi_theap_t* theap, mi_page_queue_t* pq, mi
     _mi_page_free(page, pq);
     return true;
   }
-  _mi_page_purge_holes(page);
+  _mi_page_purge_holes(page, mi_page_tld(page));
   mi_assert_expensive(_mi_page_is_valid(page));
   return true; // continue
 }
@@ -193,9 +195,9 @@ static void mi_theap_purge_holes(mi_theap_t* theap) mi_attr_noexcept {
   if (theap->tld == NULL) return;
   if (theap->tld->thread_id != _mi_thread_id() &&
       mi_atomic_load_acquire(&theap->tld->park_state) != MI_PARK_SWEEPING) return;
-  _mi_page_purge_holes_begin();
+  _mi_page_purge_holes_begin(theap->tld);
   mi_theap_visit_pages(theap, &mi_theap_page_purge_holes, true /* include full pages */, NULL, NULL);
-  _mi_page_purge_holes_end();
+  _mi_page_purge_holes_end(theap->tld);
 }
 
 // Purge the holes in every page this thread may safely touch:
@@ -225,6 +227,7 @@ static void mi_purge_holes_of(mi_tld_t* tld) mi_attr_noexcept {
   //    hold it. Reading a `heaps[i]` outside the lock is a use-after-free (`heap->subproc`).
   mi_lock(&tld->theaps_lock) {
     for (mi_theap_t* theap = tld->theaps; theap != NULL; theap = theap->tnext) {
+      if (theap->frozen) continue;
       mi_theap_purge_holes(theap);
       mi_heap_t* const heap = _mi_theap_heap(theap);
       if (heap != NULL && heap_count < MI_PURGE_HOLES_MAX_HEAPS) {
@@ -247,7 +250,7 @@ void _mi_thread_idle_work(mi_tld_t* tld, mi_theap_t* theap0) mi_attr_noexcept {
   if (tld == NULL) return;
   // each phase is a full walk: an owner waiting in `_mi_park_leave` cannot allocate until we stop
   if (mi_atomic_load_relaxed(&tld->park_reclaim) != 0) return;
-  if (theap0 != NULL && mi_theap_is_initialized(theap0)) {
+  if (theap0 != NULL && mi_theap_is_initialized(theap0) && !theap0->frozen) {
     mi_theap_collect(theap0, false /* not forced */);
   }
   if (mi_atomic_load_relaxed(&tld->park_reclaim) != 0) return;
@@ -926,3 +929,10 @@ bool mi_theap_visit_blocks(const mi_theap_t* theap, bool visit_blocks, mi_block_
   return mi_theap_visit_areas(theap, &mi_theap_area_visitor, &args);
 }
 
+
+
+// Mark a theap as an immutable image: idle work, hole purging and collection skip it from now on.
+void mi_theap_freeze(mi_theap_t* theap) mi_attr_noexcept {
+  if (theap == NULL) return;
+  theap->frozen = true;
+}

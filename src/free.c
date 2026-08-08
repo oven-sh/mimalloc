@@ -62,6 +62,9 @@ static void mi_decl_noinline mi_free_try_collect_mt(mi_page_t* page, mi_block_t*
 static inline void mi_free_block_mt(mi_page_t* page, mi_block_t* block, bool was_guarded, bool allow_collect) mi_attr_noexcept
 {
   MI_UNUSED(was_guarded); 
+  // A page frozen into a heap image (thread id MI_THREADID_FROZEN, so every free of its blocks lands here) is never written
+  // again: dropping the block keeps the page clean and file-backed. Costs one compare on a path that is already the slow one.
+  if mi_unlikely(mi_page_thread_id(page) == MI_THREADID_FROZEN) return;
   // adjust stats (after padding check and potentially recursive `mi_free` above)
   mi_stat_free(page, block);    // stat_free may access the padding
   mi_track_free_size(block, mi_page_usable_size_of(page, block, was_guarded));
