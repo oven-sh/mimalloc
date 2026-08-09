@@ -936,3 +936,18 @@ void mi_theap_freeze(mi_theap_t* theap) mi_attr_noexcept {
   if (theap == NULL) return;
   theap->frozen = true;
 }
+
+// Image restore: the thread state in the image (the main thread's static tld included) records the
+// thread id of the process that built it. The calling thread takes it over: without this, every page
+// this thread allocates from now on is stamped with a thread id no thread has, so all of its frees
+// take the cross-thread path and strand blocks on `xthread_free`, and its idle sweeps refuse to run.
+void mi_theap_adopt_current_thread(mi_theap_t* theap) mi_attr_noexcept {
+  if (theap == NULL || theap->tld == NULL) return;
+  mi_tld_t* const tld = theap->tld;
+  tld->thread_id = _mi_thread_id();
+  mi_atomic_store_release(&tld->park_state, MI_PARK_RUNNING);
+  mi_atomic_store_release(&tld->park_reclaim, 0);
+  mi_atomic_store_release(&tld->park_swept, 0);
+  tld->park_theap0 = NULL;
+  mi_lock_init(&tld->theaps_lock);   // the builder was quiescent when it froze, but its lock word is opaque state
+}
