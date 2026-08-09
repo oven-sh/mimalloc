@@ -161,22 +161,33 @@ void mi_os_hint_floor(void* floor) mi_attr_noexcept {
   while ((cur < f || cur > MI_HINT_MAX) && !mi_atomic_cas_weak_acq_rel(&aligned_base, &cur, f)) { }
 }
 
+// Deterministic hinting: on when the executable is image-capable (MI_HEAP_IMAGE_HOST_FN) or requested through the
+// environment. Decided once; the embedder's own reservations ask the same question (`mi_heap_image_hints_enabled`).
+static bool mi_heap_image_hints_decide(void) {
+  static int decided = -1;
+  if (decided < 0) {
+    const char* e = getenv("MIMALLOC_DETERMINISTIC_HINT");
+    const int from_env = (e && *e == '1') ? 1 : 0;
+    // MIMALLOC_HINT_FLOOR=0x...: start hinted OS allocations at/above this address (a heap image will be mapped below it)
+    const char* fl = getenv("MIMALLOC_HINT_FLOOR");
+    if (fl && *fl) { unsigned long long v = strtoull(fl, NULL, 0); if (v) mi_os_hint_floor((void*)(uintptr_t)v); }
+    // Image-capable and not building: this process may be about to map an image over the default hint area, so nothing it
+    // allocates before then (libc scratch, dyld, the image inflater) may live there.
+    else if (mi_heap_image_capable() && getenv(MI_HEAP_IMAGE_BUILD_ENV) == NULL) mi_os_hint_floor((void*)MI_HEAP_IMAGE_RESTORER_FLOOR);
+    decided = (from_env || mi_heap_image_capable()) ? 1 : 0;
+  }
+  return decided == 1;
+}
+
+bool mi_heap_image_hints_enabled(void) mi_attr_noexcept {
+  return mi_heap_image_hints_decide();
+}
+
 void* _mi_os_get_aligned_hint(size_t try_alignment, size_t size)
 {
 
   // todo: perhaps only do alignment hints if THP is enabled?
-  // Deterministic hinting: on when the executable is image-capable (link-time flag in the host binary) or requested via env.
-  static int deterministic_env = -1;
-  if (deterministic_env < 0) {
-    const char* e = getenv("MIMALLOC_DETERMINISTIC_HINT"); deterministic_env = (e && *e == '1') ? 1 : 0;
-    // MIMALLOC_HINT_FLOOR=0x...: start hinted OS allocations at/above this address (a heap image will be mapped below it)
-    const char* fl = getenv("MIMALLOC_HINT_FLOOR"); if (fl && *fl) { unsigned long long v = strtoull(fl, NULL, 0); if (v) mi_os_hint_floor((void*)(uintptr_t)v); }
-    // Image-capable and not building: this process may be about to map an image over the default hint area, so nothing it
-    // allocates before then (libc scratch, dyld, the image inflater) may live there.
-    else if (mi_heap_image_capable() && getenv(MI_HEAP_IMAGE_BUILD_ENV) == NULL) mi_os_hint_floor((void*)MI_HEAP_IMAGE_RESTORER_FLOOR);
-  }
-  // deterministic mode: every OS allocation gets a bump-pointer hint in the hint area (so nothing lands at kernel-chosen addresses)
-  const int deterministic_all = deterministic_env || mi_heap_image_capable();
+  const int deterministic_all = mi_heap_image_hints_enabled();
   if (!deterministic_all && (try_alignment <= mi_os_mem_config.alloc_granularity || try_alignment > MI_HINT_ALIGN)) return NULL;
   if (deterministic_all && try_alignment > MI_HINT_ALIGN) return NULL;
   if (mi_os_mem_config.virtual_address_bits < 46) return NULL;  // < 64TiB virtual address space
@@ -213,6 +224,8 @@ void* _mi_os_get_aligned_hint(size_t try_alignment, size_t size) {
    MI_UNUSED(try_alignment); MI_UNUSED(size);
    return NULL;
 }
+bool mi_heap_image_hints_enabled(void) mi_attr_noexcept { return false; }
+void mi_os_hint_floor(void* floor) mi_attr_noexcept { MI_UNUSED(floor); }
 #endif
 
 
