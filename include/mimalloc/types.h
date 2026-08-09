@@ -355,6 +355,9 @@ typedef size_t mi_page_flags_t;
 // Abandoning partially used pages allows for sharing of this memory between threads (in particular if threads are blocked)
 #define MI_THREADID_ABANDONED           MI_ZU(0)
 #define MI_THREADID_ABANDONED_MAPPED    (MI_PAGE_FLAG_MASK + 1)
+// Snapshot: pages captured in a snapshot are owned by nobody and never change again; frees of their blocks are dropped
+// (see mi_free_block_mt) and no thread id can ever equal this value.
+#define MI_THREADID_FROZEN              (~MI_ZU(0) & ~MI_PAGE_FLAG_MASK)
 
 // Thread free list.
 // Points to a list of blocks that are freed by other threads.
@@ -572,6 +575,7 @@ struct mi_theap_s {
 
   long                  page_full_retain;                    // how many full pages can be retained per queue (before abandoning them)
   bool                  allow_page_reclaim;                  // `true` if this theap can reclaim abandoned pages
+  bool                  frozen;                              // pages are an immutable snapshot: never allocate from, collect, or purge them
   bool                  allow_page_abandon;                  // `true` if this theap can abandon pages to reduce memory footprint
   bool                  prof_force_slow;                     // if profiling is enabled: keep `pages_free_direct` poisoned so every malloc routes through `_mi_malloc_generic`
   intptr_t              prof_countdown;                      // bytes until next profiling sample (only consulted in `_mi_malloc_generic`; 0 if profiling is off)
@@ -708,6 +712,14 @@ struct mi_tld_s {
   _Atomic(uint32_t)     park_swept;           // this park's sweep is done: don't claim it again until the thread re-parks
   mi_tld_t*             subproc_next;         // list of tlds in the subproc, so the scavenger can find parked threads
   size_t                holes_sweep_seq;      // idle sweeps run over THIS tld's heaps (paces `purge_holes_full_every`)
+  // State of the hole sweep currently running over this tld's pages (owner or scavenger; one sweeper at a time).
+  // Kept here, reached through the page or the tld in hand, rather than in `__thread` variables: on macOS a first
+  // access to a thread-local from inside the allocator makes dyld allocate the thread's TLV block with malloc, which
+  // re-enters the allocator before the variable exists (unbounded recursion on any new thread's first allocation).
+  bool                  holes_sweeping;       // `_mi_page_purge_holes_begin/end`: a sweep is rewriting this tld's pages
+  bool                  holes_sweep_full;     // this sweep ignores `page->swept_state`
+  size_t                holes_sweep_skipped;  // per-sweep counters, folded into the process-wide ones at the end
+  size_t                holes_sweep_visited;
   mi_msecs_t            holes_sweep_last;     // when this tld's heaps were last swept (paces `purge_holes_min_interval`)
 };
 
