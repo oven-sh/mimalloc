@@ -137,6 +137,7 @@ mi_decl_cache_align const mi_theap_t _mi_theap_empty = {
   NULL, NULL,             // hnext, hprev
   0,                      // full page retain
   false,                  // allow reclaim
+  false,                  // frozen
   true,                   // allow abandon
   false, 0,               // prof_force_slow, prof_countdown
   #if MI_GUARDED
@@ -165,6 +166,7 @@ mi_decl_cache_align const mi_theap_t _mi_theap_empty_wrong = {
   NULL, NULL,             // hnext, hprev
   0,                      // full page retain
   false,                  // allow reclaim
+  false,                  // frozen
   true,                   // allow abandon
   false, 0,               // prof_force_slow, prof_countdown
   #if MI_GUARDED
@@ -212,6 +214,7 @@ mi_decl_cache_align mi_theap_t mi_theap_main = {
   NULL, NULL,             // hnext, hprev
   2,                      // full page retain
   true,                   // allow page reclaim
+  false,                  // frozen
   true,                   // allow page abandon
   false, 0,               // prof_force_slow, prof_countdown
   #if MI_GUARDED
