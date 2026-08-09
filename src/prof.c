@@ -307,6 +307,39 @@ void _mi_prof_init(void) {
   mi_prof_set_all_theaps(true);
 }
 
+// snapshot restore (or fork child): whatever thread held the profiler lock does not exist here.
+#ifdef __cplusplus
+extern "C"
+#endif
+mi_decl_export void mi_prof_reinit_lock(void) mi_attr_noexcept {
+  if (mi_prof.ht_cap == 0) return;
+  mi_lock_init(&mi_prof.lock);
+}
+// Diagnostic: is the profiler lock free right now? (snapshot code asserts this before freezing)
+#ifdef __cplusplus
+extern "C"
+#endif
+mi_decl_export bool mi_prof_lock_is_free(void) mi_attr_noexcept {
+  if (mi_prof.ht_cap == 0) return true;
+  if (!mi_lock_try_acquire(&mi_prof.lock)) return false;
+  mi_lock_release(&mi_prof.lock);
+  return true;
+}
+
+// Visit live sampled allocations (addr != 0). Callback returns false to stop.
+#ifdef __cplusplus
+extern "C"
+#endif
+mi_decl_export void mi_prof_visit_live(bool (*cb)(uintptr_t addr, size_t size, const uintptr_t* frames, uint8_t nframes, void* arg), void* arg) {
+  mi_lock_acquire(&mi_prof.lock);
+  for (size_t i = 0; i < mi_prof.sample_count; i++) {
+    mi_prof_sample_t* smp = &mi_prof.samples[i];
+    if (smp->addr == 0) continue;
+    if (!cb(smp->addr, smp->size, smp->frames, smp->nframes, arg)) break;
+  }
+  mi_lock_release(&mi_prof.lock);
+}
+
 void mi_prof_reset(void) mi_attr_noexcept {
   if (mi_prof.ht_cap == 0) return;  // never initialized
   mi_lock(&mi_prof.lock) {
@@ -573,7 +606,7 @@ static int mi_prof_dump_pb(mi_pb_t* wp) {
   // To keep this simple, do two passes: pass 1 collect unique frame addrs,
   // pass 2 emit samples referencing location ids.
   // Unique-address collection:
-  size_t loc_cap = 4096;
+  size_t loc_cap = 4096; while (loc_cap < mi_prof.sample_count * 8) loc_cap <<= 1;
   mi_memid_t lm;
   mi_prof_loc_t* locs = (mi_prof_loc_t*)_mi_os_zalloc(_mi_subproc_main(), loc_cap * sizeof(mi_prof_loc_t), &lm);
   size_t nlocs = 0;
@@ -645,6 +678,7 @@ static int mi_prof_dump_pb(mi_pb_t* wp) {
 
   pb_flush(&w);
   *wp = w;
+  _mi_os_free(_mi_subproc_main(), locs, loc_cap * sizeof(mi_prof_loc_t), lm);
   return (w.err ? -1 : 0);
 }
 
