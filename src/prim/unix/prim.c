@@ -546,18 +546,23 @@ int _mi_prim_decommit(void* start, size_t size, bool* needs_recommit) {
   int err = 0;
   #if 1
     #if defined(__APPLE__) && defined(MADV_FREE_REUSABLE)
-      // decommit on macOS: use MADV_FREE_REUSABLE as it does immediate rss accounting (issue #1097)
+      // decommit on macOS: MADV_FREE_REUSABLE moves the pages to the task's reusable ledger, which
+      // drops phys_footprint immediately (issue #1097) but leaves them counted in resident_size
+      // until the kernel reclaims them. Dropping the protection as well takes them out of the
+      // resident set right away while keeping the reservation; commit re-protects on reuse.
       err = unix_madvise(start, size, MADV_FREE_REUSABLE);
       if (err) { err = unix_madvise(start, size, MADV_DONTNEED); }
+      *needs_recommit = true;
+      mprotect(start, size, PROT_NONE);
     #else
       // decommit: use MADV_DONTNEED as it decreases rss immediately (unlike MADV_FREE)
       err = unix_madvise(start, size, MADV_DONTNEED);
-    #endif
-    #if !MI_DEBUG && MI_SECURE<=2
-      *needs_recommit = false;
-    #else
-      *needs_recommit = true;
-      mprotect(start, size, PROT_NONE);
+      #if !MI_DEBUG && MI_SECURE<=2
+        *needs_recommit = false;
+      #else
+        *needs_recommit = true;
+        mprotect(start, size, PROT_NONE);
+      #endif
     #endif
   #else
     // decommit: use mmap with MAP_FIXED and PROT_NONE to discard the existing memory (and reduce rss)
@@ -607,16 +612,20 @@ int _mi_prim_decommit_zero(void* start, size_t size, bool* needs_recommit, bool*
     *needs_recommit = false;
     return err;
   #elif defined(__APPLE__) && defined(MADV_ZERO)
-    // MADV_ZERO zeroes in place (no accounting change); MADV_FREE_REUSABLE then releases the
-    // pages with immediate footprint accounting. Reclaimed pages refault as zero and pages the
-    // kernel keeps were just zeroed, so BOTH outcomes read back zero. Only claim zero if the
-    // MADV_ZERO itself succeeded -- the REUSABLE/DONTNEED fallbacks below do not zero on Darwin.
+    // MADV_ZERO zeroes in place (no accounting change); MADV_FREE_REUSABLE then hands the pages to
+    // the task's reusable ledger, which drops phys_footprint immediately -- but the kernel keeps
+    // them in resident_size (what task_info/`rss` report) until it actually reclaims them, and a
+    // later read faults the old contents straight back in. Dropping the protection as well takes
+    // them out of the resident set now and keeps the reservation; the arena clears its commit bits
+    // and `_mi_prim_commit` re-protects on reuse. Only claim zero if the MADV_ZERO itself
+    // succeeded -- neither REUSABLE nor the PROT_NONE round trip zeroes on Darwin.
     if (unix_madv_zero_supported() && unix_madvise(start, size, MADV_ZERO) == 0) {
       *is_zero = true;
     }
-    *needs_recommit = false;
     int err = unix_madvise(start, size, MADV_FREE_REUSABLE);
     if (err) { err = unix_madvise(start, size, MADV_DONTNEED); }
+    *needs_recommit = true;
+    if (mprotect(start, size, PROT_NONE) != 0 && err == 0) { err = errno; }
     return err;
   #endif
   #endif
