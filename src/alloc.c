@@ -706,12 +706,16 @@ static bool mi_try_new_handler(bool nothrow) {
     return true;
   }
   else {
+    #if defined(_CPPUNWIND) || defined(__cpp_exceptions)  // as above: this file is also built as C++ with exceptions disabled
     try {
       h();
     }
     catch(...) {     // swallow std::bad_alloc
       return false;  // stop trying
     }
+    #else
+    h();             // without exceptions a handler can only return (or terminate)
+    #endif
     return true;
   }
 }
