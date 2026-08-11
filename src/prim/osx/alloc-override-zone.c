@@ -725,4 +725,17 @@ static void _mi_macos_override_malloc(void) {
 }
 #endif  // MI_OSX_INTERPOSE
 
+// snapshot restore: libsystem_malloc rewrites a registered zone's function table in place (typed-malloc shims whose
+// bookkeeping lives in libsystem's own per-process data). The zone as the snapshot builder's libsystem left it therefore
+// must not be copied over the one this process registered: the restore keeps these ranges as they are.
+#ifdef __cplusplus
+extern "C"
+#endif
+mi_decl_export size_t mi_malloc_zone_process_owned_ranges(uintptr_t (*out)[2], size_t cap) {
+  size_t n = 0;
+  if (n < cap) { out[n][0] = (uintptr_t)&mi_malloc_zone; out[n][1] = (uintptr_t)(&mi_malloc_zone + 1); n++; }
+  if (n < cap) { out[n][0] = (uintptr_t)&mi_introspect; out[n][1] = (uintptr_t)(&mi_introspect + 1); n++; }
+  return n;
+}
+
 #endif // MI_MALLOC_OVERRIDE
