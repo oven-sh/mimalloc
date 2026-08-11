@@ -31,6 +31,18 @@ terms of the MIT license. A copy of the license can be found in the file
 #define ENOMEM 12
 #endif
 
+#if !(defined(MI_MALLOC_OVERRIDE) && !defined(_DLL))   // otherwise defined in alloc-override.c, where malloc_size/malloc_usable_size alias them
+mi_decl_nodiscard size_t mi_malloc_size(const void* p) mi_attr_noexcept {
+  if (!mi_is_in_heap_region(p)) return 0;
+  return mi_usable_size(p);
+}
+
+mi_decl_nodiscard size_t mi_malloc_usable_size(const void *p) mi_attr_noexcept {
+  if (!mi_is_in_heap_region(p)) return 0;
+  return mi_usable_size(p);
+}
+#endif
+
 mi_decl_nodiscard size_t mi_malloc_good_size(size_t size) mi_attr_noexcept {
   return mi_good_size(size);
 }
