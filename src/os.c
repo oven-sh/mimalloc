@@ -4,6 +4,7 @@ This is free software; you can redistribute it and/or modify it under the
 terms of the MIT license. A copy of the license can be found in the file
 "LICENSE" at the root of this distribution.
 -----------------------------------------------------------------------------*/
+#include <errno.h>   // ENOENT
 #include "mimalloc.h"
 #include "mimalloc/internal.h"
 #include "mimalloc/atomic.h"
@@ -176,7 +177,8 @@ static bool mi_startup_snapshot_hints_decide(void) {
     }
     // Snapshot-capable and not building: this process may be about to map a snapshot over the default hint area, so nothing it
     // allocates before then (libc scratch, dyld) may live there.
-    else if (mi_startup_snapshot_capable() && _mi_getenv(MI_STARTUP_SNAPSHOT_BUILD_ENV, buf, sizeof(buf)) != 0) mi_os_hint_floor((void*)MI_STARTUP_SNAPSHOT_RESTORER_FLOOR);
+    // Presence is what matters here; the value (an output path) may well not fit `buf`, which _mi_getenv reports as EAGAIN, not ENOENT.
+    else if (mi_startup_snapshot_capable() && _mi_getenv(MI_STARTUP_SNAPSHOT_BUILD_ENV, buf, sizeof(buf)) == ENOENT) mi_os_hint_floor((void*)MI_STARTUP_SNAPSHOT_RESTORER_FLOOR);
     decided = (from_env || mi_startup_snapshot_capable()) ? 1 : 0;
   }
   return decided == 1;
