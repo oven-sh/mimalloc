@@ -367,6 +367,11 @@ typedef struct mi_heap_area_s {
 typedef bool (mi_cdecl mi_block_visit_fun)(const mi_heap_t* heap, const mi_heap_area_t* area, void* block, size_t block_size, void* arg);
 
 mi_decl_export bool   mi_heap_visit_blocks(mi_heap_t* heap, bool visit_blocks, mi_block_visit_fun* visitor, void* arg);
+mi_decl_export void mi_os_hint_floor(void* floor) mi_attr_noexcept;
+mi_decl_export bool mi_startup_snapshot_hints_enabled(void) mi_attr_noexcept;   // deterministic placement is on for this process (snapshot-capable executable, or MIMALLOC_DETERMINISTIC_HINT=1)
+mi_decl_export void mi_arenas_seal_existing(void) mi_attr_noexcept; // snapshot restore: no new allocations inside pre-existing (snapshot) arenas
+mi_decl_export void mi_arenas_freeze_pages(void) mi_attr_noexcept;   // snapshot build: pages written into the snapshot are never freed into again
+mi_decl_export void mi_arenas_visit_free_ranges(mi_heap_t* heap, void (*visit)(void* start, size_t size, void* arg), void* arg) mi_attr_noexcept;  // visit maximal runs of arena slices that belong to no page
 mi_decl_export bool   mi_heap_visit_abandoned_blocks(mi_heap_t* heap, bool visit_blocks, mi_block_visit_fun* visitor, void* arg);
 
 
@@ -443,6 +448,8 @@ mi_decl_export bool mi_subproc_visit_heaps(mi_subproc_id_t subproc, mi_heap_visi
 
 struct mi_theap_s;
 typedef struct mi_theap_s mi_theap_t;
+mi_decl_export void mi_theap_freeze(mi_theap_t* theap) mi_attr_noexcept;  // snapshot restore: never collect/purge/idle-sweep this theap again
+mi_decl_export void mi_theap_adopt_current_thread(mi_theap_t* theap) mi_attr_noexcept;  // snapshot restore: this theap's thread state now belongs to the calling thread
 
 mi_decl_export mi_theap_t* mi_heap_theap(mi_heap_t* heap);
 mi_decl_export mi_theap_t* mi_theap_set_default(mi_theap_t* theap);

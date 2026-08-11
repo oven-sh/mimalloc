@@ -111,7 +111,9 @@ static mi_decl_cache_align mi_tld_t mi_tld_detached = {
   NULL,                   // park_theap0
   MI_ATOMIC_VAR_INIT(0),  // park_swept
   NULL,                   // subproc_next
-  0, 0                    // holes_sweep_seq / _last
+  0,                      // holes_sweep_seq
+  false, false, 0, 0,     // holes_sweeping / holes_sweep_full / _skipped / _visited
+  0                       // holes_sweep_last
 };
 
 mi_decl_hidden mi_decl_cache_align const mi_theap_t _mi_theap_empty = {
@@ -130,6 +132,7 @@ mi_decl_hidden mi_decl_cache_align const mi_theap_t _mi_theap_empty = {
   NULL, NULL,             // hnext, hprev
   0,                      // full page retain
   false,                  // allow reclaim
+  false,                  // frozen
   true,                   // allow abandon
   true,                   // is_detached
   false, 0,               // prof_force_slow, prof_countdown (fork)

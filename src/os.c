@@ -8,6 +8,7 @@ terms of the MIT license. A copy of the license can be found in the file
 #include "mimalloc/internal.h"
 #include "mimalloc/atomic.h"
 #include "mimalloc/prim.h"
+#include <stdlib.h>
 #include "mimalloc/prim-tls.h"  // _mi_theap_default for random
 
 /* -----------------------------------------------------------
@@ -128,12 +129,70 @@ bool _mi_os_commit(mi_subproc_t* subproc, void* addr, size_t size, bool* is_zero
 #define MI_HINT_AREA  ((uintptr_t)4 << 40)  // upto (2+4) 6TiB  (since before win8 there is "only" 8TiB available to processes)
 #define MI_HINT_MAX   ((uintptr_t)30 << 40) // wrap after 30TiB (area after 32TiB is used for huge OS pages)
 
+// snapshot support (see mi_arenas_freeze_pages / mi_os_hint_floor). The embedder can name a function, callable from the
+// very first allocation, that says whether this executable can build or map a snapshot (`-DMI_STARTUP_SNAPSHOT_HOST_FN=name`,
+// `int name(void)`); such executables get deterministic address hints without any environment. It can also name the
+// environment variable that marks a snapshot *build* (`-DMI_STARTUP_SNAPSHOT_BUILD_ENV="VAR"`): a build keeps its heap at the
+// default base (that heap becomes the snapshot); any other snapshot-capable process keeps its own early heap above snapshot space.
+#if defined(MI_STARTUP_SNAPSHOT_HOST_FN)
+#ifdef __cplusplus
+extern "C" int MI_STARTUP_SNAPSHOT_HOST_FN(void);
+#else
+extern int MI_STARTUP_SNAPSHOT_HOST_FN(void);
+#endif
+#define mi_startup_snapshot_capable() (MI_STARTUP_SNAPSHOT_HOST_FN() != 0)
+#else
+#define mi_startup_snapshot_capable() (0)
+#endif
+#if !defined(MI_STARTUP_SNAPSHOT_BUILD_ENV)
+#define MI_STARTUP_SNAPSHOT_BUILD_ENV "MIMALLOC_SNAPSHOT_BUILD"
+#endif
+#define MI_STARTUP_SNAPSHOT_RESTORER_FLOOR  ((uintptr_t)0x21000000000ULL)   // 64GiB above the default hint base
+static mi_decl_cache_align _Atomic(uintptr_t) aligned_base; // = 0  (hint bump pointer; file scope so mi_os_hint_floor can move it)
+static _Atomic(uintptr_t) hint_floor; // = 0: lowest address hinted allocations may use (also where the pointer restarts when it wraps or is invalid)
+
+// Snapshot restore: every hinted OS allocation from now on lands at or above `floor` (the snapshot occupies the area below). Also repairs a
+// pointer that is unusable (0, past MI_HINT_MAX — e.g. inherited from another process's data segment).
+void mi_os_hint_floor(void* floor) mi_attr_noexcept {
+  uintptr_t f = _mi_align_up((uintptr_t)floor, MI_HINT_ALIGN);
+  uintptr_t curf = mi_atomic_load_acquire(&hint_floor);
+  while (curf < f && !mi_atomic_cas_weak_acq_rel(&hint_floor, &curf, f)) { }
+  uintptr_t cur = mi_atomic_load_acquire(&aligned_base);
+  while ((cur < f || cur > MI_HINT_MAX) && !mi_atomic_cas_weak_acq_rel(&aligned_base, &cur, f)) { }
+}
+
+// Deterministic hinting: on when the executable is snapshot-capable (MI_STARTUP_SNAPSHOT_HOST_FN) or requested through the
+// environment. Decided once; the embedder's own reservations ask the same question (`mi_startup_snapshot_hints_enabled`).
+static bool mi_startup_snapshot_hints_decide(void) {
+  static int decided = -1;
+  if (decided < 0) {
+    // _mi_getenv (0 = found), not getenv: this runs inside the very first allocation, and the C runtime's getenv allocates on some platforms.
+    char buf[64];
+    const int from_env = (_mi_getenv("MIMALLOC_DETERMINISTIC_HINT", buf, sizeof(buf)) == 0 && buf[0] == '1') ? 1 : 0;
+    // MIMALLOC_HINT_FLOOR=0x...: start hinted OS allocations at/above this address (a snapshot will be mapped below it)
+    if (_mi_getenv("MIMALLOC_HINT_FLOOR", buf, sizeof(buf)) == 0 && buf[0] != 0) {
+      unsigned long long v = strtoull(buf, NULL, 0);
+      if (v) mi_os_hint_floor((void*)(uintptr_t)v);
+    }
+    // Snapshot-capable and not building: this process may be about to map a snapshot over the default hint area, so nothing it
+    // allocates before then (libc scratch, dyld) may live there.
+    else if (mi_startup_snapshot_capable() && _mi_getenv(MI_STARTUP_SNAPSHOT_BUILD_ENV, buf, sizeof(buf)) != 0) mi_os_hint_floor((void*)MI_STARTUP_SNAPSHOT_RESTORER_FLOOR);
+    decided = (from_env || mi_startup_snapshot_capable()) ? 1 : 0;
+  }
+  return decided == 1;
+}
+
+bool mi_startup_snapshot_hints_enabled(void) mi_attr_noexcept {
+  return mi_startup_snapshot_hints_decide();
+}
+
 void* _mi_os_get_aligned_hint(size_t try_alignment, size_t size)
 {
-  static mi_decl_cache_align _Atomic(uintptr_t) aligned_base; // = 0
 
   // todo: perhaps only do alignment hints if THP is enabled?
-  if (try_alignment <= mi_os_mem_config.alloc_granularity || try_alignment > MI_HINT_ALIGN) return NULL;
+  const int deterministic_all = mi_startup_snapshot_hints_enabled();
+  if (!deterministic_all && (try_alignment <= mi_os_mem_config.alloc_granularity || try_alignment > MI_HINT_ALIGN)) return NULL;
+  if (deterministic_all && try_alignment > MI_HINT_ALIGN) return NULL;
   if (mi_os_mem_config.virtual_address_bits < 46) return NULL;  // < 64TiB virtual address space
   size = _mi_align_up(size, MI_HINT_ALIGN);
   #if (MI_SECURE>=1)
@@ -142,13 +201,19 @@ void* _mi_os_get_aligned_hint(size_t try_alignment, size_t size)
   size += MI_HINT_ALIGN;              // put in virtual gaps between hinted blocks; this splits VLA's but increases guarded areas.
 
   uintptr_t hint = mi_atomic_add_acq_rel(&aligned_base, size);
-  if (hint == 0 || hint > MI_HINT_MAX) {   // wrap or initialize
+  if (hint == 0 || hint > MI_HINT_MAX || hint < mi_atomic_load_relaxed(&hint_floor)) {   // wrap or initialize (never below the floor)
     uintptr_t init = MI_HINT_BASE;
+    { uintptr_t fl = mi_atomic_load_relaxed(&hint_floor); if (fl > init) init = fl; }
+    // Experiment: MIMALLOC_DETERMINISTIC_HINT=1 disables hint randomization (snapshot determinism tests).
+    const int deterministic = deterministic_all;
+    MI_UNUSED(deterministic);   // only consulted in the randomizing configurations below
     #if (MI_SECURE>=1 || defined(NDEBUG))  // security: randomize start of aligned allocations unless in debug mode
+    if (!deterministic) {
     mi_theap_t* const theap = _mi_theap_default();     // don't use `mi_theap_get_default()` as that can cause allocation recursively (issue #1267)
     if (!mi_theap_is_initialized(theap)) return NULL;  // no hint as we lack randomness at this point
     const uintptr_t r = _mi_theap_random_next(theap);
     init = init + ((MI_HINT_ALIGN * ((r>>17) & 0xFFFFF)) % MI_HINT_AREA);  // (randomly 20 bits)*4MiB == 0 to 4TiB
+    }
     #endif
     uintptr_t expected = hint + size;
     mi_atomic_cas_strong_acq_rel(&aligned_base, &expected, init);
@@ -163,6 +228,8 @@ void* _mi_os_get_aligned_hint(size_t try_alignment, size_t size) {
    MI_UNUSED(try_alignment); MI_UNUSED(size);
    return NULL;
 }
+bool mi_startup_snapshot_hints_enabled(void) mi_attr_noexcept { return false; }
+void mi_os_hint_floor(void* floor) mi_attr_noexcept { MI_UNUSED(floor); }
 #endif
 
 
