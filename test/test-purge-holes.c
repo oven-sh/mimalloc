@@ -1516,7 +1516,7 @@ static bool test_sweep_full_every(void) {
     if (ptrs[i] != NULL && _mi_ptr_page(ptrs[i]) == page) { mi_free(ptrs[i]); ptrs[i] = NULL; break; }
   }
   s0 = hole_stats();
-  page->swept_state = (((uint32_t)page->capacity) << 16) | (uint32_t)page->used;
+  page->swept_state = (((uint64_t)page->capacity) << 32) | (uint64_t)page->used;   // must match mi_page_sweep_state() in page.c
 
   // with no periodic full sweep the page is now wedged: no amount of parking finds the hole
   for (int r = 0; r < BOUND_EVERY * 2; r++) { mi_on_thread_idle(); }

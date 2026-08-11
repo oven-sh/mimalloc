@@ -75,14 +75,17 @@ static void* zone_valloc(malloc_zone_t* zone, size_t size) {
 }
 
 static void zone_free(malloc_zone_t* zone, void* p) {
-  if mi_likely(mi_any_heap_contains(p)) {
-    if mi_likely(_mi_thread_is_initialized()) {
-      mi_free(p); // with the page_map and pagemap_commit=1 we can use the regular free
-    }
-    else {
-      // during thread shutdown `_pthread_tsd_cleanup` may call `zone_free` on a pointer that was allocated in another subproc.
-      _mi_free_subproc_safe(p); 
-    }
+  mi_page_t* const page = _mi_checked_ptr_page(p);  
+  if mi_likely(page!=NULL) {
+    mi_assert_internal(_mi_thread_is_initialized());  
+    _mi_free_in_page(p,page);
+    // if mi_likely(_mi_thread_is_initialized()) {
+    //   _mi_free_in_page(p,page);
+    // }
+    // else {
+    //   // during thread shutdown `_pthread_tsd_cleanup` may call `zone_free` on a pointer that was allocated in another subproc.
+    //   _mi_free_subproc_safe_in_page(p,page); 
+    // }
   }
   else if (!is_mimalloc_zone(zone)) {  // can happen due to interpose
     zone->free(zone,p);
@@ -225,8 +228,8 @@ static kern_return_t mi_zone_enum_remote_page(task_t task, memory_reader_t reade
   const size_t ubsize = bsize - MI_PADDING_SIZE;
   // `lpage` is a local copy of a page that lives in the TARGET process, so the block start
   // must be rebuilt from the remote page address -- mi_page_start(&lpage) would offset from
-  // our own copy. (Upstream dropped the cached `page_start` field in favour of `page_woffset`.)
-  const vm_address_t pstart = (vm_address_t)(rpage + ((size_t)lpage.page_woffset * MI_SIZE_SIZE));
+  // our own copy. (The start is stored as an offset from the page struct, in `MI_MAX_ALIGN_SIZE` units.)
+  const vm_address_t pstart = (vm_address_t)(rpage + ((size_t)lpage.page_ma_offset * MI_MAX_ALIGN_SIZE));
 
   if (e->type_mask & MALLOC_PTR_REGION_RANGE_TYPE) {
     mi_zone_enum_flush(e, MALLOC_PTR_IN_USE_RANGE_TYPE);
