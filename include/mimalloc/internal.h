@@ -917,7 +917,7 @@ static inline bool mi_page_all_free(const mi_page_t* page) {
 // Page hole purging  (see the "Page hole purging" section in `page.c`)
 // ------------------------------------------------------
 
-void          _mi_page_purge_holes(mi_page_t* page);
+void          _mi_page_purge_holes(mi_page_t* page, mi_tld_t* tld);   // `tld`: the thread whose sweep this is (see `_mi_page_purge_holes_begin`)
 void          _mi_page_purged_reset(mi_page_t* page);
 bool          _mi_page_unpurge_run(mi_page_t* page);
 void          _mi_page_unpurge_all(mi_page_t* page);
@@ -926,12 +926,12 @@ void          _mi_page_unpurge_unformed_upto(mi_page_t* page, uintptr_t end);   
 size_t        _mi_page_unformed_purged_bytes(const mi_page_t* page);            // the bytes of this page's unformed tail that are discarded right now
 bool          _mi_page_purge_os_page_blocks(size_t os_page_size, size_t block_size, uintptr_t page_start,
                                             size_t capacity, size_t k, size_t* first, size_t* last);
-bool          _mi_page_purge_holes_in_progress(void);
+bool          _mi_page_purge_holes_in_progress(void);            // is the calling thread inside a sweep of its own heaps?
 void          _mi_page_holes_count_page_freed(void);
 void          _mi_page_holes_count_ineligible(const mi_page_t* page);
 void          _mi_page_holes_reset_ineligible(void);
-void          _mi_page_purge_holes_begin(void);
-void          _mi_page_purge_holes_end(void);
+void          _mi_page_purge_holes_begin(mi_tld_t* tld);         // around each pass of a sweep; `tld` is the thread being swept
+void          _mi_page_purge_holes_end(mi_tld_t* tld);
 void          _mi_page_purge_holes_sweep_begin(mi_tld_t* tld);   // once per idle sweep, before its passes
 
 // ------------------------------------------------------

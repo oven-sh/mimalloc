@@ -165,20 +165,23 @@ void _mi_theap_collect_abandon(mi_theap_t* theap) {
 // that are still partially used. Meant to be called when the application knows
 // it is idle (e.g. from an event loop about to park): it costs a few madvise
 // calls and nothing on the alloc/free hot path.
-static bool mi_theap_page_purge_holes(mi_theap_t* theap, mi_page_queue_t* pq, mi_page_t* page, void* arg1, void* arg2) {
-  MI_UNUSED(arg1); MI_UNUSED(arg2);
+static bool mi_theap_page_purge_holes(mi_theap_t* theap, mi_page_queue_t* pq, mi_page_t* page, void* arg_tld, void* arg2) {
+  MI_UNUSED(arg2);
+  mi_tld_t* const tld = (mi_tld_t*)arg_tld;   // the tld being swept (== theap->tld)
   // When the scavenger is doing this for a parked thread, the owner may wake at any moment and
   // has to wait for us. Stopping between pages bounds that wait to one page's walk; the pages we
   // skip are simply swept at the next park (`swept_state` makes the re-walk cheap).
   if (theap->tld != NULL && mi_atomic_load_relaxed(&theap->tld->park_reclaim) != 0) return false;
-  _mi_page_free_collect(page, true);   // force: fold local_free (and thread_free) into `free` first
+  // force: fold local_free (and thread_free) into `free` first. Never un-purge here: we are about
+  // to purge, and a run brought back now would be discarded again right away (see `mi_theap_page_collect`).
+  _mi_page_free_collect_no_unpurge(page, true);
   if (mi_page_all_free(page)) {
     // the forced collect emptied the page: hand it back instead of leaving it resident
     _mi_page_holes_count_page_freed();
     _mi_page_free(page, pq);
     return true;
   }
-  _mi_page_purge_holes(page);
+  _mi_page_purge_holes(page, tld);
   mi_assert_expensive(_mi_page_is_valid(page));
   return true; // continue
 }
@@ -193,9 +196,10 @@ static void mi_theap_purge_holes(mi_theap_t* theap) mi_attr_noexcept {
   if (theap->tld == NULL) return;
   if (theap->tld->thread_id != _mi_thread_id() &&
       mi_atomic_load_acquire(&theap->tld->park_state) != MI_PARK_SWEEPING) return;
-  _mi_page_purge_holes_begin();
-  mi_theap_visit_pages(theap, &mi_theap_page_purge_holes, true /* include full pages */, NULL, NULL);
-  _mi_page_purge_holes_end();
+  mi_tld_t* const tld = theap->tld;
+  _mi_page_purge_holes_begin(tld);
+  mi_theap_visit_pages(theap, &mi_theap_page_purge_holes, true /* include full pages */, tld, NULL);
+  _mi_page_purge_holes_end(tld);
 }
 
 // Purge the holes in every page this thread may safely touch:

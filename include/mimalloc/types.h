@@ -721,6 +721,16 @@ struct mi_tld_s {
   mi_tld_t*             subproc_next;         // list of tlds in the subproc, so the scavenger can find parked threads
   size_t                holes_sweep_seq;      // idle sweeps run over THIS tld's heaps (paces `purge_holes_full_every`)
   mi_msecs_t            holes_sweep_last;     // when this tld's heaps were last swept (paces `purge_holes_min_interval`)
+
+  // State of the sweep that is currently running over this tld's heaps (on the owner, or on the
+  // scavenger while the owner is parked). It lives here and not in thread-locals of the sweeping
+  // thread: `_mi_page_purge_holes_in_progress` is read inside the allocator, and where `__thread`
+  // is emulated (Android before API 29) the first access to a thread-local on a thread calls
+  // malloc, which re-enters the very page collect that is reading it (oven-sh/bun#38051).
+  bool                  holes_sweeping;       // a pass of the sweep is rewriting free lists right now (see `_mi_page_purge_holes_begin`)
+  bool                  holes_sweep_full;     // this sweep ignores `page->swept_state` (see `_mi_page_purge_holes`)
+  size_t                holes_sweep_skipped;  // per-sweep counters, folded into the process-wide ones in `_mi_page_purge_holes_end`
+  size_t                holes_sweep_visited;
 };
 
 
