@@ -472,41 +472,36 @@ static void mi_holes_count_reuse(size_t bytes, size_t blocks, bool reused) {
   mi_atomic_addi64_relaxed(&mi_holes_blocks, -(int64_t)blocks);
 }
 
-// The sweep's per-thread scratch state (`purging_holes`, `holes_sweep_*`) lives on the tld of the
-// thread RUNNING the sweep -- see `mi_tld_s`. It is reached through `_mi_theap_default()`, the same
-// accessor the allocation fast path uses, so it is safe wherever `malloc` itself is (in particular
-// it never goes through emulated TLS, which allocates on first access).
+// The sweep's scratch state (`purging_holes`, `holes_sweep_*`) lives on the tld whose heaps are being
+// swept -- see `mi_tld_s` -- and is passed down explicitly, so nothing here reads compiler thread
+// locals (with emulated TLS, e.g. Android before API 29, the first access to a `__thread` variable
+// allocates, and `_mi_page_purge_holes_in_progress` is reached from the allocation slow path).
+// The sweeping thread owns that tld for the duration: it is either its own, or a parked thread's
+// that it claimed (MI_PARK_SWEEPING).
 //
-// - `purging_holes` is the re-entrancy guard: while the idle sweep is rewriting a page's free list
-//   and bitmap, a nested `mi_malloc` (only reachable through a user output function from a warning
-//   message) must not un-purge a hole from under it.
+// - `purging_holes` is the re-entrancy guard: while the sweep is rewriting a page's free list and
+//   bitmap, a nested `mi_malloc` on the sweeping thread (only reachable through a user output
+//   function from a warning message) must not un-purge a hole from under it. Such an allocation
+//   can only come from a page of the swept tld when the sweeper is the owner itself, which is why
+//   the reader consults the page owner's tld.
 // - `holes_sweep_skipped/visited` are per-sweep counters. The sweep runs over every page of the
 //   thread, so a process-wide atomic per page would be a real cost on the very path we are making
-//   cheap: accumulate per thread and fold them in once per pass, in `_mi_page_purge_holes_end`.
+//   cheap: accumulate on the tld and fold them in once per pass, in `_mi_page_purge_holes_end`.
 // - `holes_sweep_full` is whether THIS sweep ignores `page->swept_state` (see `_mi_page_purge_holes`).
-//   Set once per idle sweep, in `_mi_page_purge_holes_sweep_begin`; the sequence it is paced by
-//   lives on the tld being swept, since one scavenger thread runs the sweeps of many.
+//   Set once per idle sweep, in `_mi_page_purge_holes_sweep_begin`, paced by the same tld's sequence.
 
-// The sweeping thread's tld, or NULL on a thread that has not initialized mimalloc yet (such a
-// thread cannot be inside a sweep: `_mi_page_purge_holes_begin` initializes it).
-static mi_tld_t* mi_holes_sweep_tld(void) {
-  mi_theap_t* const theap = _mi_theap_default();
-  return ((theap != NULL && mi_theap_is_initialized(theap)) ? theap->tld : NULL);
+bool _mi_page_purge_holes_in_progress(const mi_page_t* page) {
+  const mi_theap_t* const theap = page->theap;   // NULL for an abandoned page: nobody allocates from those
+  return (theap != NULL && theap->tld != NULL && theap->tld->purging_holes);
 }
 
-bool _mi_page_purge_holes_in_progress(void) {
-  const mi_tld_t* const tld = mi_holes_sweep_tld();
-  return (tld != NULL && tld->purging_holes);
-}
-
-void _mi_page_purge_holes_begin(void) {
-  mi_tld_t* const tld = mi_theap_get_default()->tld;   // `get_default`: make sure this thread has a tld of its own
+void _mi_page_purge_holes_begin(mi_tld_t* tld) {
   mi_assert_internal(tld != NULL && !tld->purging_holes);
+  if (tld == NULL) return;
   tld->purging_holes = true;
 }
 
-void _mi_page_purge_holes_end(void) {
-  mi_tld_t* const tld = mi_holes_sweep_tld();
+void _mi_page_purge_holes_end(mi_tld_t* tld) {
   mi_assert_internal(tld != NULL && tld->purging_holes);
   if (tld == NULL) return;
   tld->purging_holes = false;
@@ -520,14 +515,11 @@ void _mi_page_purge_holes_end(void) {
   }
 }
 
-// Called once per idle sweep of `tld`'s heaps, before its passes (`mi_purge_holes_of`).
 void _mi_page_purge_holes_sweep_begin(mi_tld_t* tld) {
-  // `tld` is the tld being swept (it paces the sequence); the flag is state of the sweeping thread.
-  mi_tld_t* const sweeper = mi_theap_get_default()->tld;
   const long every = mi_option_get(mi_option_purge_holes_full_every);
   const size_t seq = ++tld->holes_sweep_seq;
-  sweeper->holes_sweep_full = (every > 0 && (seq % (size_t)every) == 0);
-  if (sweeper->holes_sweep_full) { mi_atomic_addi64_relaxed(&mi_holes_full_sweeps, 1); }
+  tld->holes_sweep_full = (every > 0 && (seq % (size_t)every) == 0);
+  if (tld->holes_sweep_full) { mi_atomic_addi64_relaxed(&mi_holes_full_sweeps, 1); }
 }
 
 static inline bool mi_page_bits_at(const uint64_t* bits, size_t k) {
@@ -696,7 +688,7 @@ void _mi_page_unpurge_unformed_upto(mi_page_t* page, uintptr_t end) {
 // Walk the free list of a page and discard every OS page in it that holds no live block.
 // Returns false if any discard failed: those blocks went straight back on the free list and the
 // page must be swept again, so the caller must not record it as swept.
-static bool mi_page_purge_holes_walk(mi_page_t* page) {
+static bool mi_page_purge_holes_walk(mi_page_t* page, mi_tld_t* tld) {
   if (page->free == NULL) return true;                    // nothing to take off the free list
 
   const size_t os_size = _mi_os_page_size();
@@ -721,8 +713,7 @@ static bool mi_page_purge_holes_walk(mi_page_t* page) {
       nfree[k]++;
     }
   }
-  mi_tld_t* const sweeper = mi_holes_sweep_tld();
-  if (sweeper != NULL) { sweeper->holes_sweep_visited += nvisited; }   // folded into the process-wide counter at the end of the sweep
+  if (tld != NULL) { tld->holes_sweep_visited += nvisited; }   // folded into the process-wide counter at the end of the sweep
 
   // 2. an OS page can be discarded when *every* block overlapping it is free -- either on the
   //    free list, or purged already. Of the blocks overlapping an OS page, only the first and
@@ -808,7 +799,7 @@ static bool mi_page_purge_holes_walk(mi_page_t* page) {
 // regardless, which caps the delay of a missed discard at N parks for 1/N of the old cost.
 // (An exact "was anything freed in this page" bit is the alternative, and it costs a store in
 // `mi_free` itself -- the hot path this whole feature stays off.)
-void _mi_page_purge_holes(mi_page_t* page) {
+void _mi_page_purge_holes(mi_page_t* page, mi_tld_t* tld) {
   mi_assert_internal(page != NULL);
   if (!mi_option_is_enabled(mi_option_purge_holes)) return;
   if (mi_page_all_free(page)) return;                     // the page itself is about to be freed
@@ -816,9 +807,8 @@ void _mi_page_purge_holes(mi_page_t* page) {
   mi_page_purge_unformed_tail(page);                      // the blocks that are not formed yet: resident, but never handed out
   if (!mi_page_can_purge_holes(page)) { _mi_page_holes_count_ineligible(page); return; }
 
-  mi_tld_t* const sweeper = mi_holes_sweep_tld();
-  if ((sweeper == NULL || !sweeper->holes_sweep_full) && page->swept_state == mi_page_sweep_state(page)) {
-    if (sweeper != NULL) { sweeper->holes_sweep_skipped++; }   // nothing was allocated or freed in this page since we swept it
+  if ((tld == NULL || !tld->holes_sweep_full) && page->swept_state == mi_page_sweep_state(page)) {
+    if (tld != NULL) { tld->holes_sweep_skipped++; }   // nothing was allocated or freed in this page since we swept it
     return;
   }
   // Record the state we LEAVE the page in, read back from the page: a nested `mi_malloc` (see
@@ -828,7 +818,7 @@ void _mi_page_purge_holes(mi_page_t* page) {
   // blocks straight back, and changes neither `capacity` nor `used` -- so recording here would
   // say "already swept" for a page that still has holes, and the skip check would then park them
   // until the next full sweep, or forever with `purge_holes_full_every=0`.
-  if (mi_page_purge_holes_walk(page)) {
+  if (mi_page_purge_holes_walk(page, tld)) {
     page->swept_state = mi_page_sweep_state(page);
   }
 }
@@ -1230,7 +1220,7 @@ static void mi_page_free_collect_ex(mi_page_t* page, bool force, bool allow_unpu
   // Free list empty but this page has discarded holes: bring a whole run of them
   // back. Every caller re-checks `mi_page_immediate_available` after collect, so the
   // page becomes usable again without touching the other holes.
-  if (allow_unpurge && page->free == NULL && mi_page_has_purged(page) && !_mi_page_purge_holes_in_progress()) {
+  if (allow_unpurge && page->free == NULL && mi_page_has_purged(page) && !_mi_page_purge_holes_in_progress(page)) {
     _mi_page_unpurge_run(page);
   }
 }
