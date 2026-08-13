@@ -441,6 +441,14 @@ typedef struct mi_page_s {
   // was allocated or freed in it since, so the sweep has nothing new to discard (see
   // `_mi_page_purge_holes`). `MI_PAGE_SWEPT_NONE` means "unknown". Cold, like `purged` above.
   uint32_t                  swept_state;
+
+  // The hole sweep is rewriting THIS page's free list and `purged` bitmap right now (set only by
+  // the thread that holds the page for the sweep, around `_mi_page_purge_holes`). A nested
+  // allocation on that thread must not un-purge a run of this page from under the walk; see
+  // `mi_page_free_collect_ex`. Cold, and deliberately per page rather than thread-local: with
+  // emulated TLS (Android before API 29) reading a `__thread` flag on the allocation slow path
+  // itself allocated and recursed without bound.
+  bool                      purging_holes;
 } mi_page_t;
 
 // An impossible `(capacity,used)` (`used > capacity` never holds): "this page has no sweep state".
@@ -711,10 +719,8 @@ struct mi_tld_s {
   mi_msecs_t            holes_sweep_last;     // when this tld's heaps were last swept (paces `purge_holes_min_interval`)
 
   // Scratch state of the hole sweep running over THIS tld's heaps (by its own thread, or by the
-  // scavenger while it is parked). Deliberately not compiler thread-locals: `purging_holes` is
-  // read on the allocation slow path, and with emulated TLS (Android before API 29) the first
-  // access to a `__thread` variable itself calls `malloc`, which recursed without bound.
-  bool                  purging_holes;        // re-entrancy guard: a sweep is rewriting this tld's free lists right now
+  // scavenger while it is parked), passed down the sweep explicitly rather than kept in compiler
+  // thread-locals (see `mi_page_t.purging_holes` for why the sweep avoids those).
   bool                  holes_sweep_full;     // this sweep ignores `page->swept_state`
   size_t                holes_sweep_skipped;  // per-sweep counters, folded into the process-wide stats at `_end`
   size_t                holes_sweep_visited;

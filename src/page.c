@@ -58,6 +58,7 @@ void _mi_page_purged_reset(mi_page_t* page) {
   page->unformed_purged_lo = 0;
   page->unformed_purged_hi = 0;
   page->swept_state = MI_PAGE_SWEPT_NONE;   // a fresh (or recycled) page was never swept
+  page->purging_holes = false;
 }
 
 // The block state of the page, as the sweep sees it (see `_mi_page_purge_holes`). The pack is
@@ -472,39 +473,20 @@ static void mi_holes_count_reuse(size_t bytes, size_t blocks, bool reused) {
   mi_atomic_addi64_relaxed(&mi_holes_blocks, -(int64_t)blocks);
 }
 
-// The sweep's scratch state (`purging_holes`, `holes_sweep_*`) lives on the tld whose heaps are being
-// swept -- see `mi_tld_s` -- and is passed down explicitly, so nothing here reads compiler thread
-// locals (with emulated TLS, e.g. Android before API 29, the first access to a `__thread` variable
-// allocates, and `_mi_page_purge_holes_in_progress` is reached from the allocation slow path).
-// The sweeping thread owns that tld for the duration: it is either its own, or a parked thread's
-// that it claimed (MI_PARK_SWEEPING).
+// The sweep's per-pass state (`holes_sweep_*`) lives on the tld whose heaps are being swept -- see
+// `mi_tld_s` -- and is passed down explicitly; the re-entrancy guard is the per-page
+// `page->purging_holes` (see `mi_page_t`). Neither reads compiler thread-locals: with emulated TLS
+// (Android before API 29) the first access to a `__thread` variable allocates, and the guard is
+// consulted from the allocation slow path.
 //
-// - `purging_holes` is the re-entrancy guard: while the sweep is rewriting a page's free list and
-//   bitmap, a nested `mi_malloc` on the sweeping thread (only reachable through a user output
-//   function from a warning message) must not un-purge a hole from under it. Such an allocation
-//   can only come from a page of the swept tld when the sweeper is the owner itself, which is why
-//   the reader consults the page owner's tld.
 // - `holes_sweep_skipped/visited` are per-sweep counters. The sweep runs over every page of the
 //   thread, so a process-wide atomic per page would be a real cost on the very path we are making
 //   cheap: accumulate on the tld and fold them in once per pass, in `_mi_page_purge_holes_end`.
 // - `holes_sweep_full` is whether THIS sweep ignores `page->swept_state` (see `_mi_page_purge_holes`).
 //   Set once per idle sweep, in `_mi_page_purge_holes_sweep_begin`, paced by the same tld's sequence.
 
-bool _mi_page_purge_holes_in_progress(const mi_page_t* page) {
-  const mi_theap_t* const theap = page->theap;   // NULL for an abandoned page: nobody allocates from those
-  return (theap != NULL && theap->tld != NULL && theap->tld->purging_holes);
-}
-
-void _mi_page_purge_holes_begin(mi_tld_t* tld) {
-  mi_assert_internal(tld != NULL && !tld->purging_holes);
-  if (tld == NULL) return;
-  tld->purging_holes = true;
-}
-
 void _mi_page_purge_holes_end(mi_tld_t* tld) {
-  mi_assert_internal(tld != NULL && tld->purging_holes);
-  if (tld == NULL) return;
-  tld->purging_holes = false;
+  mi_assert_internal(tld != NULL);
   if (tld->holes_sweep_skipped > 0) {
     mi_atomic_addi64_relaxed(&mi_holes_pages_skipped, (int64_t)tld->holes_sweep_skipped);
     tld->holes_sweep_skipped = 0;
@@ -515,6 +497,7 @@ void _mi_page_purge_holes_end(mi_tld_t* tld) {
   }
 }
 
+// Called once per idle sweep of `tld`'s heaps, before its passes (`mi_purge_holes_of`).
 void _mi_page_purge_holes_sweep_begin(mi_tld_t* tld) {
   const long every = mi_option_get(mi_option_purge_holes_full_every);
   const size_t seq = ++tld->holes_sweep_seq;
@@ -799,7 +782,7 @@ static bool mi_page_purge_holes_walk(mi_page_t* page, mi_tld_t* tld) {
 // regardless, which caps the delay of a missed discard at N parks for 1/N of the old cost.
 // (An exact "was anything freed in this page" bit is the alternative, and it costs a store in
 // `mi_free` itself -- the hot path this whole feature stays off.)
-void _mi_page_purge_holes(mi_page_t* page, mi_tld_t* tld) {
+static void mi_page_purge_holes_held(mi_page_t* page, mi_tld_t* tld) {
   mi_assert_internal(page != NULL);
   if (!mi_option_is_enabled(mi_option_purge_holes)) return;
   if (mi_page_all_free(page)) return;                     // the page itself is about to be freed
@@ -812,7 +795,7 @@ void _mi_page_purge_holes(mi_page_t* page, mi_tld_t* tld) {
     return;
   }
   // Record the state we LEAVE the page in, read back from the page: a nested `mi_malloc` (see
-  // `purging_holes`) may have taken a block out of it while we walked.
+  // `page->purging_holes`) may have taken a block out of it while we walked.
   //
   // Only if the walk got everything. A failed `_mi_os_discard` (ENOMEM under pressure) puts its
   // blocks straight back, and changes neither `capacity` nor `used` -- so recording here would
@@ -821,6 +804,15 @@ void _mi_page_purge_holes(mi_page_t* page, mi_tld_t* tld) {
   if (mi_page_purge_holes_walk(page, tld)) {
     page->swept_state = mi_page_sweep_state(page);
   }
+}
+
+// `tld`: the tld whose heaps this sweep runs over (for its per-sweep state); the caller holds `page`
+// exclusively (it is the owner, sweeps a parked owner's theap, or claimed the abandoned page).
+void _mi_page_purge_holes(mi_page_t* page, mi_tld_t* tld) {
+  mi_assert_internal(!page->purging_holes);
+  page->purging_holes = true;    // a nested allocation on this thread must not un-purge under the walk
+  mi_page_purge_holes_held(page, tld);
+  page->purging_holes = false;
 }
 
 // Bring the first run of discarded OS pages back onto the free list. Only that run is
@@ -1220,7 +1212,7 @@ static void mi_page_free_collect_ex(mi_page_t* page, bool force, bool allow_unpu
   // Free list empty but this page has discarded holes: bring a whole run of them
   // back. Every caller re-checks `mi_page_immediate_available` after collect, so the
   // page becomes usable again without touching the other holes.
-  if (allow_unpurge && page->free == NULL && mi_page_has_purged(page) && !_mi_page_purge_holes_in_progress(page)) {
+  if (allow_unpurge && page->free == NULL && mi_page_has_purged(page) && !page->purging_holes) {
     _mi_page_unpurge_run(page);
   }
 }

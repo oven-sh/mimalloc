@@ -898,11 +898,9 @@ void          _mi_page_unpurge_unformed_upto(mi_page_t* page, uintptr_t end);   
 size_t        _mi_page_unformed_purged_bytes(const mi_page_t* page);            // the bytes of this page's unformed tail that are discarded right now
 bool          _mi_page_purge_os_page_blocks(size_t os_page_size, size_t block_size, uintptr_t page_start,
                                             size_t capacity, size_t k, size_t* first, size_t* last);
-bool          _mi_page_purge_holes_in_progress(const mi_page_t* page);
 void          _mi_page_holes_count_page_freed(void);
 void          _mi_page_holes_count_ineligible(const mi_page_t* page);
 void          _mi_page_holes_reset_ineligible(void);
-void          _mi_page_purge_holes_begin(mi_tld_t* tld);
 void          _mi_page_purge_holes_end(mi_tld_t* tld);
 void          _mi_page_purge_holes_sweep_begin(mi_tld_t* tld);   // once per idle sweep, before its passes
 

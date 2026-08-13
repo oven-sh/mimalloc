@@ -1329,7 +1329,7 @@ void _mi_arenas_page_unabandon(mi_page_t* page, mi_theap_t* current_theapx) {
 
 typedef struct mi_purge_holes_arg_s {
   mi_bitmap_t* bitmap;
-  mi_tld_t*    tld;      // whose park we are sweeping under; NULL when not a parked sweep
+  mi_tld_t*    tld;      // the tld whose heaps this sweep runs over (paces the sweep and holds its counters)
 } mi_purge_holes_arg_t;
 
 static bool mi_arena_page_purge_holes_at(size_t slice_index, size_t slice_count, mi_arena_t* arena, void* arg) {
@@ -1353,8 +1353,8 @@ static bool mi_arena_page_purge_holes_at(size_t slice_index, size_t slice_count,
   }
 
   // We own the page: no other thread can reclaim, unabandon, or free it now, and only the
-  // atomic `xthread_free` can still change under us.
-  _mi_page_free_collect(page, true);
+  // atomic `xthread_free` can still change under us. Nothing to serve here: never un-purge.
+  _mi_page_free_collect_no_unpurge(page, true);
   if (mi_page_all_free(page)) {
     mi_bitmap_set(bitmap, slice_index);   // `_mi_arenas_page_unabandon` expects it in the map
     _mi_arenas_page_unabandon(page, NULL);
@@ -1374,7 +1374,6 @@ static bool mi_arena_page_purge_holes_at(size_t slice_index, size_t slice_count,
 void _mi_arenas_purge_abandoned_holes(mi_heap_t* heap, mi_tld_t* tld) {
   if (heap == NULL) return;
   if (!mi_option_is_enabled(mi_option_purge_holes)) return;
-  _mi_page_purge_holes_begin(tld);
   mi_forall_arenas(heap, ((mi_arena_t*)NULL), 0, arena) {
     mi_arena_pages_t* const arena_pages = mi_heap_arena_pages(heap, arena);
     if (arena_pages != NULL) {
