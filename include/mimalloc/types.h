@@ -709,6 +709,15 @@ struct mi_tld_s {
   mi_tld_t*             subproc_next;         // list of tlds in the subproc, so the scavenger can find parked threads
   size_t                holes_sweep_seq;      // idle sweeps run over THIS tld's heaps (paces `purge_holes_full_every`)
   mi_msecs_t            holes_sweep_last;     // when this tld's heaps were last swept (paces `purge_holes_min_interval`)
+
+  // Scratch state of a hole sweep run BY this thread (over its own or a parked thread's heaps).
+  // Deliberately not compiler thread-locals: `purging_holes` is read on the allocation slow path,
+  // and with emulated TLS (Android before API 29) the first access to a `__thread` variable
+  // itself calls `malloc`, which recursed without bound on a fresh thread.
+  bool                  purging_holes;        // re-entrancy guard: a sweep is rewriting free lists on this thread right now
+  bool                  holes_sweep_full;     // this sweep ignores `page->swept_state`
+  size_t                holes_sweep_skipped;  // per-sweep counters, folded into the process-wide stats at `_end`
+  size_t                holes_sweep_visited;
 };
 
 
