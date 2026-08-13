@@ -869,6 +869,33 @@ if (MI_BUILD_TESTS)
   # and sweep every park, so the reclaim path is hit as hard as possible
   add_test(NAME test-park-handoff-eager COMMAND ${CMAKE_COMMAND} -E env MIMALLOC_PURGE_HOLES_MIN_INTERVAL=0 $<TARGET_FILE:mimalloc-test-park-handoff>)
 
+  # The allocator must never touch one of its own `__thread` variables from inside an allocation:
+  # where `__thread` is emulated (Android before API 29) the first access on a thread mallocs, and
+  # with the allocator being malloc that is a re-entrant allocation (oven-sh/bun#38051). Build the
+  # allocator once more with emulated TLS, as malloc, in the TLS model Android uses, and link
+  # test/test-emulated-tls.c against that build. Only compilers that can emulate TLS (clang); the
+  # sanitizers bring their own malloc.
+  if(MI_OVERRIDE AND NOT WIN32 AND NOT (MI_TRACK_ASAN OR MI_TRACK_VALGRIND OR MI_DEBUG_TSAN OR MI_DEBUG_UBSAN))
+    include(CheckCCompilerFlag)
+    check_c_compiler_flag("-femulated-tls" MI_HAS_EMULATED_TLS)
+    if(MI_HAS_EMULATED_TLS)
+      set(mi_emutls_defines ${mi_defines})
+      list(FILTER mi_emutls_defines EXCLUDE REGEX "^MI_TLS_MODEL_")
+      add_library(mimalloc-emulated-tls STATIC ${mi_sources})
+      target_compile_definitions(mimalloc-emulated-tls PRIVATE ${mi_emutls_defines} MI_STATIC_LIB MI_MALLOC_OVERRIDE MI_TLS_MODEL_PTHREADS=1)
+      target_compile_options(mimalloc-emulated-tls PRIVATE ${mi_cflags} -femulated-tls)
+      target_include_directories(mimalloc-emulated-tls PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>)
+      target_link_libraries(mimalloc-emulated-tls PRIVATE ${mi_libraries})
+      add_executable(mimalloc-test-emulated-tls test/test-emulated-tls.c)
+      target_compile_definitions(mimalloc-test-emulated-tls PRIVATE ${mi_emutls_defines})
+      target_compile_options(mimalloc-test-emulated-tls PRIVATE ${mi_cflags})
+      target_link_libraries(mimalloc-test-emulated-tls PRIVATE mimalloc-emulated-tls ${mi_libraries})
+      add_test(NAME test-emulated-tls COMMAND mimalloc-test-emulated-tls)
+    else()
+      message(STATUS "The compiler cannot emulate TLS: skipping test-emulated-tls")
+    endif()
+  endif()
+
   # heap snapshot reader CLI (standalone, no mimalloc dependency)
   add_executable(mi-heapview tools/mi-heapview.c)
   target_compile_options(mi-heapview PRIVATE ${mi_cflags})

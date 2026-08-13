@@ -1329,7 +1329,7 @@ void _mi_arenas_page_unabandon(mi_page_t* page, mi_theap_t* current_theapx) {
 
 typedef struct mi_purge_holes_arg_s {
   mi_bitmap_t* bitmap;
-  mi_tld_t*    tld;      // whose park we are sweeping under; NULL when not a parked sweep
+  mi_tld_t*    tld;      // the thread whose sweep this is (its own, or the parked one the scavenger is sweeping for)
 } mi_purge_holes_arg_t;
 
 static bool mi_arena_page_purge_holes_at(size_t slice_index, size_t slice_count, mi_arena_t* arena, void* arg) {
@@ -1337,7 +1337,7 @@ static bool mi_arena_page_purge_holes_at(size_t slice_index, size_t slice_count,
   mi_purge_holes_arg_t* const parg = (mi_purge_holes_arg_t*)arg;
   // this pass holds every page that ever became full, so it is most of a cold sweep: an owner
   // waiting in `_mi_park_leave` cannot allocate until we stop
-  if (parg->tld != NULL && mi_atomic_load_relaxed(&parg->tld->park_reclaim) != 0) return false;
+  if (mi_atomic_load_relaxed(&parg->tld->park_reclaim) != 0) return false;
   mi_bitmap_t* const bitmap = parg->bitmap;
 
   // Take the page out of the abandoned map first: this is the reader side of the protocol in
@@ -1353,8 +1353,8 @@ static bool mi_arena_page_purge_holes_at(size_t slice_index, size_t slice_count,
   }
 
   // We own the page: no other thread can reclaim, unabandon, or free it now, and only the
-  // atomic `xthread_free` can still change under us.
-  _mi_page_free_collect(page, true);
+  // atomic `xthread_free` can still change under us. (No un-purging: we are about to purge.)
+  _mi_page_free_collect_no_unpurge(page, true);
   if (mi_page_all_free(page)) {
     mi_bitmap_set(bitmap, slice_index);   // `_mi_arenas_page_unabandon` expects it in the map
     _mi_arenas_page_unabandon(page, NULL);
@@ -1362,7 +1362,7 @@ static bool mi_arena_page_purge_holes_at(size_t slice_index, size_t slice_count,
     _mi_page_holes_count_page_freed();
     return true;
   }
-  _mi_page_purge_holes(page);
+  _mi_page_purge_holes(page, parg->tld);
   mi_bitmap_set(bitmap, slice_index);     // back in the map *before* unowning: unown may free the page
   mi_abandoned_page_unown(page, NULL);
   return true;
@@ -1372,9 +1372,9 @@ static bool mi_arena_page_purge_holes_at(size_t slice_index, size_t slice_count,
 // A page abandoned while full is not mapped; it has no free blocks at that point, and once
 // enough blocks are freed in it, `_mi_arenas_page_try_reabandon_to_mapped` puts it in the map.
 void _mi_arenas_purge_abandoned_holes(mi_heap_t* heap, mi_tld_t* tld) {
-  if (heap == NULL) return;
+  if (heap == NULL || tld == NULL) return;
   if (!mi_option_is_enabled(mi_option_purge_holes)) return;
-  _mi_page_purge_holes_begin();
+  _mi_page_purge_holes_begin(tld);
   mi_forall_arenas(heap, ((mi_arena_t*)NULL), 0, arena) {
     mi_arena_pages_t* const arena_pages = mi_heap_arena_pages(heap, arena);
     if (arena_pages != NULL) {
@@ -1389,7 +1389,7 @@ void _mi_arenas_purge_abandoned_holes(mi_heap_t* heap, mi_tld_t* tld) {
     }
   }
   mi_forall_arenas_end();
-  _mi_page_purge_holes_end();
+  _mi_page_purge_holes_end(tld);
 }
 
 // The read-only counterpart of the sweep above: account for the holes in the abandoned pages
