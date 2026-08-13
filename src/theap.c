@@ -7,7 +7,7 @@ terms of the MIT license. A copy of the license can be found in the file
 
 #include "mimalloc.h"
 #include "mimalloc/internal.h"
-#include "mimalloc/prim.h"       // _mi_prim_thread_yield
+#include "mimalloc/prim.h"      // _mi_prim_thread_yield
 #include "mimalloc/prim-tls.h"  // _mi_theap_default
 
 #if defined(_MSC_VER) && (_MSC_VER < 1920)
@@ -24,7 +24,7 @@ typedef bool (theap_page_visitor_fun)(mi_theap_t* theap, mi_page_queue_t* pq, mi
 // Visit all pages in a theap; returns `false` if break was called.
 static bool mi_theap_visit_pages(mi_theap_t* theap, theap_page_visitor_fun* fn, bool include_full, void* arg1, void* arg2)
 {
-  if (theap==NULL || theap->page_count==0) return 0;
+  if (theap==NULL || theap->page_count==0) return true;
 
   // visit all pages
   #if MI_DEBUG>1
@@ -119,7 +119,7 @@ static bool mi_theap_page_collect(mi_theap_t* theap, mi_page_queue_t* pq, mi_pag
   return true; // don't break
 }
 
-static void mi_theap_merge_stats(mi_theap_t* theap) {
+void _mi_theap_merge_stats(mi_theap_t* theap) {
   mi_assert_internal(mi_theap_is_initialized(theap));
   mi_heap_t* const heap = _mi_theap_heap(theap);
   _mi_stats_merge_into(&heap->stats, &theap->stats);
@@ -136,8 +136,8 @@ static void mi_theap_collect_ex(mi_theap_t* theap, mi_collect_t collect)
   // python/cpython#112532: we may be called from a thread that is not the owner of the theap
   // const bool is_main_thread = (_mi_is_main_thread() && theap->thread_id == _mi_thread_id());
 
-  // collect retired pages
-  _mi_theap_collect_retired(theap, force);
+  // collect retired pages (and full pages if theap->allow_page_abandon is false)
+  _mi_theap_collect_retired(theap, force); 
 
   // collect all pages owned by this thread
   mi_theap_visit_pages(theap, &mi_theap_page_collect, (collect!=MI_NORMAL), &collect, NULL);  // dont normally visit full pages, see issue #1220
@@ -153,7 +153,7 @@ static void mi_theap_collect_ex(mi_theap_t* theap, mi_collect_t collect)
   }
 
   // merge statistics
-  mi_theap_merge_stats(theap);
+  _mi_theap_merge_stats(theap);
 }
 
 void _mi_theap_collect_abandon(mi_theap_t* theap) {
@@ -442,6 +442,52 @@ mi_theap_t* mi_theap_set_default(mi_theap_t* theap) {
   return previous;
 }
 
+#if MI_GUARDED
+mi_decl_export void mi_theap_guarded_set_sample_rate(mi_theap_t* theap, size_t sample_rate, size_t seed) {
+  theap->guarded_sample_rate  = sample_rate;
+  theap->guarded_sample_count = sample_rate;  // count down samples
+  if (theap->guarded_sample_rate > 1) {
+    if (seed == 0) {
+      seed = _mi_theap_random_next(theap);
+    }
+    theap->guarded_sample_count = (seed % theap->guarded_sample_rate) + 1;  // start at random count between 1 and `sample_rate`
+  }
+}
+
+mi_decl_export void mi_theap_guarded_set_size_bound(mi_theap_t* theap, size_t min, size_t max) {
+  theap->guarded_size_min = min;
+  theap->guarded_size_max = (min > max ? min : max);
+}
+
+static void mi_theap_guarded_init(mi_theap_t* theap) {
+  mi_theap_guarded_set_sample_rate(theap,
+    (size_t)mi_option_get_clamp(mi_option_guarded_sample_rate, 0, LONG_MAX),
+    (size_t)mi_option_get(mi_option_guarded_sample_seed));
+  mi_theap_guarded_set_size_bound(theap,
+    (size_t)mi_option_get_clamp(mi_option_guarded_min, 0, LONG_MAX),
+    (size_t)mi_option_get_clamp(mi_option_guarded_max, 0, LONG_MAX) );
+}
+#else
+mi_decl_export void mi_theap_guarded_set_sample_rate(mi_theap_t* theap, size_t sample_rate, size_t seed) {
+  MI_UNUSED(theap); MI_UNUSED(sample_rate); MI_UNUSED(seed);
+}
+
+mi_decl_export void mi_theap_guarded_set_size_bound(mi_theap_t* theap, size_t min, size_t max) {
+  MI_UNUSED(theap); MI_UNUSED(min); MI_UNUSED(max);
+}
+static void mi_theap_guarded_init(mi_theap_t* theap) {
+  MI_UNUSED(theap);
+}
+#endif
+
+static void mi_theap_options_init(mi_theap_t* theap) {
+  theap->allow_page_reclaim = (mi_option_get(mi_option_page_reclaim_on_free) >= 0);
+  theap->allow_page_abandon = (mi_option_get(mi_option_page_full_retain) >= 0);
+  theap->page_full_retain = mi_option_get_clamp(mi_option_page_full_retain, -1, 32);
+  _mi_prof_theap_init(theap);   // fork: sampling state
+  theap->is_detached = (theap->tld->thread_id == MI_THREADID_DETACHED);
+}
+
 // todo: make order of parameters consistent (but would that break compat with CPython?)
 void _mi_theap_init(mi_theap_t* theap, mi_heap_t* heap, mi_tld_t* tld)
 {
@@ -452,17 +498,15 @@ void _mi_theap_init(mi_theap_t* theap, mi_heap_t* heap, mi_tld_t* tld)
   _mi_memcpy_aligned(theap, &_mi_theap_empty, sizeof(mi_theap_t));
   theap->memid = memid;
   theap->tld   = tld;  // avoid reading the thread-local tld during initialization
-  mi_atomic_store_release(&theap->refcount,1);
-  mi_atomic_store_release(&theap->freed,0);
-  mi_atomic_store_ptr_release(mi_heap_t,&theap->heap,heap);
+  mi_atomic_store_release(&theap->refcount,1);  
   mi_atomic_store_ptr_release(mi_subproc_t,&theap->subproc,heap->subproc);
   mi_assert_internal(theap->stats.size == sizeof(mi_stats_t));
-  
-  _mi_theap_options_init(theap);
+  mi_theap_options_init(theap);
+
   if (theap->tld->is_in_threadpool) {
     // if we run as part of a thread pool it is better to not arbitrarily reclaim abandoned pages into our theap.
     // this is checked in `free.c:mi_free_try_collect_mt`
-    // .. but abandoning is good in this case: halve the full page retain (possibly to 0)
+    // .. but abandoning is good in this case: quarter the full page retain (possibly to 0)
     // (so blocked threads do not hold on to too much memory)
     if (theap->page_full_retain > 0) {
       theap->page_full_retain = theap->page_full_retain / 4;
@@ -484,20 +528,29 @@ void _mi_theap_init(mi_theap_t* theap, mi_heap_t* heap, mi_tld_t* tld)
   }
 
   // initialize random if heap==NULL
-  if (head == NULL) {  // first theap in this thread?
+  if (head==NULL) {  // first theap of the first thread?
     #if defined(_WIN32) && !defined(MI_SHARED_LIB)
+    if (tld->thread_seq==0) {
       _mi_random_init_weak(&theap->random);    // prevent allocation failure during bcrypt dll initialization with static linking (issue #1185)
-    #else
-      _mi_random_init(&theap->random);
+    }
+    else
     #endif
+    {
+      _mi_random_init(&theap->random);
+    }
   }
   else {
     _mi_random_split(&head_random, &theap->random); // &theap->random is used as nonce so it is ok if threads capture the same head->random
   }
   theap->cookie = _mi_theap_random_next(theap) | 1;
-  _mi_theap_guarded_init(theap);
-  mi_subproc_stat_increase(_mi_theap_subproc(theap),theaps,1);  // on subproc to match theap_free_mem
+  mi_theap_guarded_init(theap); // needs theap->random
+  if (!theap->is_detached) {
+    mi_subproc_stat_increase(_mi_theap_subproc(theap),theaps,1);  // on subproc to match theap_free_mem
+  }
 
+  // only now set the heap member as it is used to determine if a theap is initialized
+  mi_atomic_store_ptr_release(mi_heap_t,&theap->heap,heap);
+  
   // push on the heap's theap list
   mi_lock(&heap->theaps_lock) {
     head = heap->theaps;
@@ -508,10 +561,10 @@ void _mi_theap_init(mi_theap_t* theap, mi_heap_t* heap, mi_tld_t* tld)
   }
 }
 
-mi_theap_t* _mi_theap_create(mi_heap_t* heap, mi_tld_t* tld) {
+mi_theap_t* _mi_theap_alloc(mi_heap_t* heap, mi_tld_t* tld) {
   mi_assert_internal(tld!=NULL);
   mi_assert_internal(heap!=NULL);
-  mi_assert_internal(_mi_thread_id() == tld->thread_id);
+  mi_assert_internal(tld->thread_id == MI_THREADID_DETACHED || _mi_thread_id() == tld->thread_id);
   // mi_assert_internal(_mi_heap_theap_peek(heap)==NULL);  // don't access thread locals as this is called on thread init
 
   // allocate and initialize a theap
@@ -533,7 +586,13 @@ mi_theap_t* _mi_theap_create(mi_heap_t* heap, mi_tld_t* tld) {
   }
 
   theap->memid = memid;
-  _mi_theap_init(theap, heap, tld);  
+  return theap;
+}
+
+mi_theap_t* _mi_theap_create(mi_heap_t* heap, mi_tld_t* tld) {
+  mi_theap_t* theap = _mi_theap_alloc(heap,tld);
+  if (theap == NULL) return NULL;
+  _mi_theap_init(theap, heap, tld);
   return theap;
 }
 
@@ -543,18 +602,11 @@ uintptr_t _mi_theap_random_next(mi_theap_t* theap) {
 
 static void mi_theap_free_mem(mi_theap_t* theap) {
   if (theap!=NULL) {
-    mi_subproc_stat_decrease(_mi_theap_subproc(theap),theaps,1);
-    // free the used memory
-    if (theap->memid.memkind == MI_MEM_HEAP_MAIN) {  // note: for now unused as it would access theap_default stats in mi_free of the current theap
-      mi_assert_internal(_mi_is_heap_main(mi_heap_of(theap)));
-      _mi_free_subproc_safe(theap);
+    mi_subproc_t* const subproc = mi_atomic_load_ptr_relaxed(mi_subproc_t,&theap->subproc);      
+    if (!theap->is_detached) {
+      mi_subproc_stat_decrease(subproc,theaps,1);  
     }
-    else if (theap->memid.memkind == MI_MEM_META) {
-      _mi_meta_free(_mi_theap_subproc(theap), theap, sizeof(*theap), theap->memid);
-    }
-    else {
-      _mi_arenas_free(_mi_theap_subproc(theap), theap, _mi_align_up(sizeof(*theap),MI_ARENA_MIN_OBJ_SIZE), theap->memid ); // issue #1168, avoid assertion failure
-    }
+    _mi_meta_free(subproc, theap, theap->memid);
   }
 }
 
@@ -573,70 +625,86 @@ void _mi_theap_decref(mi_theap_t* theap) {
   }
 }
 
+// Thread termination and heap delete/destroy might run concurrently 
+// and we need to ensure we free the memory correctly. A heap or tld
+// will first "detach" its theaps so it has a list with theaps that are
+// no longer shared, and only then free's the theaps in that list.
+// To detach we need to hold both the `heap->theaps_lock` and the `tld->theaps_lock`.
+// Due to lock-inversion we need to use `mi_lock_try_acquire` and if that fails
+// we back-off, release the outer lock, and try again until we succeed.
 
-// called from `mi_theap_delete` to free the internal theap resources.
-bool _mi_theap_free(mi_theap_t* theap, bool acquire_heap_theaps_lock, bool acquire_tld_theaps_lock) {
-  mi_assert(theap != NULL);
-  if (theap==NULL) return true;
-
-  // ensure only one thread actually frees the theap
-  const size_t freed = mi_atomic_exchange_acq_rel( &theap->freed, 1 );
-  if (freed!=0) {
-    // concurrent interaction, retry in an outer loop (as the other thread may be blocked on our lock)
-    return false;
-  }
-  else {
-    // We won the `freed` exchange, so we own the free. Before doing any blocking work, secure
-    // both inner locks with try-acquire so the caller's retry loop can fire under contention.
-    // (Blocking here while the caller still holds its outer lock can complete a wait-for cycle
-    // with another `mi_heap_delete`, thread exit, or `_mi_process_fork_prepare`.)
-    mi_heap_t* const heap = _mi_theap_heap(theap);
-    bool got_hlock = !acquire_heap_theaps_lock;
-    bool got_tlock = !acquire_tld_theaps_lock;
-    if (acquire_heap_theaps_lock) { got_hlock = mi_lock_try_acquire(&heap->theaps_lock); }
-    if (got_hlock && acquire_tld_theaps_lock) { got_tlock = mi_lock_try_acquire(&theap->tld->theaps_lock); }
-    if (!got_hlock || !got_tlock) {
-      // back out: release what we took and give the claim back, so the retry can win it again.
-      // (`theap->heap` is untouched here -- it is only NULLed once the free actually completes.)
-      if (got_hlock && acquire_heap_theaps_lock) { mi_lock_release(&heap->theaps_lock); }
-      mi_atomic_store_release(&theap->freed, (size_t)0);
-      return false;  // caller releases its outer lock, yields, and retries
+// Remove the theaps in this heap from any thread local tld lists.
+void _mi_heap_detach_theaps( mi_heap_t* heap ) {
+  bool all_detached;
+  do {
+    all_detached = true;
+    mi_lock(&heap->theaps_lock) {
+      mi_theap_t* theap = heap->theaps;
+      while (theap != NULL) {
+        mi_theap_t* next = theap->hnext;
+        mi_tld_t* tld = theap->tld; 
+        if (tld != NULL) {
+          if (mi_lock_try_acquire(&tld->theaps_lock)) {
+            // remove the theap from the tld theaps list
+            if (theap->tnext != NULL) { theap->tnext->tprev = theap->tprev;  }
+            if (theap->tprev != NULL) { theap->tprev->tnext = theap->tnext;  }
+                                else { mi_assert_internal(theap->tld->theaps == theap); theap->tld->theaps = theap->tnext; }
+            theap->tnext = theap->tprev = NULL;       
+            theap->tld = NULL;
+            mi_lock_release(&tld->theaps_lock);
+          }
+          else {
+            all_detached = false;
+          }
+        }
+        theap = next;
+      }
     }
-
-    // merge stats to the owning heap
-    _mi_stats_merge_into(&heap->stats, &theap->stats);
-
-    // remove ourselves from the heap theaps list (lock already held if needed)
-    if (theap->hnext != NULL) { theap->hnext->hprev = theap->hprev; }
-    if (theap->hprev != NULL) { theap->hprev->hnext = theap->hnext; }
-                        else { mi_assert_internal(heap->theaps == theap); heap->theaps = theap->hnext; }
-    theap->hnext = theap->hprev = NULL;
-    if (acquire_heap_theaps_lock) { mi_lock_release(&heap->theaps_lock); }
-
-    // remove ourselves from the thread local theaps list (lock already held if needed)
-    if (theap->tnext != NULL) { theap->tnext->tprev = theap->tprev;  }
-    if (theap->tprev != NULL) { theap->tprev->tnext = theap->tnext;  }
-                        else { mi_assert_internal(theap->tld->theaps == theap); theap->tld->theaps = theap->tnext; }
-    theap->tnext = theap->tprev = NULL;
-    if (acquire_tld_theaps_lock) { mi_lock_release(&theap->tld->theaps_lock); }
-
-    // Set heap to NULL only after we are removed from the thread local theaps list since
-    // we may concurrently traverse it to collect (in `init.c:mi_thread_theaps_done`)
-    // (We need to set it to NULL to avoid an ABA problem where the _mi_theap_cached
-    // has a heap address that is reused for a newly allocated heap.)
-    mi_atomic_store_ptr_release(mi_heap_t, &theap->heap, NULL);
-    theap->tld = NULL;
-    // clear the per-thread cached theap if it is this one (this only catches the case where
-    // the *current* thread is the one freeing; cross-thread callers cannot reach the owning
-    // thread's TLS, but cache lookups still re-validate via `theap->heap` which is now NULL)
-    if (_mi_theap_cached() == theap) {
-      _mi_theap_cached_set((mi_theap_t*)&_mi_theap_empty);
+    if (!all_detached) {
+      mi_subproc_stat_counter_increase(heap->subproc,heaps_delete_wait,1);
+      _mi_prim_thread_yield();
     }
-    // leave subproc field as is for free-ing
-    _mi_theap_decref(theap);
-    return true;
-  }
+  } while (!all_detached);
 }
+
+// Remove the theaps in this thread from the heaps that own them.
+void _mi_tld_detach_theaps( mi_tld_t* tld ) {
+  bool all_detached;
+  do {
+    all_detached = true;
+    mi_lock(&tld->theaps_lock) {
+      mi_theap_t* theap = tld->theaps;
+      while (theap != NULL) {
+        mi_theap_t* next = theap->tnext;
+        mi_assert_internal(theap->page_count==0);
+        mi_heap_t* heap = _mi_theap_heap_peek(theap); // now the heap might be NULL from an earlier iteration
+        if (heap != NULL) {
+          if (mi_lock_try_acquire(&heap->theaps_lock)) {
+            // merge stats into the owning heap stats
+            _mi_stats_merge_into(&heap->stats, &theap->stats);
+            // remove the theap from the heap list
+            if (theap->hnext != NULL) { theap->hnext->hprev = theap->hprev; }
+            if (theap->hprev != NULL) { theap->hprev->hnext = theap->hnext; }
+                                else { mi_assert_internal(heap->theaps == theap); heap->theaps = theap->hnext; }
+            theap->hnext = theap->hprev = NULL;
+            // and set `heap` to NULL
+            mi_atomic_store_ptr_release(mi_heap_t, &theap->heap, NULL);
+            mi_lock_release(&heap->theaps_lock);
+          }
+          else {
+            all_detached = false;
+          }
+        }
+        theap = next;
+      }
+    }
+    if (!all_detached) {
+      mi_subproc_stat_counter_increase(tld->subproc,heaps_delete_wait,1);
+      _mi_prim_thread_yield();
+    }
+  } while (!all_detached);
+}
+
 
 
 /* -----------------------------------------------------------
@@ -644,19 +712,19 @@ bool _mi_theap_free(mi_theap_t* theap, bool acquire_heap_theaps_lock, bool acqui
 ----------------------------------------------------------- */
 
 // Safe delete a theap without freeing any still allocated blocks in that theap.
-void _mi_theap_delete(mi_theap_t* theap, bool acquire_tld_theaps_lock)
-{
-  mi_assert(theap != NULL);
-  mi_assert(mi_theap_is_initialized(theap));
-  mi_assert_expensive(mi_theap_is_valid(theap));
-  if (theap==NULL || !mi_theap_is_initialized(theap)) return;
+// void _mi_theap_delete(mi_theap_t* theap, bool acquire_tld_theaps_lock)
+// {
+//   mi_assert(theap != NULL);
+//   mi_assert(mi_theap_is_initialized(theap));
+//   mi_assert_expensive(mi_theap_is_valid(theap));
+//   if (theap==NULL || !mi_theap_is_initialized(theap)) return;
 
-  // abandon all pages
-  _mi_theap_collect_abandon(theap);
+//   // abandon all pages
+//   _mi_theap_collect_abandon(theap);
 
-  mi_assert_internal(theap->page_count==0);
-  _mi_theap_free(theap, true /* acquire heap->theaps_lock */, acquire_tld_theaps_lock);
-}
+//   mi_assert_internal(theap->page_count==0);
+//   _mi_theap_free(theap, true /* acquire heap->theaps_lock */, acquire_tld_theaps_lock);
+// }
 
 
 
@@ -710,7 +778,7 @@ bool mi_theap_reload(mi_theap_t* theap, mi_arena_id_t arena_id) {
   // reinit direct pages (as we may be in a different process)
   mi_assert_internal(theap->page_count == 0);
   for (size_t i = 0; i < MI_PAGES_DIRECT; i++) {
-    theap->pages_free_direct[i] = (mi_page_t*)&_mi_page_empty;
+    theap->pages_free_direct[i] = _mi_page_empty_get();
   }
 
   // push on the thread local theaps list
@@ -871,11 +939,11 @@ bool _mi_theap_area_visit_blocks(const mi_heap_area_t* area, mi_page_t* page, mi
   return true;
 }
 
-bool _mi_page_visit_blocks( mi_page_t* page, mi_block_visit_fun* visitor, void* arg ) {
-  mi_heap_area_t area;
-  _mi_heap_area_init(&area, page);
-  return _mi_theap_area_visit_blocks(&area, page, visitor, arg);
-}
+// bool _mi_page_visit_blocks( mi_page_t* page, mi_block_visit_fun* visitor, void* arg ) {
+//   mi_heap_area_t area;
+//   _mi_heap_area_init(&area, page);
+//   return _mi_theap_area_visit_blocks(&area, page, visitor, arg);
+// }
 
 
 // Separate struct to keep `mi_page_t` out of the public interface

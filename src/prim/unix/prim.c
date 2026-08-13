@@ -288,7 +288,7 @@ int _mi_prim_free(void* addr, size_t size ) {
 
 // return errno on failure
 static int unix_madvise(void* addr, size_t size, int advice) {
-  #if defined(__sun)
+  #if defined(__sun) || defined(_AIX)
   const int res = madvise((caddr_t)addr, size, advice);  // Solaris needs cast (issue #520)
   return (res==0 ? 0 : errno);
   #elif defined(__QNX__)
@@ -370,6 +370,10 @@ static int unix_mmap_fd(void) {
   #endif
 }
 
+#if defined(MAP_ALIGNED_SUPER) || defined(MAP_HUGETLB) || defined(MAP_HUGE_1GB) || defined(MAP_HUGE_2MB) || defined(VM_FLAGS_SUPERPAGE_SIZE_2MB)
+#define MI_OS_HAS_HUGE_PAGES  1
+#endif
+
 static void* unix_mmap(void* addr, size_t size, size_t try_alignment, int protect_flags, bool large_only, bool allow_large, bool* is_large) {
   #if !defined(MAP_ANONYMOUS)
   #define MAP_ANONYMOUS  MAP_ANON
@@ -387,6 +391,7 @@ static void* unix_mmap(void* addr, size_t size, size_t try_alignment, int protec
   protect_flags |= PROT_MAX(PROT_READ | PROT_WRITE); // BSD
   #endif
   // huge page allocation
+  #if MI_OS_HAS_HUGE_PAGES
   if (allow_large && (large_only || (_mi_os_canuse_large_page(size, try_alignment) && mi_option_is_enabled(mi_option_allow_large_os_pages)))) {
     static _Atomic(size_t) large_page_try_ok; // = 0;
     size_t try_ok = mi_atomic_load_acquire(&large_page_try_ok);
@@ -441,7 +446,10 @@ static void* unix_mmap(void* addr, size_t size, size_t try_alignment, int protec
         }
       }
     }
-  }
+  } // huge pages
+  #else
+  MI_UNUSED(large_only);
+  #endif
   // regular allocation
   if (p == NULL) {
     *is_large = false;
@@ -702,7 +710,7 @@ int _mi_prim_alloc_huge_os_pages(void* hint_addr, size_t size, int numa_node, bo
   bool is_large = true;
   *is_zero = true;
   *addr = unix_mmap(hint_addr, size, MI_ARENA_SLICE_ALIGN, PROT_READ | PROT_WRITE, true, true, &is_large);
-  if (*addr != NULL && numa_node >= 0 && numa_node < 8*MI_INTPTR_SIZE) { // at most 64 nodes
+  if (*addr != NULL && numa_node >= 0 && numa_node < (8*MI_INTPTR_SIZE - 1)) { // at most 63 nodes
     unsigned long numa_mask = (1UL << numa_node);
     // todo: does `mbind` work correctly for huge OS pages? should we
     // use `set_mempolicy` before calling mmap instead?
@@ -735,9 +743,9 @@ int _mi_prim_alloc_huge_os_pages(void* hint_addr, size_t size, int numa_node, bo
 
 size_t _mi_prim_numa_node(void) {
   #if defined(MI_HAS_SYSCALL_H) && defined(SYS_getcpu)
-    unsigned long node = 0;
-    unsigned long ncpu = 0;
-    long err = syscall(SYS_getcpu, &ncpu, &node, NULL);
+    unsigned int node = 0;
+    unsigned int ncpu = 0;
+    int err = syscall(SYS_getcpu, &ncpu, &node, NULL);
     if (err != 0) return 0;
     return node;
   #else
@@ -747,13 +755,16 @@ size_t _mi_prim_numa_node(void) {
 
 size_t _mi_prim_numa_node_count(void) {
   char buf[128];
-  unsigned node = 0;
-  for(node = 0; node < 256; node++) {
+  unsigned last_found = 1;
+  for(unsigned node = 1; node < 256; node++) {
     // enumerate node entries -- todo: it there a more efficient way to do this? (but ensure there is no allocation)
-    _mi_snprintf(buf, 127, "/sys/devices/system/node/node%u", node + 1);
-    if (mi_prim_access(buf,R_OK) != 0) break;
+    _mi_snprintf(buf, 127, "/sys/devices/system/node/node%u", node);
+    if (mi_prim_access(buf,R_OK) != 0) {
+      if (node - last_found > 4) break; // allow some sparseness of nodes but not more than 4
+    }
+    else { last_found = node; }         // highest found node
   }
-  return (node+1);
+  return last_found;
 }
 
 #elif defined(__FreeBSD__) && __FreeBSD_version >= 1200000
@@ -867,66 +878,68 @@ static mi_msecs_t timeval_secs(const struct timeval* tv) {
 void _mi_prim_process_info(mi_process_info_t* pinfo)
 {
   struct rusage rusage;
-  getrusage(RUSAGE_SELF, &rusage);
-  pinfo->utime = timeval_secs(&rusage.ru_utime);
-  pinfo->stime = timeval_secs(&rusage.ru_stime);
-#if !defined(__HAIKU__)
-  pinfo->page_faults = rusage.ru_majflt;
-#endif
-#if defined(__HAIKU__)
-  // Haiku does not have (yet?) a way to
-  // get these stats per process
-  thread_info tid;
-  area_info mem;
-  ssize_t c;
-  get_thread_info(find_thread(0), &tid);
-  while (get_next_area_info(tid.team, &c, &mem) == B_OK) {
-    pinfo->peak_rss += mem.ram_size;
-  }
-  pinfo->page_faults = 0;
-#elif defined(__APPLE__)
-  pinfo->peak_rss = rusage.ru_maxrss;         // macos reports in bytes
-  #ifdef MACH_TASK_BASIC_INFO
-  struct mach_task_basic_info info;
-  mach_msg_type_number_t infoCount = MACH_TASK_BASIC_INFO_COUNT;
-  if (task_info(mach_task_self(), MACH_TASK_BASIC_INFO, (task_info_t)&info, &infoCount) == KERN_SUCCESS) {
-    pinfo->current_rss = (size_t)info.resident_size;
-  }
-  #else
-  struct task_basic_info info;
-  mach_msg_type_number_t infoCount = TASK_BASIC_INFO_COUNT;
-  if (task_info(mach_task_self(), TASK_BASIC_INFO, (task_info_t)&info, &infoCount) == KERN_SUCCESS) {
-    pinfo->current_rss = (size_t)info.resident_size;
-  }
-  #endif
-#else
-  pinfo->peak_rss = rusage.ru_maxrss * 1024;  // Linux/BSD report in KiB
-  #if defined(__linux__)
-  // Without this `current_rss` keeps its default, which is `current_commit` -- so anything
-  // reporting "rss" on Linux prints committed bytes instead. That is not a rounding error:
-  // a purge that keeps a range committed does not lower commit, so the two diverge by
-  // gigabytes (a Bun crash report read "RSS: 4.91 GB" against a real 0.56 GB peak).
-  {
-    int fd = mi_prim_open("/proc/self/statm", O_RDONLY);
-    if (fd >= 0) {
-      char buf[64];
-      const ssize_t nread = mi_prim_read(fd, buf, sizeof(buf) - 1);
-      mi_prim_close(fd);
-      if (nread > 0) {
-        buf[nread] = 0;
-        // "size resident shared text lib data dt" -- all in pages; we want the 2nd field
-        const char* p = buf;
-        while (*p == ' ') { p++; }
-        while (*p != 0 && *p != ' ') { p++; }     // skip `size`
-        while (*p == ' ') { p++; }
-        size_t resident_pages = 0;
-        while (*p >= '0' && *p <= '9') { resident_pages = (resident_pages * 10) + (size_t)(*p - '0'); p++; }
-        if (resident_pages > 0) { pinfo->current_rss = resident_pages * _mi_os_page_size(); }
+  if (getrusage(RUSAGE_SELF, &rusage) == 0) {
+    pinfo->utime = timeval_secs(&rusage.ru_utime);
+    pinfo->stime = timeval_secs(&rusage.ru_stime);
+    #if !defined(__HAIKU__)
+      pinfo->page_faults = rusage.ru_majflt;
+    #endif
+    #if defined(__APPLE__)
+      pinfo->peak_rss = rusage.ru_maxrss;         // macos reports in bytes
+    #else
+      pinfo->peak_rss = rusage.ru_maxrss * 1024;  // Linux/BSD report in KiB
+    #endif
+    #if defined(__linux__)
+    // Without this `current_rss` keeps its default, which is `current_commit` -- so anything reporting "rss" on Linux prints
+    // committed bytes instead; a purge that keeps a range committed does not lower commit, so the two diverge by gigabytes.
+    {
+      int fd = mi_prim_open("/proc/self/statm", O_RDONLY);
+      if (fd >= 0) {
+        char buf[64];
+        const ssize_t nread = mi_prim_read(fd, buf, sizeof(buf) - 1);
+        mi_prim_close(fd);
+        if (nread > 0) {
+          buf[nread] = 0;
+          const char* q = buf;                                   // "size resident ..." in pages; the 2nd field
+          while (*q == ' ') { q++; }
+          while (*q != 0 && *q != ' ') { q++; }
+          while (*q == ' ') { q++; }
+          size_t resident_pages = 0;
+          while (*q >= '0' && *q <= '9') { resident_pages = (resident_pages * 10) + (size_t)(*q - '0'); q++; }
+          if (resident_pages > 0) { pinfo->current_rss = resident_pages * _mi_os_page_size(); }
+        }
       }
     }
+    #endif
   }
+
+  #if defined(__HAIKU__)
+    // Haiku does not have (yet?) a way to
+    // get these stats per process
+    thread_info tid;
+    if (get_thread_info(find_thread(0), &tid) == B_OK) {
+      area_info mem;
+      ssize_t c;
+      while (get_next_area_info(tid.team, &c, &mem) == B_OK) {
+        pinfo->peak_rss += mem.ram_size;
+      }
+    }
+    pinfo->page_faults = 0;
+  #elif defined(__APPLE__)
+    #ifdef MACH_TASK_BASIC_INFO
+    struct mach_task_basic_info info;
+    mach_msg_type_number_t infoCount = MACH_TASK_BASIC_INFO_COUNT;
+    if (task_info(mach_task_self(), MACH_TASK_BASIC_INFO, (task_info_t)&info, &infoCount) == KERN_SUCCESS) {
+      pinfo->current_rss = (size_t)info.resident_size;
+    }
+    #else
+    struct task_basic_info info;
+    mach_msg_type_number_t infoCount = TASK_BASIC_INFO_COUNT;
+    if (task_info(mach_task_self(), TASK_BASIC_INFO, (task_info_t)&info, &infoCount) == KERN_SUCCESS) {
+      pinfo->current_rss = (size_t)info.resident_size;
+    }
+    #endif
   #endif
-#endif
   // use defaults for commit
 }
 
@@ -984,8 +997,8 @@ int _mi_prim_getenv(const char* name, char* result, size_t result_size) {
     const char* s = env[i];
     if (_mi_strnicmp(name, s, len) == 0 && s[len] == '=') { // case insensitive
       // found it
-      _mi_strlcpy(result, s + len + 1, result_size);
-      return 1;  // success
+      if (!_mi_strlcpy(result, s + len + 1, result_size)) return -1;
+      return 1;   // success
     }
   }
   return 0; // not found
@@ -1006,8 +1019,8 @@ int _mi_prim_getenv(const char* name, char* result, size_t result_size) {
     buf[len] = 0;
     s = getenv(buf);
   }
-  if (s == NULL || _mi_strnlen(s,result_size) >= result_size)  return 0; // not found
-  _mi_strlcpy(result, s, result_size);
+  if (s == NULL || _mi_strnlen(s,result_size) >= result_size) return 0; // not found
+  if (!_mi_strlcpy(result, s, result_size)) return -1;
   return 1;  // success
 }
 #endif  // !MI_USE_ENVIRON
@@ -1037,7 +1050,7 @@ bool _mi_prim_random_buf(void* buf, size_t buf_len) {
   return true;
 }
 
-#elif defined(__APPLE__) || defined(__linux__) || defined(__HAIKU__)   // also for old apple versions < 10.7 (issue #829)
+#elif defined(__APPLE__) || defined(__linux__) || defined(__HAIKU__) || defined(__CYGWIN__)  // also for old apple versions < 10.7 (issue #829)
 
 #include <sys/types.h>
 #include <sys/stat.h>
@@ -1069,7 +1082,10 @@ bool _mi_prim_random_buf(void* buf, size_t buf_len) {
   size_t count = 0;
   while(count < buf_len) {
     ssize_t ret = mi_prim_read(fd, (char*)buf + count, buf_len - count);
-    if (ret<=0) {
+    if (ret==0) {
+      break;
+    }
+    else if (ret<0) {
       if (errno!=EAGAIN && errno!=EINTR) break;
     }
     else {

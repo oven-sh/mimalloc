@@ -257,7 +257,7 @@ static void mi_prof_set_theap(mi_theap_t* theap, bool on) {
   theap->prof_countdown  = (on ? mi_prof_next_countdown(theap) : 0);
   // poison/restore pages_free_direct
   for (size_t i = 0; i < MI_PAGES_DIRECT; i++) {
-    theap->pages_free_direct[i] = (mi_page_t*)&_mi_page_empty;
+    theap->pages_free_direct[i] = _mi_page_empty_get();
   }
   // (when turning off, the slots refill lazily via mi_theap_queue_first_update)
 }
