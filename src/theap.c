@@ -332,25 +332,35 @@ void mi_on_thread_idle_end(void) mi_attr_noexcept {
 // MI_PARK_SWEEPING is what keeps `tld` alive across the sweep without holding `tlds_lock`: every
 // path out of a park (`mi_on_thread_idle_end`, and teardown via `_mi_park_leave`) waits for it to
 // clear before freeing anything. So the lock covers the walk, not the work.
-void _mi_theap_sweep_parked(mi_subproc_t* subproc) {
-  if (subproc == NULL) return;
-  if (mi_atomic_load_relaxed(&subproc->parked_count) == 0) return;
+//
+// Returns in how many msecs a park that was passed over for `purge_holes_min_interval` becomes
+// due (0: none was), so the scavenger can wake for it instead of leaving it to its safety timeout.
+mi_msecs_t _mi_theap_sweep_parked(mi_subproc_t* subproc) {
+  if (subproc == NULL) return 0;
+  if (mi_atomic_load_relaxed(&subproc->parked_count) == 0) return 0;
   for (;;) {
     mi_tld_t* claimed = NULL;
     mi_theap_t* theap0 = NULL;
+    mi_msecs_t due_in = 0;
     mi_lock(&subproc->tlds_lock) {
       const mi_msecs_t now = _mi_clock_now();
       const mi_msecs_t interval = (mi_msecs_t)mi_option_get_clamp(mi_option_purge_holes_min_interval, 0, 3600000);
       for (mi_tld_t* tld = subproc->tlds; tld != NULL; tld = tld->subproc_next) {
         if (mi_atomic_load_acquire(&tld->park_swept) != 0) continue;   // already done for this park
-        if (interval > 0 && tld->holes_sweep_last != 0 && now - tld->holes_sweep_last < interval) continue;
+        if (interval > 0 && tld->holes_sweep_last != 0 && now - tld->holes_sweep_last < interval) {
+          if (mi_atomic_load_relaxed(&tld->park_state) == MI_PARK_PARKED) {
+            const mi_msecs_t due = interval - (now - tld->holes_sweep_last);
+            if (due_in == 0 || due < due_in) { due_in = due; }
+          }
+          continue;
+        }
         uint32_t expected = MI_PARK_PARKED;
         if (mi_atomic_cas_strong_acq_rel(&tld->park_state, &expected, MI_PARK_SWEEPING)) {
           claimed = tld; theap0 = tld->park_theap0; break;
         }
       }
     }
-    if (claimed == NULL) return;   // nothing parked (any more)
+    if (claimed == NULL) return due_in;   // nothing parked (any more) that is due yet
     claimed->holes_sweep_last = _mi_clock_now();
     _mi_thread_idle_work(claimed, theap0);
     // Mark BEFORE releasing: a `park_swept` set after the store could land on the thread's *next*

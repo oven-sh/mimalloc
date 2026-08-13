@@ -285,8 +285,8 @@ static void test_third_thread_frees_during_sweep(void) {
 // ---------------------------------------------------------------------------
 // A single thread parks repeatedly: each park with fresh holes must be swept within a deadline far
 // under the scavenger's 30s safety timeout. Sweeps of one thread are rate-limited to
-// `purge_holes_min_interval` (100ms by default) and a park inside that window is skipped on
-// purpose, so space the parks past it; the `-eager` ctest variant sets the interval to 0.
+// `purge_holes_min_interval` (100ms by default), so space the parks past it (the in-window case
+// is `test_park_inside_window_gets_swept`); the `-eager` ctest variant sets the interval to 0.
 // ---------------------------------------------------------------------------
 static void test_parks_get_swept(void) {
   enum { ROUNDS = 20 };
@@ -313,6 +313,50 @@ static void test_parks_get_swept(void) {
   free(p);
   fprintf(stderr, "  parks handed off: %d, unswept: %d (min_interval=%ldms)\n", handed_off, missed, interval_ms);
   check("every spaced park gets swept promptly", missed == 0);
+}
+
+// ---------------------------------------------------------------------------
+// The common idle shape: swept, woken briefly by a timer, parked again inside `min_interval` --
+// this time for long. That second park is passed over when it starts, and must be swept once the
+// window ends rather than at the scavenger's next unrelated wake (up to its 30s safety timeout).
+// ---------------------------------------------------------------------------
+static void test_park_inside_window_gets_swept(void) {
+  const long interval_ms = mi_option_get(mi_option_purge_holes_min_interval);
+  if (interval_ms <= 0) return;   // no window (the `-eager` variant)
+  void** p = (void**)calloc(LIVE, sizeof(void*));
+  if (p == NULL) return;
+  // first park: spaced, so it is swept and stamps `holes_sweep_last`
+  churn(p);
+  usleep((useconds_t)(interval_ms * 1000 + 5000));
+  size_t before = discards();
+  bool parked = mi_on_thread_idle_start();
+  bool first_swept = parked && wait_for_discard_after(before);
+  mi_on_thread_idle_end();
+  if (!parked) { for (int i = 0; i < LIVE; i++) { mi_free(p[i]); } free(p); return; }   // nobody to hand off to (no scavenger)
+  if (!first_swept) { free(p); check("park inside the rate window is swept when the window ends", false); return; }
+  // second park: straight away, inside the window, with fresh holes
+  for (int i = 0; i < LIVE; i++) { if (p[i] == NULL) { p[i] = mi_malloc(BSZ); memset(p[i], 3, BSZ); } }
+  churn(p);
+  before = discards();
+  struct timespec t0, t1;
+  clock_gettime(CLOCK_MONOTONIC, &t0);
+  parked = mi_on_thread_idle_start();
+  long waited_ms = -1;
+  if (parked) {
+    const long deadline_ms = interval_ms * 10 + 1000;   // far under 30s, generous over `interval_ms`
+    for (;;) {
+      clock_gettime(CLOCK_MONOTONIC, &t1);
+      const long elapsed = (long)(t1.tv_sec - t0.tv_sec) * 1000 + (long)(t1.tv_nsec - t0.tv_nsec) / 1000000;
+      if (discards() > before) { waited_ms = elapsed; break; }
+      if (elapsed > deadline_ms) break;
+      usleep(1000);
+    }
+  }
+  mi_on_thread_idle_end();
+  for (int i = 0; i < LIVE; i++) { if (p[i] != NULL) mi_free(p[i]); }
+  free(p);
+  fprintf(stderr, "  in-window park swept after %ldms (min_interval=%ldms)\n", waited_ms, interval_ms);
+  check("park inside the rate window is swept when the window ends", parked && waited_ms >= 0);
 }
 
 // ---------------------------------------------------------------------------
@@ -437,6 +481,7 @@ int main(void) {
   test_unbalanced();
   test_third_thread_frees_during_sweep();
   test_parks_get_swept();
+  test_park_inside_window_gets_swept();
   test_fork_while_parked();
   test_park_then_exit();
   test_exit_while_swept_with_dyn_tls();

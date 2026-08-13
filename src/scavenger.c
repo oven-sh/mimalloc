@@ -193,7 +193,7 @@ static void mi_scavenger_run(void) {
     mi_atomic_exchange_acq_rel(&subproc->scavenger_wake, (uint32_t)0);
     // Do the idle work of any thread that parked and handed us its theaps. This is the expensive
     // part (the hole punch is ~99% madvise) and it is why the owner gets to skip it.
-    _mi_theap_sweep_parked(subproc);
+    const mi_msecs_t park_due = _mi_theap_sweep_parked(subproc);
     mi_msecs_t expire = mi_atomic_loadi64_acquire(&subproc->purge_expire);
     mi_msecs_t timeout_ms;
     if (expire == 0) {
@@ -219,6 +219,8 @@ static void mi_scavenger_run(void) {
         continue;
       }
     }
+    // a park passed over for `purge_holes_min_interval` is swept when its window ends, not at the safety timeout
+    if (park_due > 0 && park_due < timeout_ms) { timeout_ms = park_due; }
     if (mi_atomic_load_acquire(&_mi_scavenger_running) == 0) break;
     mi_scav_wait(&subproc->scavenger_wake, timeout_ms);
   }

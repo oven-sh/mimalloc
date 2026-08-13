@@ -338,7 +338,7 @@ void          _mi_theap_collect_abandon(mi_theap_t* theap);
 
 
 void          _mi_thread_idle_work(mi_tld_t* tld, mi_theap_t* theap0) mi_attr_noexcept;
-void          _mi_theap_sweep_parked(mi_subproc_t* subproc);
+mi_msecs_t    _mi_theap_sweep_parked(mi_subproc_t* subproc);   // msecs until a rate-limited park becomes due (0: none)
 void          _mi_park_leave(mi_tld_t* tld);
 void          _mi_scavenger_forked_child(void);
 bool          _mi_theap_area_visit_blocks(const mi_heap_area_t* area, mi_page_t* page, mi_block_visit_fun* visitor, void* arg);
