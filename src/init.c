@@ -607,6 +607,10 @@ static void mi_process_init_once(void) {
   _mi_thread_locals_init();  // pthread key create
   _mi_process_is_initialized = true;
 
+  #if !defined(_WIN32) && !defined(__wasi__)
+  pthread_atfork(&_mi_process_fork_prepare, &_mi_process_fork_parent, &_mi_process_fork_child);   // fork: see subproc.c
+  #endif
+
   #if defined(_WIN32) && defined(MI_WIN_INIT_USE_FLS)
   // On windows, when building as a static lib the FLS cleanup happens to early for the main thread.
   // To avoid this, set the FLS value for the main thread to NULL so the fls cleanup
@@ -649,9 +653,6 @@ void mi_process_init(void) mi_attr_noexcept {
   mi_atomic_do_once {
     mi_process_init_once();
   }
-  #if !defined(_WIN32) && !defined(__wasi__)
-  pthread_atfork(&_mi_process_fork_prepare, &_mi_process_fork_parent, &_mi_process_fork_child);   // fork: see subproc.c
-  #endif
 }
 
 

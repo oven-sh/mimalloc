@@ -22,6 +22,13 @@ terms of the MIT license.
    and signals a thread that does not exist instead of purging inline, so a
    forked child never returns memory to the OS at all.
 
+   Case D: the fork handlers must be registered once per process. When the
+   pthread_atfork call sat in mi_process_init (reached from every mi_heap_new)
+   instead of mi_process_init_once, each heap added another handler triple;
+   macOS caps the table at one page (~680 entries on arm64), after which any
+   other pthread_atfork in the process fails with ENOMEM (BoringSSL aborts on
+   that). glibc's list is unbounded, so this case only bites on macOS.
+
    Case A is probabilistic. Case B is made deterministic via the
    MI_DEBUG-gated mi_debug_stall_in_theap_init hook (see src/theap.c).
 
@@ -202,8 +209,25 @@ static int case_c(void) {
   return rc;
 }
 
+static void atfork_noop(void) { }
+
+// Case D: creating heaps must not register more fork handlers. 2048 heaps is well past macOS's
+// per-process pthread_atfork table, so if each mi_heap_new added a triple our own registration fails.
+static int case_d(void) {
+  for (int i = 0; i < 2048; i++) {
+    mi_heap_t* heap = mi_heap_new();
+    mi_free(mi_heap_malloc(heap, 16));
+    mi_heap_delete(heap);
+  }
+  int err = pthread_atfork(&atfork_noop, &atfork_noop, &atfork_noop);
+  fprintf(stderr, "case_d: pthread_atfork after 2048 heaps -> %d (%s)\n", err,
+          err ? "FAIL (fork handler table exhausted by mi_heap_new)" : "ok");
+  return err ? 1 : 0;
+}
+
 int main(void) {
   int rc = 0;
+  rc |= case_d();   // first: cases A-C fork, and each fork runs every handler registered so far
   rc |= (case_a() > 0 ? 1 : 0);
   rc |= case_c();
   #if MI_DEBUG > 0
