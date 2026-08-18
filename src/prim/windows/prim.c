@@ -737,7 +737,7 @@ typedef BOOL (WINAPI *PProcessPrng)(PBYTE, SIZE_T);
 static  PBCryptGenRandom pBCryptGenRandom = NULL;
 static  PProcessPrng pProcessPrng = NULL;
 
-// Prefer ProcessPrng (bcryptprimitives.dll, Windows 10+): it is the primitive
+// Prefer ProcessPrng (bcryptprimitives.dll, Windows 8+): it is the primitive
 // BCryptGenRandom(BCRYPT_USE_SYSTEM_PREFERRED_RNG) ends up calling, without
 // loading bcrypt.dll and resolving the CNG provider (about a millisecond at
 // process start). Fall back to BCryptGenRandom on older systems.
