@@ -83,7 +83,6 @@ typedef SIZE_T(__stdcall* PGetLargePageMinimum)(VOID);
 static PGetLargePageMinimum pGetLargePageMinimum = NULL;
 
 // Available after Windows XP
-typedef BOOL (__stdcall *PGetPhysicallyInstalledSystemMemory)( PULONGLONG TotalMemoryInKilobytes );
 typedef BOOL (__stdcall* PGetVersionExW)(LPOSVERSIONINFOW lpVersionInformation);
 
 
@@ -218,11 +217,13 @@ void _mi_prim_mem_init( mi_os_mem_config_t* config )
     pGetNumaNodeProcessorMask = (PGetNumaNodeProcessorMask)(void (*)(void))GetProcAddress(hDll, "GetNumaNodeProcessorMask");
     pGetNumaHighestNodeNumber = (PGetNumaHighestNodeNumber)(void (*)(void))GetProcAddress(hDll, "GetNumaHighestNodeNumber");
     pGetLargePageMinimum = (PGetLargePageMinimum)(void (*)(void))GetProcAddress(hDll, "GetLargePageMinimum");
-    // Get physical memory (not available on XP, so check dynamically)
-    PGetPhysicallyInstalledSystemMemory pGetPhysicallyInstalledSystemMemory = (PGetPhysicallyInstalledSystemMemory)(void (*)(void))GetProcAddress(hDll,"GetPhysicallyInstalledSystemMemory");
-    if (pGetPhysicallyInstalledSystemMemory != NULL) {
-      ULONGLONG memInKiB = 0;
-      if ((*pGetPhysicallyInstalledSystemMemory)(&memInKiB)) {
+    // Get physical memory. GlobalMemoryStatusEx is a plain system-information
+    // query; GetPhysicallyInstalledSystemMemory parses the SMBIOS firmware table.
+    {
+      MEMORYSTATUSEX mem;
+      mem.dwLength = sizeof(mem);
+      if (GlobalMemoryStatusEx(&mem)) {
+        ULONGLONG memInKiB = mem.ullTotalPhys / MI_KiB;
         if (memInKiB > 0 && memInKiB <= SIZE_MAX) {
           config->physical_memory_in_kib = (size_t)memInKiB;
         }
@@ -730,18 +731,31 @@ bool _mi_prim_random_buf(void* buf, size_t buf_len) {
 #endif
 
 typedef LONG (NTAPI *PBCryptGenRandom)(HANDLE, PUCHAR, ULONG, ULONG);
+typedef BOOL (WINAPI *PProcessPrng)(PBYTE, SIZE_T);
 static  PBCryptGenRandom pBCryptGenRandom = NULL;
+static  PProcessPrng pProcessPrng = NULL;
 
+// Prefer ProcessPrng (bcryptprimitives.dll, Windows 10+): it is the primitive
+// BCryptGenRandom(BCRYPT_USE_SYSTEM_PREFERRED_RNG) ends up calling, without
+// loading bcrypt.dll and resolving the CNG provider (about a millisecond at
+// process start). Fall back to BCryptGenRandom on older systems.
 bool _mi_prim_random_buf(void* buf, size_t buf_len) {
   mi_assert(buf_len <= ULONG_MAX);
   if (buf_len > ULONG_MAX) return false;
   mi_atomic_do_once {
-    HINSTANCE hDll = mi_win_loadlibrary(TEXT("bcrypt.dll"));
+    HINSTANCE hDll = mi_win_loadlibrary(TEXT("bcryptprimitives.dll"));
     if (hDll != NULL) {
-      pBCryptGenRandom = (PBCryptGenRandom)(void (*)(void))GetProcAddress(hDll, "BCryptGenRandom");
-      // mi_win_freelibrary(hDll);  // don't free
+      pProcessPrng = (PProcessPrng)(void (*)(void))GetProcAddress(hDll, "ProcessPrng");
+    }
+    if (pProcessPrng == NULL) {
+      hDll = mi_win_loadlibrary(TEXT("bcrypt.dll"));
+      if (hDll != NULL) {
+        pBCryptGenRandom = (PBCryptGenRandom)(void (*)(void))GetProcAddress(hDll, "BCryptGenRandom");
+        // mi_win_freelibrary(hDll);  // don't free
+      }
     }
   }
+  if (pProcessPrng != NULL) return (pProcessPrng((PBYTE)buf, (SIZE_T)buf_len) != FALSE);
   if (pBCryptGenRandom == NULL) return false;
   return (pBCryptGenRandom(NULL, (PUCHAR)buf, (ULONG)buf_len, BCRYPT_USE_SYSTEM_PREFERRED_RNG) >= 0);
 }
