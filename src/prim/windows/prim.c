@@ -86,20 +86,22 @@ static PGetLargePageMinimum pGetLargePageMinimum = NULL;
 typedef BOOL (__stdcall* PGetVersionExW)(LPOSVERSIONINFOW lpVersionInformation);
 
 
-// Load a library
-static HMODULE mi_win_loadlibrary(const TCHAR* library) {
+// Load a system library. Wide names so no ANSI conversion happens (this runs
+// at process initialization), and LOAD_LIBRARY_SEARCH_SYSTEM32 so the loader
+// goes straight to system32 instead of probing the application directory first.
+static HMODULE mi_win_loadlibrary(const wchar_t* library) {
   #if MI_WIN_DESKTOP
-    return LoadLibrary(library);
+    return LoadLibraryExW(library, NULL, LOAD_LIBRARY_SEARCH_SYSTEM32);
   #else
     return LoadPackagedLibrary(library, 0);
   #endif
 }
 
 // Get a library handle (and possibly load it)
-static HMODULE mi_win_getlibrary(const TCHAR* library, bool* should_free) {
+static HMODULE mi_win_getlibrary(const wchar_t* library, bool* should_free) {
   #if MI_WIN_DESKTOP
   // avoid calling LoadLibrary for "kernel32", "ntdll", and "kernelbase" (also to avoid hitting the loader lock)
-  HMODULE mod = GetModuleHandle(library);
+  HMODULE mod = GetModuleHandleW(library);
   if (mod!=NULL) {
     *should_free = false;
     return mod;
@@ -133,7 +135,7 @@ static bool win_enable_large_os_pages_once(size_t* large_page_size)
   err = GetLastError();
   if (ok) {
     TOKEN_PRIVILEGES tp;
-    ok = LookupPrivilegeValue(NULL, TEXT("SeLockMemoryPrivilege"), &tp.Privileges[0].Luid);
+    ok = LookupPrivilegeValueW(NULL, L"SeLockMemoryPrivilege", &tp.Privileges[0].Luid);
     err = GetLastError();
     if (ok) {
       tp.PrivilegeCount = 1;
@@ -194,7 +196,7 @@ void _mi_prim_mem_init( mi_os_mem_config_t* config )
 
   // get the VirtualAlloc2 function
   bool hDllFree;
-  HINSTANCE hDll = mi_win_getlibrary(TEXT("kernelbase.dll"), &hDllFree);
+  HINSTANCE hDll = mi_win_getlibrary(L"kernelbase.dll", &hDllFree);
   if (hDll != NULL) {
     // use VirtualAlloc2FromApp if possible as it is available to Windows store apps
     pVirtualAlloc2 = (PVirtualAlloc2)(void (*)(void))GetProcAddress(hDll, "VirtualAlloc2FromApp");
@@ -202,13 +204,13 @@ void _mi_prim_mem_init( mi_os_mem_config_t* config )
     mi_win_freelibrary(hDll, hDllFree);
   }
   // NtAllocateVirtualMemoryEx is used for huge page allocation
-  hDll = mi_win_getlibrary(TEXT("ntdll.dll"), &hDllFree);
+  hDll = mi_win_getlibrary(L"ntdll.dll", &hDllFree);
   if (hDll != NULL) {
     pNtAllocateVirtualMemoryEx = (PNtAllocateVirtualMemoryEx)(void (*)(void))GetProcAddress(hDll, "NtAllocateVirtualMemoryEx");
     mi_win_freelibrary(hDll, hDllFree);
   }
   // Try to use Win7+ numa API
-  hDll = mi_win_getlibrary(TEXT("kernel32.dll"), &hDllFree);
+  hDll = mi_win_getlibrary(L"kernel32.dll", &hDllFree);
   if (hDll != NULL) {
     pGetCurrentProcessorNumberEx = (PGetCurrentProcessorNumberEx)(void (*)(void))GetProcAddress(hDll, "GetCurrentProcessorNumberEx");
     pGetNumaProcessorNodeEx = (PGetNumaProcessorNodeEx)(void (*)(void))GetProcAddress(hDll, "GetNumaProcessorNodeEx");
@@ -626,7 +628,7 @@ void _mi_prim_process_info(mi_process_info_t* pinfo)
 
   // load psapi on demand
   mi_atomic_do_once{
-    HINSTANCE hDll = mi_win_loadlibrary(TEXT("psapi.dll"));
+    HINSTANCE hDll = mi_win_loadlibrary(L"psapi.dll");
     if (hDll != NULL) {
       pGetProcessMemoryInfo = (PGetProcessMemoryInfo)(void (*)(void))GetProcAddress(hDll, "GetProcessMemoryInfo");
       // mi_win_freelibrary(hDll, true);  // don't free
@@ -743,12 +745,12 @@ bool _mi_prim_random_buf(void* buf, size_t buf_len) {
   mi_assert(buf_len <= ULONG_MAX);
   if (buf_len > ULONG_MAX) return false;
   mi_atomic_do_once {
-    HINSTANCE hDll = mi_win_loadlibrary(TEXT("bcryptprimitives.dll"));
+    HINSTANCE hDll = mi_win_loadlibrary(L"bcryptprimitives.dll");
     if (hDll != NULL) {
       pProcessPrng = (PProcessPrng)(void (*)(void))GetProcAddress(hDll, "ProcessPrng");
     }
     if (pProcessPrng == NULL) {
-      hDll = mi_win_loadlibrary(TEXT("bcrypt.dll"));
+      hDll = mi_win_loadlibrary(L"bcrypt.dll");
       if (hDll != NULL) {
         pBCryptGenRandom = (PBCryptGenRandom)(void (*)(void))GetProcAddress(hDll, "BCryptGenRandom");
         // mi_win_freelibrary(hDll);  // don't free
