@@ -25,7 +25,8 @@ terms of the MIT license. A copy of the license can be found in the file
 #include "mimalloc/prim.h"
 
 #include <sys/mman.h>  // mmap
-#include <unistd.h>    // sysconf, sleep
+#include <unistd.h>    // sysconf
+#include <sched.h>     // sched_yield
 #include <fcntl.h>     // open, close, read, access
 #include <stdlib.h>    // getenv, arc4random_buf
 
@@ -1162,5 +1163,6 @@ bool _mi_prim_thread_is_in_threadpool(void) {
 }
 
 void _mi_prim_thread_yield(void) {
-  sleep(0);
+  // `sleep(0)` is `nanosleep({0,0})` on glibc: a syscall that returns without rescheduling.
+  sched_yield();
 }
