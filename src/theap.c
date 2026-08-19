@@ -274,8 +274,12 @@ void _mi_park_leave(mi_tld_t* tld) {
     // PARKED may reach RUNNING
     mi_assert_internal(expected == MI_PARK_SWEEPING);
     mi_atomic_store_release(&tld->park_reclaim, 1);
+    // it stops at its next page or phase: spin briefly (no syscall), and only if it is still
+    // sweeping after that -- likely descheduled -- yield the CPU to it
+    size_t spin = 0;
     while (mi_atomic_load_acquire(&tld->park_state) == MI_PARK_SWEEPING) {
-      _mi_prim_thread_yield();   // it stops at its next page or phase; if descheduled, yield to it
+      if (spin < 256) { mi_atomic_pause(); spin++; }
+      else { _mi_prim_thread_yield(); }
     }
   }
   mi_atomic_store_release(&tld->park_reclaim, 0);
@@ -319,7 +323,7 @@ bool mi_on_thread_idle_start(void) mi_attr_noexcept {
 
 // The other half: we are awake and about to allocate again, so take the theaps back. Usually an
 // uncontended CAS. If the scavenger is mid-sweep we ask it to stop (it checks between pages) and
-// spin until it does -- bounded by one page's walk, and a syscall-free wait either way.
+// spin until it does -- bounded by one page's walk, so normally a syscall-free wait.
 void mi_on_thread_idle_end(void) mi_attr_noexcept {
   mi_theap_t* const theap0 = _mi_theap_default();
   if (theap0 == NULL || !mi_theap_is_initialized(theap0) || theap0->tld == NULL) return;
