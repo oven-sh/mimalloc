@@ -741,13 +741,18 @@ static  PProcessPrng pProcessPrng = NULL;
 // BCryptGenRandom(BCRYPT_USE_SYSTEM_PREFERRED_RNG) ends up calling, without
 // loading bcrypt.dll and resolving the CNG provider (about a millisecond at
 // process start). Fall back to BCryptGenRandom on older systems.
+// This runs from the TLS process-attach callback, i.e. under the loader lock,
+// so use an already loaded bcryptprimitives.dll when there is one (anything
+// that seeds from ProcessPrng imports it) and only LoadLibrary it otherwise.
 bool _mi_prim_random_buf(void* buf, size_t buf_len) {
   mi_assert(buf_len <= ULONG_MAX);
   if (buf_len > ULONG_MAX) return false;
   mi_atomic_do_once {
-    HINSTANCE hDll = mi_win_loadlibrary(L"bcryptprimitives.dll");
+    bool hDllFree;
+    HINSTANCE hDll = mi_win_getlibrary(L"bcryptprimitives.dll", &hDllFree);
     if (hDll != NULL) {
       pProcessPrng = (PProcessPrng)(void (*)(void))GetProcAddress(hDll, "ProcessPrng");
+      // never freed: pProcessPrng points into it
     }
     if (pProcessPrng == NULL) {
       hDll = mi_win_loadlibrary(L"bcrypt.dll");
