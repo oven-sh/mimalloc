@@ -153,6 +153,16 @@ static bool unix_detect_overcommit(void) {
   return os_overcommit;
 }
 
+#if defined(__linux__) && defined(MADV_NOHUGEPAGE)
+// Whether `unix_mmap` has to opt its mappings out of transparent huge pages with `MADV_NOHUGEPAGE`
+// when `allow_thp` is off. The kernel only gives huge pages to a mapping that did not ask for them
+// under `enabled = [always]`; under `[madvise]` (the Debian/Ubuntu default) and `[never]` the call
+// would just cost one syscall per mmap. Starts out true so the opt-out stays in place where the
+// setting cannot be read (no sysfs). The per-size mTHP settings (`hugepages-*kB/enabled`) are not
+// read: that takes more syscalls at startup than the opt-outs it could save.
+static bool unix_thp_needs_optout = true;
+#endif
+
 static bool unix_detect_thp(void) {
   bool thp_enabled = false;
   #if defined(__linux__)
@@ -166,6 +176,9 @@ static bool unix_detect_thp(void) {
     if (nread >= 1) {
       if (nread > 64) { nread = 64; }
       thp_enabled = (_mi_strnstr(buf,nread,"[never]") == NULL);
+      #if defined(MADV_NOHUGEPAGE)
+      unix_thp_needs_optout = (_mi_strnstr(buf,nread,"[always]") != NULL);
+      #endif
     }
   }
   #endif
@@ -478,10 +491,10 @@ static void* unix_mmap(void* addr, size_t size, size_t try_alignment, int protec
     }
     #endif
     #if defined(__linux__) && defined(MADV_NOHUGEPAGE)
-    if (p != NULL && !mi_option_is_enabled(mi_option_allow_thp)) {
+    if (p != NULL && !mi_option_is_enabled(mi_option_allow_thp) && unix_thp_needs_optout) {
       // VMA-level opt-out (dropped at execve, so children keep the system policy). Under THP
-      // `always`/mTHP this avoids 2MiB faults into sparse regions and huge-page splits on
-      // sub-2MiB purges, and keeps khugepaged from re-collapsing purged ranges; else a no-op.
+      // `always` this avoids 2MiB faults into sparse regions and huge-page splits on sub-2MiB
+      // purges, and keeps khugepaged from re-collapsing purged ranges.
       (void)unix_madvise(p, size, MADV_NOHUGEPAGE);
     }
     #endif
