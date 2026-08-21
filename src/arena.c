@@ -1121,8 +1121,10 @@ static void mi_arenas_page_free_prim(mi_page_t* page) {
   #endif
 
   // Read the heap's subproc before the page is unpublished from the heap below: a concurrent `mi_heap_delete`
-  // of the heap (`mi_heap_visit_page_at`) waits for us only while the page is still in the heap's `arena_pages`,
-  // and frees the heap struct right after (see `mi_page_heap`).
+  // of the heap (`mi_heap_visit_page_at`) waits for us only while the page's bit in the heap's `arena_pages`
+  // is set, and frees the heap struct and its `arena_pages` right after (see `mi_page_heap`). So below the
+  // clear of that bit nothing may touch the heap or its `arena_pages` anymore (which is why the clear itself
+  // does not maintain the chunkmap of the bitmap either).
   mi_subproc_t* const subproc = mi_page_subproc(page);
 
   // recommit guard page at the end?
@@ -1143,7 +1145,7 @@ static void mi_arenas_page_free_prim(mi_page_t* page) {
     mi_arena_t* const arena = mi_page_arena_pages(page, &slice_index, &slice_count, &arena_pages);
     mi_assert_internal(arena_pages!=NULL);
     mi_assert_internal(arena->subproc == subproc);
-    mi_bitmap_clear(arena_pages->pages, slice_index);   // from here on `page->heap` may be deleted concurrently
+    mi_bitmap_clear_no_chunkmap(arena_pages->pages, slice_index);   // last access to `arena_pages` and the heap (see above)
     const size_t slice_committed = mi_page_slice_committed(page);
     if (slice_committed > 0) {
       // if committed on-demand, set the commit bits to account commit properly
