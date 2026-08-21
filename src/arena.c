@@ -1120,11 +1120,16 @@ static void mi_arenas_page_free_prim(mi_page_t* page) {
   }
   #endif
 
+  // Read the heap's subproc before the page is unpublished from the heap below: a concurrent `mi_heap_delete`
+  // of the heap (`mi_heap_visit_page_at`) waits for us only while the page is still in the heap's `arena_pages`,
+  // and frees the heap struct right after (see `mi_page_heap`).
+  mi_subproc_t* const subproc = mi_page_subproc(page);
+
   // recommit guard page at the end?
   // we must do this since we may later allocate large spans over this page and cannot have a guard page in between
   #if MI_SECURE >= 5
   if (!page->memid.is_pinned) {
-    _mi_os_secure_guard_page_reset_before(mi_page_subproc(page), mi_page_slice_start(page) + mi_page_full_size(page), page->memid);
+    _mi_os_secure_guard_page_reset_before(subproc, mi_page_slice_start(page) + mi_page_full_size(page), page->memid);
   }
   #endif
 
@@ -1137,8 +1142,8 @@ static void mi_arenas_page_free_prim(mi_page_t* page) {
     size_t slice_count; MI_UNUSED(slice_count);
     mi_arena_t* const arena = mi_page_arena_pages(page, &slice_index, &slice_count, &arena_pages);
     mi_assert_internal(arena_pages!=NULL);
-    mi_assert_internal(arena->subproc == mi_page_subproc(page));
-    mi_bitmap_clear(arena_pages->pages, slice_index);
+    mi_assert_internal(arena->subproc == subproc);
+    mi_bitmap_clear(arena_pages->pages, slice_index);   // from here on `page->heap` may be deleted concurrently
     const size_t slice_committed = mi_page_slice_committed(page);
     if (slice_committed > 0) {
       // if committed on-demand, set the commit bits to account commit properly
@@ -1163,7 +1168,7 @@ static void mi_arenas_page_free_prim(mi_page_t* page) {
   // unregister page (after the arena_pages bitmap clear above)
   _mi_page_map_unregister(page);
   if (mi_page_meta_is_separated(page)) { page->block_size = 0; }  // for assertion checking
-  _mi_arenas_free( mi_page_subproc(page), mi_page_slice_start(page), mi_page_full_size(page), page->memid);
+  _mi_arenas_free( subproc, mi_page_slice_start(page), mi_page_full_size(page), page->memid);
 }
 
 void _mi_arenas_page_free(mi_page_t* page, mi_theap_t* current_theapx) {
