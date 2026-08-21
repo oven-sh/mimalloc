@@ -322,8 +322,21 @@ void _mi_scavenger_start(void) {
   // unblocked will have process-directed signals dispatched to it and silently
   // discarded, starving signalfd/kqueue consumers. sigfillset on glibc/musl
   // already excludes the libc-internal realtime signals used for setxid/cancel.
+  //
+  // Except the signals a fault on this thread itself raises: a blocked SIGSEGV/SIGBUS
+  // is not queued, the kernel resets it to its default action and kills the process on
+  // the spot, so the host's crash handler never runs and a corrupted free list that the
+  // sweep trips over (see `mi_page_purge_holes_walk`) ends the process without a report.
+  // These are thread-directed by nature, so leaving them unblocked starves no one.
   sigset_t all, old;
   sigfillset(&all);
+  sigdelset(&all, SIGSEGV);
+  sigdelset(&all, SIGBUS);
+  sigdelset(&all, SIGILL);
+  sigdelset(&all, SIGFPE);
+  sigdelset(&all, SIGTRAP);
+  sigdelset(&all, SIGABRT);
+  sigdelset(&all, SIGSYS);
   pthread_sigmask(SIG_SETMASK, &all, &old);
   if (pthread_create(&_mi_scavenger_thread, NULL, &mi_scavenger_thread_main, NULL) != 0) {
     mi_atomic_store_release(&_mi_scavenger_running, (uintptr_t)0);
