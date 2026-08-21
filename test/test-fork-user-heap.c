@@ -129,10 +129,12 @@ static int case_b(void) {
   fprintf(stderr, "case_b: fork while sibling thread holds tld->theaps_lock in mi_thread_theaps_done\n");
   g_heap = mi_heap_new();
   pthread_t t;
-  pthread_create(&t, NULL, stall_thread, NULL);
-  // let the thread allocate first, then arm the stall and wait for it to
-  // park inside mi_thread_theaps_done (signals 2 once the lock is held).
+  // Arm the stall before the thread exists (no other thread exits during this case). Armed after
+  // pthread_create, the thread can already have exited before the store and then never parks,
+  // and the wait below spins forever (seen under a loaded `ctest -j`). The thread allocates, exits,
+  // and parks inside mi_thread_theaps_done (signals 2 once it holds its tld->theaps_lock).
   mi_debug_stall_in_thread_theaps_done = 1;
+  pthread_create(&t, NULL, stall_thread, NULL);
   while (mi_debug_stall_in_thread_theaps_done != 2) { sched_yield(); }
 
   pid_t pid = fork();
@@ -141,7 +143,7 @@ static int case_b(void) {
     alarm(5);
     // child: stalled thread is gone; its tld->theaps_lock is still held.
     // fork_child re-inits heap-level locks but not dead-thread tld locks.
-    // mi_heap_delete -> mi_heap_free_theaps -> _mi_theap_free -> acquires
+    // mi_heap_delete -> _mi_heap_detach_theaps -> acquires
     // theap->tld->theaps_lock for the vanished thread's theap -> deadlock.
     mi_heap_delete(g_heap);
     _exit(0);
