@@ -158,15 +158,26 @@ mi_heap_t* mi_heap_new(void) {
   return mi_heap_new_in_arena(0);
 }
 
-// free all theaps belonging to this heap (without deleting their pages as we do this arena wise for efficiency)
-static void mi_heap_free_theaps(mi_heap_t* heap) {
-  // This can run concurrently with a thread that terminates (see `init.c:mi_thread_theaps_done`),
-  // and we need to ensure we free theaps atomically.
-
-  // We first detach our theaps list from any thread local lists
+// Detach all theaps belonging to this heap from their threads, and merge their statistics into the heap
+// (before the pages are moved or destroyed, as that adjusts the page statistics of the heap).
+// This can run concurrently with a thread that terminates (see `init.c:mi_thread_theaps_done`); after the
+// detach our list only holds theaps that no thread shares anymore. The theaps are not freed yet, see below.
+static void mi_heap_detach_theaps(mi_heap_t* heap) {
   _mi_heap_detach_theaps(heap);
+  mi_lock(&heap->theaps_lock) { // paranoia
+    for (mi_theap_t* theap = heap->theaps; theap != NULL; theap = theap->hnext) {
+      mi_assert_internal(_mi_theap_heap_peek(theap)==NULL);  // detached
+      _mi_stats_merge_into(&heap->stats, &theap->stats);
+    }
+  }
+}
 
-  // Now we can safely free the theaps
+// Free the detached theaps of this heap (without deleting their pages as we do this arena wise for efficiency).
+// This must run after the pages have left the heap: a concurrent `mi_free` of a block in a page that was
+// still in the heap may have found its theap through `heap->theap` just before the detach
+// (`_mi_page_associated_theap_peek`), and uses the theap (and its `tld`) while it owns the page.
+// The page walk waited for it (`arena.c:mi_heap_visit_page_at`).
+static void mi_heap_free_theaps(mi_heap_t* heap) {
   mi_lock(&heap->theaps_lock) { // paranoia
     mi_theap_t* theap = heap->theaps;
     heap->theaps = NULL;
@@ -174,10 +185,8 @@ static void mi_heap_free_theaps(mi_heap_t* heap) {
       mi_theap_t* next = theap->hnext;
       theap->hnext = NULL;
       theap->hprev = NULL;
-      mi_assert_internal(theap->tld==NULL);
-      // merge stats into the owning heap stats
-      _mi_stats_merge_into(&heap->stats, &theap->stats);
-      // and free
+      mi_assert_internal(_mi_theap_heap_peek(theap)==NULL);  // detached
+      theap->tld = NULL;
       _mi_theap_decref(theap);  // a cached entry can still point to the theap
       theap = next;
     }
@@ -233,15 +242,17 @@ void mi_heap_delete(mi_heap_t* heap) {
     _mi_warning_message("cannot delete the main heap\n");
     return;
   }
-  mi_heap_free_theaps(heap);
+  mi_heap_detach_theaps(heap);
   _mi_heap_move_pages(heap, heap_main);
+  mi_heap_free_theaps(heap);
   mi_heap_free(heap,true /* acquire subproc->heaps_lock */);
 }
 
 void _mi_heap_force_destroy(mi_heap_t* heap, bool acquire_heaps_lock) {
   if (heap==NULL) return;
-  mi_heap_free_theaps(heap);
+  mi_heap_detach_theaps(heap);
   _mi_heap_destroy_pages(heap);
+  mi_heap_free_theaps(heap);
   // if (_mi_subproc_main()->heap_main == heap) {
   //   _mi_stats_merge_into(&heap->subproc->stats,&heap->stats);
   // }
