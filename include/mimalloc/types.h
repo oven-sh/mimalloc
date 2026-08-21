@@ -417,7 +417,7 @@ typedef struct mi_page_s {
   uint16_t                  reserved;          // number of blocks reserved in memory
   
   mi_theap_t*               theap;             // the theap owning this page (may not be valid or NULL for abandoned pages)
-  mi_heap_t*                heap;              // const: the heap owning this page
+  mi_heap_t*                heap;              // the heap owning this page (`mi_heap_delete` moves it to the main heap; only dereference while owning the page, see `mi_page_heap`)
 
   struct mi_page_s*         next;              // next page owned by the theap with the same `block_size`
   struct mi_page_s*         prev;              // previous page owned by the theap with the same `block_size`

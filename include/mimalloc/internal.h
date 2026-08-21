@@ -1224,6 +1224,11 @@ static inline mi_tld_t* mi_page_tld(const mi_page_t* page) {
 }
 
 
+// The heap of a page. Only dereference this (or `mi_page_subproc`) while owning the page and while the page
+// is still published in that heap: `mi_heap_delete` claims each page (`arena.c:mi_heap_visit_page_at` waits for a
+// concurrent owner), re-points `page->heap` to the main heap (`arena.c:mi_heap_delete_page`), and then frees the
+// heap struct. A concurrent `mi_free` from another thread thus cannot use it before it owns the page
+// (`free.c:mi_stat_free`), nor after it unpublished the page from the heap (`arena.c:mi_arenas_page_free_prim`).
 static inline mi_heap_t* mi_page_heap(const mi_page_t* page) {
   mi_heap_t* heap = page->heap;
   mi_assert_internal(heap != NULL);
