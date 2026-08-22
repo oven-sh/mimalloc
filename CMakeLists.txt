@@ -874,7 +874,7 @@ if (MI_BUILD_TESTS)
   enable_testing()
 
   # static link tests
-  set(mi_static_tests api api-fill stress-heaps stress-subprocs stress heap-mt heap-delete-race heap-churn fork-user-heap snapshot prof prof-adversarial theap-sentinel purge-holes purge-zero park-handoff)
+  set(mi_static_tests api api-fill stress-heaps stress-subprocs stress heap-mt heap-delete-race heap-aba heap-churn fork-user-heap snapshot prof prof-adversarial theap-sentinel purge-holes purge-zero park-handoff)
   if (MI_DEBUG_FULL OR CMAKE_BUILD_TYPE MATCHES "Debug")
     list(APPEND mi_static_tests commit-fail)  # uses mi_debug_fail_os_commit_after (MI_DEBUG>0 only)
   endif()
