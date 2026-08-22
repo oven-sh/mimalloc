@@ -392,10 +392,15 @@ static inline bool _mi_thread_is_initialized(void) {
 static inline mi_theap_t* _mi_heap_theap(mi_heap_t* heap) {
   mi_theap_t* theap = _mi_theap_cached();
   #if MI_THEAP_INITASNULL
-  if mi_likely(theap!=NULL && _mi_theap_heap_peek(theap)==heap) return theap;
+  if mi_likely(theap!=NULL && _mi_theap_heap_peek(theap)==heap)
   #else
-  if mi_likely(_mi_theap_heap_peek(theap)==heap) return theap;
+  if mi_likely(_mi_theap_heap_peek(theap)==heap)
   #endif
+  {
+    // a theap of a deleted heap has `theap->heap==NULL` and never matches, also not a new heap at the same address
+    mi_assert_internal(theap->tld != NULL && (theap->tld->thread_id == _mi_prim_thread_id() || theap->tld->thread_id == MI_THREADID_DETACHED));
+    return theap;
+  }
   return _mi_heap_theap_get_or_init(heap);
 }
 

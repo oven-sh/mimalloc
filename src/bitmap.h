@@ -201,12 +201,6 @@ mi_decl_nodiscard bool mi_bitmap_try_find_and_claim(mi_bitmap_t* bitmap, size_t 
 // allocated from `mi_arena_try_abandoned` (and is in the `claim` function of `mi_bitmap_try_find_and_claim`).
 void mi_bitmap_clear_once_set(mi_subproc_t* subproc, mi_bitmap_t* bitmap, size_t idx);
 
-// Clear a bit in the bitmap like `mi_bitmap_clear`, but do not update the chunkmap afterwards, so the
-// clear of the bit is the last access to the bitmap. The chunkmap bit of the chunk stays set, which is
-// allowed (it means the chunk _may_ have bits set, see the top of this file) and only costs a visit of
-// an empty chunk. This is used to unpublish a page from a heap's `arena_pages`: once the bit is clear,
-// a concurrent `mi_heap_delete` no longer waits for us and frees the `arena_pages` (see `arena.c:mi_heap_visit_page_at`).
-bool mi_bitmap_clear_no_chunkmap(mi_bitmap_t* bitmap, size_t idx);
 
 
 // If a bit is set in the bitmap, return `true` and set `idx` to the index of the highest bit.

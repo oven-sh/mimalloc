@@ -1431,15 +1431,6 @@ void mi_bitmap_clear_once_set(mi_subproc_t* subproc, mi_bitmap_t* bitmap, size_t
   mi_bchunk_clear_once_set(subproc, &bitmap->chunks[chunk_idx], cidx);
 }
 
-// Clear a bit without updating the chunkmap (see `bitmap.h`).
-bool mi_bitmap_clear_no_chunkmap(mi_bitmap_t* bitmap, size_t idx) {
-  mi_assert_internal(idx < mi_bitmap_max_bits(bitmap));
-  const size_t chunk_idx = idx / MI_BCHUNK_BITS;
-  const size_t cidx = idx % MI_BCHUNK_BITS;
-  mi_assert_internal(chunk_idx < mi_bitmap_chunk_count(bitmap));
-  return mi_bchunk_clear(&bitmap->chunks[chunk_idx], cidx, NULL);
-}
-
 
 // Visit all set bits in a bitmap.
 // todo: optimize further? maybe use avx512 to directly get all indices using a mask_compressstore?

@@ -345,6 +345,7 @@ bool          _mi_theap_area_visit_blocks(const mi_heap_area_t* area, mi_page_t*
 void          _mi_theap_page_reclaim(mi_theap_t* theap, mi_page_t* page);
 
 void          _mi_heap_detach_theaps( mi_heap_t* heap );
+void          _mi_theap_abandon(mi_theap_t* theap);
 void          _mi_tld_detach_theaps( mi_tld_t* tld );
 void          _mi_theap_incref(mi_theap_t* theap);
 void          _mi_theap_decref(mi_theap_t* theap);
@@ -710,6 +711,7 @@ static inline bool _mi_theap_can_touch(const mi_theap_t* theap) {
   if (theap == NULL || theap->tld == NULL) return true;
   if (theap->tld->thread_id == _mi_thread_id()) return true;
   if (mi_theap_is_detached((mi_theap_t*)theap)) return true;   // upstream's detached theaps (meta-data / heaps without a thread) belong to no thread
+  if (mi_atomic_load_ptr_relaxed(mi_heap_t, &((mi_theap_t*)theap)->heap) == NULL) return true;  // detached from its heap by `mi_heap_delete`: belongs to the deleting thread
   return (mi_atomic_load_acquire(&theap->tld->park_state) == MI_PARK_SWEEPING);
 }
 

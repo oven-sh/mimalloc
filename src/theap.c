@@ -161,6 +161,25 @@ void _mi_theap_collect_abandon(mi_theap_t* theap) {
   mi_theap_collect_ex(theap, MI_ABANDON);
 }
 
+static bool mi_theap_page_abandon(mi_theap_t* theap, mi_page_queue_t* pq, mi_page_t* page, void* arg1, void* arg2 ) {
+  MI_UNUSED(theap); MI_UNUSED(arg1); MI_UNUSED(arg2);
+  _mi_page_abandon(page, pq);  // frees it instead if all blocks turn out to be free
+  return true;
+}
+
+// Abandon the pages of a theap that `mi_heap_delete`/`mi_heap_destroy` detached from its heap
+// (`_mi_heap_detach_theaps`), as if its thread terminated. That thread no longer reaches the theap,
+// and by the contract of `mi_heap_delete` it is not allocating from or freeing into these pages.
+void _mi_theap_abandon(mi_theap_t* theap) {
+  mi_assert_internal(_mi_theap_heap_peek(theap)==NULL);
+  mi_assert_internal(theap->tnext==NULL && theap->tprev==NULL);
+  mi_theap_visit_pages(theap, &mi_theap_page_abandon, true /* include full pages */, NULL, NULL);
+  mi_assert_internal(theap->page_count==0);
+  #if MI_DEBUG>1
+  for (size_t i = 0; i <= MI_BIN_FULL; i++) { mi_assert_internal(theap->pages[i].first == NULL); }
+  #endif
+}
+
 // Visit every page (INCLUDING the full queue, which a normal collect skips --
 // see mi_theap_collect_ex) and discard the memory of free blocks inside pages
 // that are still partially used. Meant to be called when the application knows
@@ -653,10 +672,10 @@ void _mi_theap_decref(mi_theap_t* theap) {
 // we back-off, release the outer lock, and try again until we succeed.
 
 // Remove the theaps in this heap from any thread local tld lists.
-// A detached theap has `theap->heap == NULL`, so `_mi_page_associated_theap_peek` no longer returns it
-// and a concurrent `mi_free` of a block in the heap no longer reclaims into it or re-abandons through it.
-// The theap itself (and its `tld`) stays valid until `heap.c:mi_heap_free_theaps`, which runs after all
-// the pages have left the heap, for a free that found the theap just before it was detached.
+// A detached theap has `theap->heap == NULL`: its thread no longer finds it (`_mi_heap_theap`,
+// `_mi_page_associated_theap_peek` check that field), so it does not allocate from it, reclaim into it,
+// or abandon its pages on termination anymore. The struct (and its `tld` pointer) stays valid until the
+// last reference is dropped (`heap.c:mi_heap_free_theaps`, or a thread's `_mi_theap_cached`).
 void _mi_heap_detach_theaps( mi_heap_t* heap ) {
   bool all_detached;
   do {
