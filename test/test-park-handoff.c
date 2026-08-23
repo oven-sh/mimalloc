@@ -37,7 +37,11 @@ static void check(const char* name, bool ok) {
   if (!ok) failures++;
 }
 
+#if defined(MI_GUARDED)
+#define LIVE   (2000)     // every sampled allocation gets a guard page (its own mapping): stay under vm.max_map_count
+#else
 #define LIVE   (20000)
+#endif
 #define BSZ    (512)
 // two OS pages of BSZ blocks between survivors (+2 for the margin), as in test-purge-holes.c
 static size_t keep_every(void) {
@@ -441,7 +445,7 @@ static void* park_then_exit_with_dyn_tls(void* arg) {
   // an app-level destructor that frees on this thread as it exits
   void** dblocks = (void**)calloc(500, sizeof(void*));
   if (dblocks != NULL) {
-    for (int i = 0; i < 500; i++) { dblocks[i] = mi_malloc(96); }
+    for (int i = 0; i < 500; i++) { dblocks[i] = mi_malloc(96); if (dblocks[i] == NULL) break; }
     pthread_setspecific(dtor_key, dblocks);
   }
   void** p = (void**)calloc(LIVE, sizeof(void*));
