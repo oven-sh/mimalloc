@@ -472,7 +472,7 @@ static bool test_abandoned(void) {
 #define LARGE_SZ  (128 * 1024)   // > MI_MEDIUM_MAX_OBJ_SIZE, so these land in large (4MB) pages
 
 static bool test_large_pages(void) {
-  bool eligible;
+  bool eligible, singleton;
   hole_stats_t before;
   hole_stats_t after;
   size_t npurged;
@@ -486,6 +486,7 @@ static bool test_large_pages(void) {
     pattern_fill(ptrs[i], LARGE_SZ, i);
   }
   eligible = mi_page_can_purge_holes(_mi_ptr_page(ptrs[0]));
+  singleton = (_mi_ptr_page(ptrs[0])->reserved <= 1);   // (32-bit: 128 KiB does not fit a large page and gets a page of its own)
   for (size_t i = 1; i < LARGE_N; i += 2) { mi_free(ptrs[i]); ptrs[i] = NULL; }
 
   before = hole_stats();
@@ -505,7 +506,7 @@ static bool test_large_pages(void) {
       fprintf(stderr, "\n  an ineligible large page was purged after all\n");
       ok_all = false;
     }
-    if (after.inelig_pages <= 0 || after.inelig_free <= 0) {
+    if (after.inelig_pages <= 0 || (after.inelig_free <= 0 && !singleton)) {   // a singleton page in use has no free bytes
       fprintf(stderr, "\n  the ineligible large pages are not reported (%lld pages, %lld free bytes)\n",
               (long long)after.inelig_pages, (long long)after.inelig_free);
       ok_all = false;

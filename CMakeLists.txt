@@ -880,9 +880,12 @@ if (MI_BUILD_TESTS)
   set(mi_static_tests api api-fill stress-heaps stress-subprocs stress heap-mt heap-teardown heap-delete-race heap-churn heap-aba fork-user-heap snapshot prof prof-adversarial purge-zero park-handoff thp-optout)
   if(MI_BUILD_STATIC AND NOT MI_DEBUG_TSAN)
     # these reach into internals that the shared library (which the TSAN build links the tests against) does not export
-    list(APPEND mi_static_tests theap-sentinel purge-holes)
-    if(NOT MI_TRACK_ASAN)
-      list(APPEND mi_static_tests freelist-corruption)  # writes into freed blocks on purpose, which the address sanitizer poisons
+    list(APPEND mi_static_tests theap-sentinel)
+    if(NOT MI_GUARDED)   # and these two know the page layout, which guard pages change
+      list(APPEND mi_static_tests purge-holes)
+      if(NOT MI_TRACK_ASAN)
+        list(APPEND mi_static_tests freelist-corruption)  # writes into freed blocks on purpose, which the address sanitizer poisons
+      endif()
     endif()
   endif()
   if (MI_DEBUG_FULL OR CMAKE_BUILD_TYPE MATCHES "Debug")

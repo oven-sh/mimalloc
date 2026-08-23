@@ -390,6 +390,11 @@ mi_theap_t* _mi_thread_init_with_heap(mi_heap_t* heap_main)
 
   mi_subproc_stat_increase(_mi_theap_subproc(theap), threads, 1);  // or theap stats and wait for merge?
   // _mi_verbose_message("thread init: 0x%zx\n", _mi_thread_id());
+  if (theap->tld != &mi_process_tld_main) {
+    // a second thread: a good moment to start the scavenger thread (not from the process initializer, see
+    // `_mi_scavenger_start_lazy`, and not from deep inside a free where a purge finds it missing)
+    _mi_scavenger_start_lazy();
+  }
   return theap;
 }
 

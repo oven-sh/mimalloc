@@ -162,11 +162,19 @@ static void mi_scav_wake_one(_Atomic(uint32_t)* addr) {
   pthread_mutex_unlock(&_mi_scav_mutex);
 }
 
+// Some thread libraries (FreeBSD's) allocate a statically initialized mutex/condvar on its first use. With
+// malloc overridden that would be an allocation by a thread that just published itself as parked
+// (`mi_on_thread_idle_start` wakes us after that), racing the sweep of its theaps: initialize them here.
+#define MI_SCAV_HAS_INIT  1
+static void mi_scav_init(void) {
+  pthread_mutex_init(&_mi_scav_mutex, NULL);
+  pthread_cond_init(&_mi_scav_cond, NULL);
+}
+
 // fork() can land with `_mi_scav_mutex` held by a thread that no longer exists in the child.
 #define MI_SCAV_HAS_FORK_RESET  1
 static void mi_scav_fork_child_reset(void) {
-  pthread_mutex_init(&_mi_scav_mutex, NULL);
-  pthread_cond_init(&_mi_scav_cond, NULL);
+  mi_scav_init();
 }
 
 #endif
@@ -174,6 +182,9 @@ static void mi_scav_fork_child_reset(void) {
 #if !defined(MI_SCAV_HAS_FORK_RESET)
 // futex / __ulock / WaitOnAddress hold no state of ours across fork()
 static void mi_scav_fork_child_reset(void) { }
+#endif
+#if !defined(MI_SCAV_HAS_INIT)
+static void mi_scav_init(void) { }
 #endif
 
 // -----------------------------------------------------------------------------
@@ -322,6 +333,7 @@ void _mi_scavenger_start(void) {
   if (!mi_option_is_enabled(mi_option_scavenger)) return;
   if (mi_option_get(mi_option_purge_delay) <= 0) return;
   mi_atomic_store_release(&_mi_scavenger_running, (uintptr_t)1);
+  mi_scav_init();
   // Block all signals on the scavenger thread. It runs before the host has set
   // up its own signal masking, and a thread that leaves (e.g.) SIGCHLD
   // unblocked will have process-directed signals dispatched to it and silently
@@ -372,11 +384,12 @@ void _mi_scavenger_forked_child(void) {
   mi_atomic_store_release(&_mi_scavenger_needs_restart, (uintptr_t)1);
 }
 
-// Start the scavenger on first demand (a purge was scheduled, or a thread parks): not at process
+// Start the scavenger when a second thread initializes or a thread first parks: not at process
 // initialization, which for an inserted/preloaded library runs before the other libraries' initializers
 // (on macOS the Objective-C runtime aborts if a thread exists before it initializes), and would give
-// every short-lived process a thread it never uses. Also the restart after fork(): not in the fork
-// handler, as most children exec immediately.
+// every short-lived single-threaded process a thread it never uses (a purge that is due without a
+// scavenger runs inline, as upstream does). Also the restart after fork(): not in the fork handler, as
+// most children exec immediately.
 void _mi_scavenger_start_lazy(void) {
   if (mi_atomic_load_relaxed(&_mi_scavenger_running) != 0) return;
   static _Atomic(uintptr_t) started;   // once per process image, plus once per fork
