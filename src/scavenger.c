@@ -10,7 +10,6 @@ terms of the MIT license. A copy of the license can be found in the file
 // arena memory returns to the OS without waiting for the next allocation.
 
 #include "mimalloc.h"
-#include "mimalloc/prim.h"      // _mi_prim_thread_yield
 #include "mimalloc/internal.h"
 
 #if defined(__wasi__) || (defined(__EMSCRIPTEN__) && !defined(__EMSCRIPTEN_PTHREADS__))
@@ -18,7 +17,6 @@ terms of the MIT license. A copy of the license can be found in the file
 // No scavenger thread on these platforms; purging stays allocation-driven.
 void _mi_scavenger_start(void) { }
 void _mi_scavenger_stop(void)  { }
-void _mi_scavenger_stop_and_join(void) { }
 void _mi_scavenger_wake(mi_subproc_t* subproc) { MI_UNUSED(subproc); }
 bool _mi_scavenger_is_running(void) { return false; }
 void _mi_scavenger_forked_child(void) { }
@@ -287,7 +285,6 @@ void _mi_scavenger_stop(void) {
     _mi_scavenger_thread = NULL;
   }
 }
-void _mi_scavenger_stop_and_join(void) { _mi_scavenger_stop(); }
 
 void _mi_scavenger_forked_child(void) { }    // no fork on Windows
 void _mi_scavenger_start_if_forked(void) { }
@@ -302,7 +299,6 @@ void _mi_scavenger_start_if_forked(void) { }
 
 static pthread_t          _mi_scavenger_thread;
 static _Atomic(uintptr_t) _mi_scavenger_joinable;
-static _Atomic(uintptr_t) _mi_scavenger_done;            // the thread has left `mi_scavenger_run` (it touches no allocator state after this)
 static _Atomic(uintptr_t) _mi_scavenger_needs_restart;   // fork() took our thread; start one on next use
 
 static void* mi_scavenger_thread_main(void* arg) {
@@ -313,7 +309,6 @@ static void* mi_scavenger_thread_main(void* arg) {
   prctl(PR_SET_NAME, "mi-scavenger", 0, 0, 0);
   #endif
   mi_scavenger_run();
-  mi_atomic_store_release(&_mi_scavenger_done, (uintptr_t)1);
   return NULL;
 }
 
@@ -343,7 +338,6 @@ void _mi_scavenger_start(void) {
   sigdelset(&all, SIGABRT);
   sigdelset(&all, SIGSYS);
   pthread_sigmask(SIG_SETMASK, &all, &old);
-  mi_atomic_store_release(&_mi_scavenger_done, (uintptr_t)0);
   if (pthread_create(&_mi_scavenger_thread, NULL, &mi_scavenger_thread_main, NULL) != 0) {
     mi_atomic_store_release(&_mi_scavenger_running, (uintptr_t)0);
   }
@@ -353,26 +347,15 @@ void _mi_scavenger_start(void) {
   pthread_sigmask(SIG_SETMASK, &old, NULL);
 }
 
-static void mi_scavenger_stop_ex(bool join) {
+void _mi_scavenger_stop(void) {
   if (mi_atomic_exchange_acq_rel(&_mi_scavenger_running, (uintptr_t)0) == 0) return;
   mi_subproc_t* const subproc = _mi_subproc_main();
   mi_atomic_store_release(&subproc->scavenger_wake, (uint32_t)1);
   mi_scav_wake_one(&subproc->scavenger_wake);
-  if (join) {
-    if (mi_atomic_exchange_acq_rel(&_mi_scavenger_joinable, (uintptr_t)0) != 0) {
-      pthread_join(_mi_scavenger_thread, NULL);
-    }
-  }
-  else {
-    // At process exit only wait until the thread is out of the allocator; do not `pthread_join` from an exit
-    // handler: glibc trims its cache of thread stacks in a join and frees the TLS of long gone threads there,
-    // memory that an `mi_subproc_destroy` may have unmapped already (test-stress-subprocs with malloc override).
-    while (mi_atomic_load_acquire(&_mi_scavenger_done) == 0) { _mi_prim_thread_yield(); }
+  if (mi_atomic_exchange_acq_rel(&_mi_scavenger_joinable, (uintptr_t)0) != 0) {
+    pthread_join(_mi_scavenger_thread, NULL);
   }
 }
-
-void _mi_scavenger_stop(void)          { mi_scavenger_stop_ex(false); }
-void _mi_scavenger_stop_and_join(void) { mi_scavenger_stop_ex(true); }
 
 // The thread does not survive fork(), but every flag saying it does is inherited. Left alone the
 // child would: take the wake path in `_mi_arenas_purge_now` and signal nobody (so never purge at
@@ -397,5 +380,5 @@ void _mi_scavenger_start_if_forked(void) {
 #endif
 
 void mi_scavenger_stop(void) mi_attr_noexcept {
-  _mi_scavenger_stop_and_join();
+  _mi_scavenger_stop();
 }

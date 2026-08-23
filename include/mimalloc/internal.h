@@ -293,8 +293,7 @@ void          _mi_prof_theap_init(mi_theap_t* theap);
 void          _mi_scavenger_start(void);
 void          _mi_scavenger_forked_child(void);
 void          _mi_scavenger_start_if_forked(void);
-void          _mi_scavenger_stop(void);           // at process exit: the thread is out of the allocator on return
-void          _mi_scavenger_stop_and_join(void);  // `mi_scavenger_stop`: and the thread is gone
+void          _mi_scavenger_stop(void);
 void          _mi_scavenger_wake(mi_subproc_t* subproc);
 bool          _mi_scavenger_is_running(void);
 void          _mi_arenas_purge_now(mi_subproc_t* subproc);

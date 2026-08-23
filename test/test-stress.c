@@ -373,8 +373,15 @@ static void test_stress_subprocs(void) {
     subprocs[i] = mi_subproc_new();
   }
   run_os_threads(subproc_null, NSUBPROCS, &test_stress_subproc, NULL);
+  // `mi_subproc_destroy` unmaps the sub-process memory with whatever is still allocated in it. When
+  // malloc is overridden that includes what the C library allocated on the sub-process threads for
+  // itself -- the DTVs of the threads they created, which glibc frees much later when it trims its
+  // stack cache (in a later pthread_join/create) -- so it can only be used when malloc is not us.
+  void* probe = malloc(16);
+  const bool malloc_is_redirected = mi_is_in_heap_region(probe);
+  free(probe);
   for(int i = 0; i < NSUBPROCS; i++) {
-    mi_subproc_destroy(subprocs[i]);
+    if (!malloc_is_redirected) { mi_subproc_destroy(subprocs[i]); }
   }
 }
 #endif
