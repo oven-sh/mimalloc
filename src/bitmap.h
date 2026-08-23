@@ -202,6 +202,7 @@ mi_decl_nodiscard bool mi_bitmap_try_find_and_claim(mi_bitmap_t* bitmap, size_t 
 void mi_bitmap_clear_once_set(mi_subproc_t* subproc, mi_bitmap_t* bitmap, size_t idx);
 
 
+
 // If a bit is set in the bitmap, return `true` and set `idx` to the index of the highest bit.
 // Otherwise return `false` (and `*idx` is undefined).
 // Used for unloading arena's

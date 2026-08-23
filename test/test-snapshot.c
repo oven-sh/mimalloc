@@ -9,6 +9,7 @@
 #include <fcntl.h>
 #if defined(_WIN32)
 #include <io.h>
+#include <process.h>   // getpid
 #else
 #include <unistd.h>
 #endif

@@ -36,6 +36,11 @@ under `-DNDEBUG` (release). Chain: heap.c:_mi_heap_theap_get_or_init →
 _mi_theap_cached_set(1) → _mi_theap_incref(1) → `1->memid.memkind`.
 -----------------------------------------------------------------------------*/
 
+#if defined(_WIN32)
+#include <stdio.h>
+int main(void) { printf("test-theap-sentinel: skipped on Windows (uses pthreads/fork)\n"); return 0; }
+#else
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
@@ -218,3 +223,5 @@ int main(int argc, char** argv) {
   if (stress) { return run_stress(); }
   return 0;
 }
+
+#endif  // !_WIN32

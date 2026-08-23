@@ -70,6 +70,7 @@ static mi_decl_noinline mi_theap_t* mi_heap_init_theap(const mi_heap_t* const_he
 
   // get the thread local theap
   mi_theap_t* theap = (mi_theap_t*)_mi_thread_local_get(heap->theap);
+  mi_assert(theap==NULL || _mi_theap_heap_peek(theap)==heap); // or else `heap` was deleted (and we, a thread that used it before, use it still)
 
   // create a fresh theap?
   if (theap==NULL) {
@@ -158,30 +159,62 @@ mi_heap_t* mi_heap_new(void) {
   return mi_heap_new_in_arena(0);
 }
 
-// free all theaps belonging to this heap (without deleting their pages as we do this arena wise for efficiency)
-static void mi_heap_free_theaps(mi_heap_t* heap) {
-  // This can run concurrently with a thread that terminates (see `init.c:mi_thread_theaps_done`),
-  // and we need to ensure we free theaps atomically.
+/* -----------------------------------------------------------
+  Heap delete and destroy.
 
-  // We first detach our theaps list from any thread local lists
+  These can run concurrently with threads that terminate, and (delete) with `mi_free` calls from threads
+  that never allocated from this heap. A thread that did allocate from the heap must not allocate from it
+  or free into it while it is deleted (it may free afterwards, the blocks then belong to the main heap).
+
+  1. `_mi_heap_detach_theaps`: unlink every theap of the heap from its thread and clear `theap->heap`.
+     From here on no thread finds a theap for this heap anymore, so nothing allocates into it, reclaims an
+     abandoned page of it, or abandons pages into it on thread termination.
+  2. `_mi_theap_abandon` each detached theap: its pages become abandoned pages of the heap, exactly as if
+     its thread had terminated. Now every page of the heap is abandoned, and the only other party that can
+     hold one is a concurrent `mi_free` collecting it.
+  3. `_mi_heap_move_pages`/`_mi_heap_destroy_pages`: claim each abandoned page (waiting out such a free,
+     see `arena.c:mi_heap_visit_page_claim`) and move it to the main heap or free it.
+  4. free the theap structs (a free in step 3 may still have been using one it found just before step 1),
+     and then the heap.
+----------------------------------------------------------- */
+
+static void mi_heap_release_pages(mi_heap_t* heap, mi_heap_t* heap_target) {
   _mi_heap_detach_theaps(heap);
+  if (_mi_is_heap_main(heap)) return;  // (`_mi_heap_force_destroy` of a main heap at sub-process teardown: the arenas go as a whole)
+  mi_lock(&heap->theaps_lock) {
+    for (mi_theap_t* theap = heap->theaps; theap != NULL; theap = theap->hnext) {
+      mi_assert_internal(_mi_theap_heap_peek(theap)==NULL);
+      if mi_unlikely(_mi_process_is_forked_child && theap->tld->thread_id != _mi_thread_id()) {
+        // the theap of a thread that did not survive a fork() may be torn mid-update: do not walk it,
+        // step 3 takes its arena pages from the `arena_pages` bitmaps instead (`mi_heap_visit_page_claim`)
+        continue;
+      }
+      _mi_theap_abandon(theap);
+      _mi_stats_merge_into(&heap->stats, &theap->stats);
+    }
+  }
+  if (heap_target != NULL) {
+    _mi_heap_move_pages(heap, heap_target);
+  }
+  else {
+    _mi_heap_destroy_pages(heap);
+  }
+}
 
-  // Now we can safely free the theaps
-  mi_lock(&heap->theaps_lock) { // paranoia
+static void mi_heap_free_theaps(mi_heap_t* heap) {
+  mi_lock(&heap->theaps_lock) {
     mi_theap_t* theap = heap->theaps;
     heap->theaps = NULL;
     while(theap != NULL) {
       mi_theap_t* next = theap->hnext;
       theap->hnext = NULL;
       theap->hprev = NULL;
-      mi_assert_internal(theap->tld==NULL);
-      // merge stats into the owning heap stats
+      mi_assert_internal(_mi_theap_heap_peek(theap)==NULL && (theap->page_count==0 || _mi_is_heap_main(heap) || _mi_process_is_forked_child));
       _mi_stats_merge_into(&heap->stats, &theap->stats);
-      // and free
-      _mi_theap_decref(theap);  // a cached entry can still point to the theap
+      _mi_theap_decref(theap);  // a thread's `_mi_theap_cached` can still reference (but no longer use) it
       theap = next;
     }
-  }  
+  }
 }
 
 // free the heap resources (assuming the pages are already moved/destroyed, and all theaps have been freed)
@@ -233,15 +266,15 @@ void mi_heap_delete(mi_heap_t* heap) {
     _mi_warning_message("cannot delete the main heap\n");
     return;
   }
+  mi_heap_release_pages(heap, heap_main);
   mi_heap_free_theaps(heap);
-  _mi_heap_move_pages(heap, heap_main);
   mi_heap_free(heap,true /* acquire subproc->heaps_lock */);
 }
 
 void _mi_heap_force_destroy(mi_heap_t* heap, bool acquire_heaps_lock) {
   if (heap==NULL) return;
+  mi_heap_release_pages(heap, NULL);
   mi_heap_free_theaps(heap);
-  _mi_heap_destroy_pages(heap);
   // if (_mi_subproc_main()->heap_main == heap) {
   //   _mi_stats_merge_into(&heap->subproc->stats,&heap->stats);
   // }

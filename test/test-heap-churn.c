@@ -35,6 +35,11 @@ terms of the MIT license.
 // identified rather than only when it happens to crash.
 //
 //   ./mimalloc-test-heap-churn [nthreads] [njobs]     (defaults: 64 100)
+#if defined(_WIN32)
+#include <stdio.h>
+int main(void) { printf("test-heap-churn: skipped on Windows (uses pthreads/fork)\n"); return 0; }
+#else
+
 #include <mimalloc.h>
 
 #include <pthread.h>
@@ -452,3 +457,5 @@ int main(int argc, char** argv) {
   printf("OK: %d jobs x %d threads, no corruption\n", g_njobs, g_nthreads);
   return 0;
 }
+
+#endif  // !_WIN32

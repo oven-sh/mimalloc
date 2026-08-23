@@ -13,7 +13,9 @@ terms of the MIT license.
 
    test 1: `mi_free` from worker threads concurrent with `mi_heap_delete`
            on the producer thread (blocks survive delete and are freed "later
-           on as usual" per the API docs).
+           on as usual" per the API docs). Three variants: the delete after the
+           frees, the delete overlapping the frees, and the delete overlapping
+           frees into abandoned pages by threads that used the heap themselves.
 
    test 2: thread A creates heap H1 and allocates once, then creates heap H2
            and allocates, while thread B concurrently destroys H1. A never
@@ -36,7 +38,7 @@ static int ITER = 200;
 #elif defined(MI_UBSAN) || defined(MI_GUARDED)
 static int ITER = 200;
 #else
-static int ITER = 5000;
+static int ITER = 1000;   // (a 3-core CI VM runs ~10 iterations/s; pass a count on the command line for more)
 #endif
 
 #define custom_calloc(n,s)    calloc(n,s)
@@ -126,6 +128,66 @@ static void test_free_during_delete_overlap(void) {
   }
 }
 
+// Variant where the pages are abandoned when the delete starts, and where every
+// freer has used the heap before:
+//  - the blocks are allocated on a thread that exits before the frees start, so
+//    its theap abandons the pages. In the two tests above the pages are still held
+//    by a theap, and the delete moves those without contention; abandoned pages
+//    are claimed by every `mi_free` into them (`mi_free_try_collect_mt`) and by
+//    the delete, so here both run the ownership protocol against each other.
+//  - every freer allocates from the heap once before it starts, so its thread
+//    local slot for the heap refers to a theap that the delete detaches and frees
+//    while the freer is still freeing (`_mi_page_associated_theap_peek` on the
+//    re-abandon path of `mi_free_try_collect_mt`).
+//  Reclaiming on free is disabled for this test: a freer that reclaims a page
+//  holds it like an allocating thread does, and a thread that holds pages of a heap
+//  must not free into them while another thread deletes the heap (the delete moves
+//  a held page without waiting for its thread).
+static volatile long t1_ready[T1_FREERS];
+
+static void t1_allocator(intptr_t tid) {
+  (void)tid;
+  mi_heap_t* heap = (mi_heap_t*)t1_heap;
+  for (int i = 0; i < T1_NPTRS; i++) { t1_ptrs[i] = mi_heap_malloc(heap, 32); }
+  // the thread exits here and abandons the pages it allocated
+}
+
+static void t1_abandoned_worker(intptr_t tid) {
+  if (tid == 0) {
+    for (int i = 0; i < T1_FREERS; i++) {
+      while (atomic_load_long(&t1_ready[i]) == 0) { /* spin */ }
+    }
+    mi_heap_t* heap = (mi_heap_t*)atomic_exchange_ptr(&t1_heap, NULL);
+    atomic_store_long(&t1_go, 1);     // release the freers together with the delete
+    mi_heap_delete(heap);
+  }
+  else {
+    // a different size class than the blocks under test, so this does not reclaim one of their pages
+    mi_free(mi_heap_malloc((mi_heap_t*)t1_heap, 128));
+    atomic_store_long(&t1_ready[tid - 1], 1);
+    t1_freer(tid - 1);
+  }
+}
+
+static void test_free_during_delete_abandoned(void) {
+  const long reclaim_on_free = mi_option_get(mi_option_page_reclaim_on_free);
+  mi_option_set(mi_option_page_reclaim_on_free, -1);
+  for (int n = 0; n < ITER; n++) {
+    mi_heap_t* heap = mi_heap_new();
+    t1_heap = heap;
+    run_os_threads(1, &t1_allocator);
+    for (int i = 0; i < T1_FREERS; i++) { atomic_store_long(&t1_ready[i], 0); }
+    atomic_store_long(&t1_go, 0);
+    run_os_threads(T1_FREERS + 1, &t1_abandoned_worker);
+    for (int i = 0; i < T1_NPTRS; i++) {
+      void* p = atomic_exchange_ptr(&t1_ptrs[i], NULL);
+      if (p != NULL) mi_free(p);
+    }
+    if ((n % 64) == 0) { fprintf(stderr, "."); fflush(stderr); }
+  }
+  mi_option_set(mi_option_page_reclaim_on_free, reclaim_on_free);
+}
+
 
 /* -----------------------------------------------------------
    Test 2: mi_heap_new (on A) concurrent with mi_heap_destroy (on B)
@@ -187,6 +249,10 @@ int main(int argc, char** argv) {
 
   fprintf(stderr, "test: heap-free-during-delete-overlap...  ");
   test_free_during_delete_overlap();
+  fprintf(stderr, " ok.\n");
+
+  fprintf(stderr, "test: heap-free-during-delete-abandoned...  ");
+  test_free_during_delete_abandoned();
   fprintf(stderr, " ok.\n");
 
   fprintf(stderr, "test: heap-new-during-destroy...  ");

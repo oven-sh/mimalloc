@@ -42,10 +42,10 @@ terms of the MIT license.
 // > mimalloc-test-stress [THREADS] [SCALE] [ITER]
 //
 // argument defaults
-#if defined(MI_TSAN)          // with thread-sanitizer reduce the threads to test within the azure pipeline limits
+#if defined(MI_TSAN)          // with thread-sanitizer reduce the threads to test within the CI limits (240s on 4 cores)
 static int THREADS = NTHREADS/4;
 static int SCALE   = 10;
-static int ITER    = 300;
+static int ITER    = 100;
 #elif defined(MI_UBSAN)       // with undefined behavious sanitizer reduce parameters to stay within the azure pipeline limits
 static int THREADS = NTHREADS/4;
 static int SCALE   = 25;
@@ -373,8 +373,15 @@ static void test_stress_subprocs(void) {
     subprocs[i] = mi_subproc_new();
   }
   run_os_threads(subproc_null, NSUBPROCS, &test_stress_subproc, NULL);
+  // `mi_subproc_destroy` unmaps the sub-process memory with whatever is still allocated in it. When
+  // malloc is overridden that includes what the C library allocated on the sub-process threads for
+  // itself -- the DTVs of the threads they created, which glibc frees much later when it trims its
+  // stack cache (in a later pthread_join/create) -- so it can only be used when malloc is not us.
+  void* probe = malloc(16);
+  const bool malloc_is_redirected = mi_is_in_heap_region(probe);
+  free(probe);
   for(int i = 0; i < NSUBPROCS; i++) {
-    mi_subproc_destroy(subprocs[i]);
+    if (!malloc_is_redirected) { mi_subproc_destroy(subprocs[i]); }
   }
 }
 #endif

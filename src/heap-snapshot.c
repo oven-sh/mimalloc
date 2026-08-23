@@ -102,8 +102,10 @@ static void mi_snap_u64(mi_snap_out_t* o, uint64_t v) { mi_snap_put(o, &v, 8); }
 static void mi_snap_emit_bitmap(mi_snap_out_t* out, const mi_bchunk_t* chunks, size_t chunk_count) {
   mi_snap_u32(out, (uint32_t)chunk_count);
   mi_snap_u32(out, (uint32_t)MI_BCHUNK_SIZE);
-  if (chunk_count > 0) {
-    mi_snap_put(out, chunks, chunk_count * MI_BCHUNK_SIZE);
+  for (size_t i = 0; i < chunk_count; i++) {
+    mi_bfield_t fields[MI_BCHUNK_FIELDS];   // the bitmaps are live: read them a word at a time
+    for (size_t j = 0; j < MI_BCHUNK_FIELDS; j++) { fields[j] = mi_atomic_load_relaxed(&((mi_bchunk_t*)chunks)[i].bfields[j]); }
+    mi_snap_put(out, fields, sizeof(fields));
   }
 }
 

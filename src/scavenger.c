@@ -20,7 +20,7 @@ void _mi_scavenger_stop(void)  { }
 void _mi_scavenger_wake(mi_subproc_t* subproc) { MI_UNUSED(subproc); }
 bool _mi_scavenger_is_running(void) { return false; }
 void _mi_scavenger_forked_child(void) { }
-void _mi_scavenger_start_if_forked(void) { }
+void _mi_scavenger_start_lazy(void) { _mi_scavenger_start(); }
 
 #else
 
@@ -133,8 +133,8 @@ static void mi_scav_wake_one(_Atomic(uint32_t)* addr) {
 
 // One scavenger per process, so a file-static mutex/cond is sufficient and
 // avoids bloating mi_subproc_s with platform-conditional fields.
-static pthread_mutex_t _mi_scav_mutex = PTHREAD_MUTEX_INITIALIZER;
-static pthread_cond_t  _mi_scav_cond  = PTHREAD_COND_INITIALIZER;
+static pthread_mutex_t _mi_scav_mutex;   // initialized in `mi_scav_init` (from `_mi_scavenger_start`, before any wait or wake)
+static pthread_cond_t  _mi_scav_cond;
 
 static void mi_scav_wait(_Atomic(uint32_t)* addr, mi_msecs_t timeout_ms) {
   if (timeout_ms <= 0) timeout_ms = 1;
@@ -162,11 +162,19 @@ static void mi_scav_wake_one(_Atomic(uint32_t)* addr) {
   pthread_mutex_unlock(&_mi_scav_mutex);
 }
 
+// Some thread libraries (FreeBSD's) allocate a statically initialized mutex/condvar on its first use. With
+// malloc overridden that would be an allocation by a thread that just published itself as parked
+// (`mi_on_thread_idle_start` wakes us after that), racing the sweep of its theaps: initialize them here.
+#define MI_SCAV_HAS_INIT  1
+static void mi_scav_init(void) {
+  pthread_mutex_init(&_mi_scav_mutex, NULL);
+  pthread_cond_init(&_mi_scav_cond, NULL);
+}
+
 // fork() can land with `_mi_scav_mutex` held by a thread that no longer exists in the child.
 #define MI_SCAV_HAS_FORK_RESET  1
 static void mi_scav_fork_child_reset(void) {
-  pthread_mutex_init(&_mi_scav_mutex, NULL);
-  pthread_cond_init(&_mi_scav_cond, NULL);
+  mi_scav_init();
 }
 
 #endif
@@ -174,6 +182,9 @@ static void mi_scav_fork_child_reset(void) {
 #if !defined(MI_SCAV_HAS_FORK_RESET)
 // futex / __ulock / WaitOnAddress hold no state of ours across fork()
 static void mi_scav_fork_child_reset(void) { }
+#endif
+#if !defined(MI_SCAV_HAS_INIT)
+static void mi_scav_init(void) { }
 #endif
 
 // -----------------------------------------------------------------------------
@@ -287,7 +298,12 @@ void _mi_scavenger_stop(void) {
 }
 
 void _mi_scavenger_forked_child(void) { }    // no fork on Windows
-void _mi_scavenger_start_if_forked(void) { }
+void _mi_scavenger_start_lazy(void) {        // see the POSIX one
+  if (mi_atomic_load_relaxed(&_mi_scavenger_running) != 0) return;
+  static _Atomic(uintptr_t) started;
+  if (mi_atomic_exchange_acq_rel(&started, (uintptr_t)1) != 0) return;
+  _mi_scavenger_start();
+}
 
 #else  // POSIX
 
@@ -317,13 +333,27 @@ void _mi_scavenger_start(void) {
   if (!mi_option_is_enabled(mi_option_scavenger)) return;
   if (mi_option_get(mi_option_purge_delay) <= 0) return;
   mi_atomic_store_release(&_mi_scavenger_running, (uintptr_t)1);
+  mi_scav_init();
   // Block all signals on the scavenger thread. It runs before the host has set
   // up its own signal masking, and a thread that leaves (e.g.) SIGCHLD
   // unblocked will have process-directed signals dispatched to it and silently
   // discarded, starving signalfd/kqueue consumers. sigfillset on glibc/musl
   // already excludes the libc-internal realtime signals used for setxid/cancel.
+  //
+  // Except the signals a fault on this thread itself raises: a blocked SIGSEGV/SIGBUS
+  // is not queued, the kernel resets it to its default action and kills the process on
+  // the spot, so the host's crash handler never runs and a corrupted free list that the
+  // sweep trips over (see `mi_page_purge_holes_walk`) ends the process without a report.
+  // These are thread-directed by nature, so leaving them unblocked starves no one.
   sigset_t all, old;
   sigfillset(&all);
+  sigdelset(&all, SIGSEGV);
+  sigdelset(&all, SIGBUS);
+  sigdelset(&all, SIGILL);
+  sigdelset(&all, SIGFPE);
+  sigdelset(&all, SIGTRAP);
+  sigdelset(&all, SIGABRT);
+  sigdelset(&all, SIGSYS);
   pthread_sigmask(SIG_SETMASK, &all, &old);
   if (pthread_create(&_mi_scavenger_thread, NULL, &mi_scavenger_thread_main, NULL) != 0) {
     mi_atomic_store_release(&_mi_scavenger_running, (uintptr_t)0);
@@ -354,11 +384,17 @@ void _mi_scavenger_forked_child(void) {
   mi_atomic_store_release(&_mi_scavenger_needs_restart, (uintptr_t)1);
 }
 
-// Restart once, on the first purge that wanted a scavenger. Not in the fork handler: most children
-// exec immediately, and starting a thread there would charge every spawn for one it throws away.
-void _mi_scavenger_start_if_forked(void) {
-  if (mi_atomic_load_relaxed(&_mi_scavenger_needs_restart) == 0) return;
-  if (mi_atomic_exchange_acq_rel(&_mi_scavenger_needs_restart, (uintptr_t)0) == 0) return;
+// Start the scavenger when a second thread initializes or a thread first parks: not at process
+// initialization, which for an inserted/preloaded library runs before the other libraries' initializers
+// (on macOS the Objective-C runtime aborts if a thread exists before it initializes), and would give
+// every short-lived single-threaded process a thread it never uses (a purge that is due without a
+// scavenger runs inline, as upstream does). Also the restart after fork(): not in the fork handler, as
+// most children exec immediately.
+void _mi_scavenger_start_lazy(void) {
+  if (mi_atomic_load_relaxed(&_mi_scavenger_running) != 0) return;
+  static _Atomic(uintptr_t) started;   // once per process image, plus once per fork
+  const bool forked = (mi_atomic_exchange_acq_rel(&_mi_scavenger_needs_restart, (uintptr_t)0) != 0);
+  if (mi_atomic_exchange_acq_rel(&started, (uintptr_t)1) != 0 && !forked) return;
   _mi_scavenger_start();
 }
 

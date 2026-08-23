@@ -111,7 +111,9 @@ static mi_decl_cache_align mi_tld_t mi_tld_detached = {
   NULL,                   // park_theap0
   MI_ATOMIC_VAR_INIT(0),  // park_swept
   NULL,                   // subproc_next
-  0, 0                    // holes_sweep_seq / _last
+  0, 0,                   // holes_sweep_seq / _last
+  false, false, 0, 0,     // holes_sweeping / _full / _skipped / _visited
+  false                   // prof_sampling
 };
 
 mi_decl_hidden mi_decl_cache_align const mi_theap_t _mi_theap_empty = {
@@ -388,6 +390,11 @@ mi_theap_t* _mi_thread_init_with_heap(mi_heap_t* heap_main)
 
   mi_subproc_stat_increase(_mi_theap_subproc(theap), threads, 1);  // or theap stats and wait for merge?
   // _mi_verbose_message("thread init: 0x%zx\n", _mi_thread_id());
+  if (theap->tld != &mi_process_tld_main) {
+    // a second thread: a good moment to start the scavenger thread (not from the process initializer, see
+    // `_mi_scavenger_start_lazy`, and not from deep inside a free where a purge finds it missing)
+    _mi_scavenger_start_lazy();
+  }
   return theap;
 }
 
@@ -407,7 +414,7 @@ void mi_decl_noinline mi_thread_init(void) mi_attr_noexcept {
 
 // Free the thread local theaps
 #if MI_DEBUG > 0
-mi_decl_export volatile int mi_debug_stall_in_thread_theaps_done = 0;   // fork test hook (test-theap-sentinel): stall teardown while holding the tld lock
+mi_decl_export _Atomic(uintptr_t) mi_debug_stall_in_thread_theaps_done;   // fork test hook (test-theap-sentinel): stall teardown while holding the tld lock
 #endif
 
 static void mi_thread_theaps_done(mi_tld_t* tld)
@@ -415,9 +422,9 @@ static void mi_thread_theaps_done(mi_tld_t* tld)
   // abandon the pages of all theaps in this thread
   mi_lock(&tld->theaps_lock) {
     #if MI_DEBUG > 0
-    if (mi_debug_stall_in_thread_theaps_done) {
-      mi_debug_stall_in_thread_theaps_done = 2; // signal: tld->theaps_lock held
-      while (mi_debug_stall_in_thread_theaps_done) { _mi_prim_thread_yield(); }
+    if (mi_atomic_load_acquire(&mi_debug_stall_in_thread_theaps_done) != 0) {
+      mi_atomic_store_release(&mi_debug_stall_in_thread_theaps_done, (uintptr_t)2); // signal: tld->theaps_lock held
+      while (mi_atomic_load_acquire(&mi_debug_stall_in_thread_theaps_done) != 0) { _mi_prim_thread_yield(); }
     }
     #endif
     mi_theap_t* theap = tld->theaps;
@@ -636,7 +643,7 @@ static void mi_process_init_once(void) {
       mi_reserve_os_memory((size_t)ksize*MI_KiB, true, true);
     }
   }
-  _mi_scavenger_start();
+  // (the scavenger thread starts on first demand, see `_mi_scavenger_start_lazy`)
 }
 
 /* -----------------------------------------------------------

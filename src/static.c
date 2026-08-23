@@ -6,6 +6,9 @@ terms of the MIT license. A copy of the license can be found in the file
 -----------------------------------------------------------------------------*/
 #ifndef _DEFAULT_SOURCE
 #define _DEFAULT_SOURCE
+#if defined(__linux__) && !defined(_GNU_SOURCE)
+#define _GNU_SOURCE   // prof.c: dl_iterate_phdr / struct dl_phdr_info
+#endif
 #endif
 #if defined(__sun)
 // same remarks as os.c for the static's context.

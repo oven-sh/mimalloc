@@ -392,10 +392,15 @@ static inline bool _mi_thread_is_initialized(void) {
 static inline mi_theap_t* _mi_heap_theap(mi_heap_t* heap) {
   mi_theap_t* theap = _mi_theap_cached();
   #if MI_THEAP_INITASNULL
-  if mi_likely(theap!=NULL && _mi_theap_heap_peek(theap)==heap) return theap;
+  if mi_likely(theap!=NULL && _mi_theap_heap_peek(theap)==heap)
   #else
-  if mi_likely(_mi_theap_heap_peek(theap)==heap) return theap;
+  if mi_likely(_mi_theap_heap_peek(theap)==heap)
   #endif
+  {
+    // a theap of a deleted heap has `theap->heap==NULL` and never matches, also not a new heap at the same address
+    mi_assert_internal(theap->tld != NULL && (theap->tld->thread_id == _mi_prim_thread_id() || theap->tld->thread_id == MI_THREADID_DETACHED));
+    return theap;
+  }
   return _mi_heap_theap_get_or_init(heap);
 }
 
@@ -408,7 +413,10 @@ static inline mi_theap_t* _mi_heap_theap_peek(const mi_heap_t* heap) {
   if mi_likely(_mi_theap_heap_peek(theap)==heap) return theap;
   #endif
   theap = (mi_theap_t*)_mi_thread_local_get(heap->theap);  // don't update the cache on a query
-  mi_assert_internal(theap==NULL || (!_mi_is_empty_theap(theap) && theap->heap==heap));
+  if (theap==NULL) return NULL;
+  mi_assert_internal(!_mi_is_empty_theap(theap));
+  mi_assert_internal(_mi_theap_heap_peek(theap)==heap || _mi_theap_heap_peek(theap)==NULL);
+  if (_mi_theap_heap_peek(theap) != heap) return NULL;  // detached by a concurrent `mi_heap_delete`/`mi_heap_destroy` of `heap` (`_mi_heap_detach_theaps`)
   return theap;
 }
 
@@ -418,7 +426,10 @@ static inline mi_theap_t* _mi_page_associated_theap_peek(mi_page_t* page) {
   mi_heap_t* const heap = mi_page_heap(page);
   mi_theap_t* const theap = (mi_theap_t*)_mi_thread_local_get(heap->theap);
   if (theap==NULL) return NULL;
-  if (theap->heap != heap) return NULL; // should never happen, but can happen for a free across subprocesses, which can happen during pthread tls storage deallocation
+  // The theap no longer belongs to the heap when it was detached by a concurrent `mi_heap_delete` of the heap
+  // (`_mi_heap_detach_theaps`; the theap itself is freed only after the page left the heap, so we can read it).
+  // It also does not belong to it for a free across subprocesses, which can happen during pthread tls storage deallocation.
+  if (_mi_theap_heap_peek(theap) != heap) return NULL;
   mi_assert_internal(!_mi_is_empty_theap(theap) && mi_theap_matches_thread(theap));
   // note: for pages allocated by a detached theap, the returned theap may not be detached
   return theap;

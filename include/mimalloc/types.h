@@ -417,7 +417,7 @@ typedef struct mi_page_s {
   uint16_t                  reserved;          // number of blocks reserved in memory
   
   mi_theap_t*               theap;             // the theap owning this page (may not be valid or NULL for abandoned pages)
-  mi_heap_t*                heap;              // const: the heap owning this page
+  mi_heap_t*                heap;              // the heap owning this page (`mi_heap_delete` moves it to the main heap; only dereference while owning the page, see `mi_page_heap`)
 
   struct mi_page_s*         next;              // next page owned by the theap with the same `block_size`
   struct mi_page_s*         prev;              // previous page owned by the theap with the same `block_size`
@@ -731,6 +731,7 @@ struct mi_tld_s {
   bool                  holes_sweep_full;     // this sweep ignores `page->swept_state` (see `_mi_page_purge_holes`)
   size_t                holes_sweep_skipped;  // per-sweep counters, folded into the process-wide ones in `_mi_page_purge_holes_end`
   size_t                holes_sweep_visited;
+  bool                  prof_sampling;        // inside `_mi_prof_sample`: an allocation made while taking the backtrace is not sampled
 };
 
 

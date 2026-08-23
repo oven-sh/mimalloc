@@ -58,7 +58,7 @@ static bool mi_theap_page_is_valid(mi_theap_t* theap, mi_page_queue_t* pq, mi_pa
   MI_UNUSED(pq);
   mi_assert_internal(mi_page_theap(page) == theap);
   mi_theap_t* const page_theap = _mi_heap_theap_peek(page->heap);
-  mi_assert_internal(page_theap == NULL || theap == page_theap || theap->tld->thread_id == MI_THREADID_DETACHED);
+  mi_assert_internal(page_theap == NULL || theap == page_theap || theap->tld->thread_id != _mi_thread_id());
   mi_assert_expensive(_mi_page_is_valid(page));
   return true;
 }
@@ -68,8 +68,9 @@ static bool mi_theap_is_valid(mi_theap_t* theap) {
   mi_heap_t* const heap = _mi_theap_heap_peek(theap);
   mi_assert_internal(heap != NULL);
   mi_theap_t* const heap_theap = _mi_heap_theap_peek(heap);  // don't use mi_heap_theap as that may re-initialize the thread
-  // a detached theap (`theap_meta`) is used under a lock from any thread, whose own theap for `heap` it is not
-  mi_assert_internal(heap_theap==NULL || heap_theap == theap || theap->tld->thread_id == MI_THREADID_DETACHED);
+  // only the owning thread's lookup must agree; a detached theap (`theap_meta`) is used under a lock from any
+  // thread, and the scavenger collects a parked thread's theaps while having theaps of its own
+  mi_assert_internal(heap_theap==NULL || heap_theap == theap || theap->tld->thread_id != _mi_thread_id());
   mi_theap_visit_pages(theap, &mi_theap_page_is_valid, true, NULL, NULL);
   for (size_t bin = 0; bin < MI_BIN_COUNT; bin++) {
     mi_assert_internal(_mi_page_queue_is_valid(theap, &theap->pages[bin]));
@@ -161,6 +162,25 @@ void _mi_theap_collect_abandon(mi_theap_t* theap) {
   mi_theap_collect_ex(theap, MI_ABANDON);
 }
 
+static bool mi_theap_page_abandon(mi_theap_t* theap, mi_page_queue_t* pq, mi_page_t* page, void* arg1, void* arg2 ) {
+  MI_UNUSED(theap); MI_UNUSED(arg1); MI_UNUSED(arg2);
+  _mi_page_abandon(page, pq);  // frees it instead if all blocks turn out to be free
+  return true;
+}
+
+// Abandon the pages of a theap that `mi_heap_delete`/`mi_heap_destroy` detached from its heap
+// (`_mi_heap_detach_theaps`), as if its thread terminated. That thread no longer reaches the theap,
+// and by the contract of `mi_heap_delete` it is not allocating from or freeing into these pages.
+void _mi_theap_abandon(mi_theap_t* theap) {
+  mi_assert_internal(_mi_theap_heap_peek(theap)==NULL);
+  mi_assert_internal(theap->tnext==NULL && theap->tprev==NULL);
+  mi_theap_visit_pages(theap, &mi_theap_page_abandon, true /* include full pages */, NULL, NULL);
+  mi_assert_internal(theap->page_count==0);
+  #if MI_DEBUG>1
+  for (size_t i = 0; i <= MI_BIN_FULL; i++) { mi_assert_internal(theap->pages[i].first == NULL); }
+  #endif
+}
+
 // Visit every page (INCLUDING the full queue, which a normal collect skips --
 // see mi_theap_collect_ex) and discard the memory of free blocks inside pages
 // that are still partially used. Meant to be called when the application knows
@@ -223,11 +243,11 @@ static void mi_purge_holes_of(mi_tld_t* tld) mi_attr_noexcept {
   size_t heap_count = 0;
 
   // Hold `tld->theaps_lock` for the whole sweep, including the abandoned-page pass below:
-  //  - another thread can unlink a theap from this list in `mi_heap_free_theaps`, and
+  //  - another thread can unlink a theap from this list in `_mi_heap_detach_theaps`, and
   //  - it keeps every `heaps[i]` alive: a heap is only freed by `mi_heap_delete`/`mi_heap_destroy`
-  //    *after* `mi_heap_free_theaps` freed every theap of it, and freeing our theap needs this lock
-  //    (`_mi_theap_free` try-acquires it and its caller retries), so it cannot complete while we
-  //    hold it. Reading a `heaps[i]` outside the lock is a use-after-free (`heap->subproc`).
+  //    *after* `_mi_heap_detach_theaps` detached every theap of it, and detaching our theap needs this
+  //    lock (it try-acquires it and retries), so it cannot complete while we hold it. Reading a
+  //    `heaps[i]` outside the lock is a use-after-free (`heap->subproc`).
   mi_lock(&tld->theaps_lock) {
     for (mi_theap_t* theap = tld->theaps; theap != NULL; theap = theap->tnext) {
       mi_theap_purge_holes(theap);
@@ -308,8 +328,13 @@ bool mi_on_thread_idle_start(void) mi_attr_noexcept {
   mi_tld_t* const tld = theap0->tld;
   if (tld->thread_id != _mi_thread_id()) return false;
   // the scavenger only sweeps the main subproc, so a thread elsewhere would never be swept
-  if (!_mi_scavenger_is_running() || tld->subproc != _mi_subproc_main()) return false;
+  if (tld->subproc != _mi_subproc_main()) return false;
+  _mi_scavenger_start_lazy();
+  if (!_mi_scavenger_is_running()) return false;
 
+  // Already parked (a second `_start` without an `_end`): the scavenger may be reading the fields
+  // below right now. Only this thread takes the state out of RUNNING, so past this check they are ours.
+  if (mi_atomic_load_acquire(&tld->park_state) != MI_PARK_RUNNING) return false;
   // The scavenger has no TLS of ours to find the default theap with, so leave it here.
   tld->park_theap0 = theap0;
   mi_atomic_store_release(&tld->park_reclaim, 0);
@@ -653,6 +678,11 @@ void _mi_theap_decref(mi_theap_t* theap) {
 // we back-off, release the outer lock, and try again until we succeed.
 
 // Remove the theaps in this heap from any thread local tld lists.
+// A detached theap has `theap->heap == NULL`: its thread no longer finds it (`_mi_heap_theap`,
+// `_mi_page_associated_theap_peek` check that field), so it does not allocate from it, reclaim into it,
+// or abandon its pages on termination anymore. The struct stays valid until the last reference is dropped
+// (`heap.c:mi_heap_free_theaps`, or a thread's `_mi_theap_cached`); its `tld` points to a thread that may
+// terminate at any time from here on, so only that thread may still dereference it.
 void _mi_heap_detach_theaps( mi_heap_t* heap ) {
   bool all_detached;
   do {
@@ -661,15 +691,16 @@ void _mi_heap_detach_theaps( mi_heap_t* heap ) {
       mi_theap_t* theap = heap->theaps;
       while (theap != NULL) {
         mi_theap_t* next = theap->hnext;
-        mi_tld_t* tld = theap->tld; 
-        if (tld != NULL) {
+        if (_mi_theap_heap_peek(theap) != NULL) {   // not detached yet in an earlier round?
+          mi_tld_t* const tld = theap->tld;
+          mi_assert_internal(tld != NULL);
           if (mi_lock_try_acquire(&tld->theaps_lock)) {
             // remove the theap from the tld theaps list
             if (theap->tnext != NULL) { theap->tnext->tprev = theap->tprev;  }
             if (theap->tprev != NULL) { theap->tprev->tnext = theap->tnext;  }
-                                else { mi_assert_internal(theap->tld->theaps == theap); theap->tld->theaps = theap->tnext; }
+                                else { mi_assert_internal(tld->theaps == theap); tld->theaps = theap->tnext; }
             theap->tnext = theap->tprev = NULL;       
-            theap->tld = NULL;
+            mi_atomic_store_ptr_release(mi_heap_t, &theap->heap, NULL);
             mi_lock_release(&tld->theaps_lock);
           }
           else {

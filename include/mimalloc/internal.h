@@ -273,6 +273,7 @@ void          _mi_arenas_unsafe_destroy_all(mi_subproc_t* subproc);
 
 mi_page_t*    _mi_arenas_page_alloc(mi_theap_t* theap, size_t block_size, size_t page_alignment);
 void          _mi_arenas_page_free(mi_page_t* page, mi_theap_t* current_theapx /* can be NULL */);
+void          _mi_arenas_abandoned_page_free(mi_page_t* page, mi_theap_t* current_theapx);
 void          _mi_arenas_page_abandon(mi_page_t* page, mi_theap_t* current_theap);
 void          _mi_arenas_page_unabandon(mi_page_t* page, mi_theap_t* current_theapx /* can be NULL */);
 bool          _mi_arenas_page_try_reabandon_to_mapped(mi_page_t* page);
@@ -291,7 +292,7 @@ void          _mi_prof_theap_init(mi_theap_t* theap);
 // scavenger.c
 void          _mi_scavenger_start(void);
 void          _mi_scavenger_forked_child(void);
-void          _mi_scavenger_start_if_forked(void);
+void          _mi_scavenger_start_lazy(void);
 void          _mi_scavenger_stop(void);
 void          _mi_scavenger_wake(mi_subproc_t* subproc);
 bool          _mi_scavenger_is_running(void);
@@ -345,6 +346,21 @@ bool          _mi_theap_area_visit_blocks(const mi_heap_area_t* area, mi_page_t*
 void          _mi_theap_page_reclaim(mi_theap_t* theap, mi_page_t* page);
 
 void          _mi_heap_detach_theaps( mi_heap_t* heap );
+void          _mi_theap_abandon(mi_theap_t* theap);
+
+#if MI_DEBUG>0
+// Test hooks (see the tests named at their definitions). Declared here so that they keep C linkage
+// when the library is compiled as C++ and the tests are not.
+#ifdef __cplusplus
+extern "C" {
+#endif
+extern mi_decl_export _Atomic(uintptr_t) mi_debug_stall_in_thread_theaps_done;
+extern mi_decl_export _Atomic(uintptr_t) mi_debug_stall_in_heap_delete_claim;
+extern mi_decl_export volatile long      mi_debug_fail_os_commit_after;
+#ifdef __cplusplus
+}
+#endif
+#endif
 void          _mi_tld_detach_theaps( mi_tld_t* tld );
 void          _mi_theap_incref(mi_theap_t* theap);
 void          _mi_theap_decref(mi_theap_t* theap);
@@ -451,6 +467,10 @@ void __mi_stat_counter_increase_mt(mi_stat_counter_t* stat, size_t amount);
 #define mi_theap_stat_adjust_increase(theap,stat,amnt)          __mi_stat_adjust_increase( &(theap)->stats.stat, amnt)
 #define mi_theap_stat_adjust_decrease(theap,stat,amnt)          __mi_stat_adjust_decrease( &(theap)->stats.stat, amnt)
 
+#define mi_theapx_stat_counter_increase(heap,theap,stat,amount) if (theap!=NULL) { mi_theap_stat_counter_increase(theap,stat,amount); } else { mi_heap_stat_counter_increase(heap,stat,amount); }
+#define mi_theapx_stat_increase(heap,theap,stat,amount)         if (theap!=NULL) { mi_theap_stat_increase(theap,stat,amount); } else { mi_heap_stat_increase(heap,stat,amount); }
+#define mi_theapx_stat_decrease(heap,theap,stat,amount)         if (theap!=NULL) { mi_theap_stat_decrease(theap,stat,amount); } else { mi_heap_stat_decrease(heap,stat,amount); }
+#define mi_theapx_stat_adjust_decrease(heap,theap,stat,amount)  if (theap!=NULL) { mi_theap_stat_adjust_decrease(theap,stat,amount); } else { mi_heap_stat_adjust_decrease(heap,stat,amount); }
 
 /* -----------------------------------------------------------
   pthread thread locals
@@ -704,6 +724,8 @@ static inline bool mi_theap_is_detached(mi_theap_t* theap) {
 
 static inline bool _mi_theap_can_touch(const mi_theap_t* theap) {
   if (theap == NULL || theap->tld == NULL) return true;
+  // detached from its heap by `mi_heap_delete`: belongs to the deleting thread (and its own thread may have terminated since, taking `tld` with it)
+  if (mi_atomic_load_ptr_relaxed(mi_heap_t, &((mi_theap_t*)theap)->heap) == NULL) return true;
   if (theap->tld->thread_id == _mi_thread_id()) return true;
   if (mi_theap_is_detached((mi_theap_t*)theap)) return true;   // upstream's detached theaps (meta-data / heaps without a thread) belong to no thread
   return (mi_atomic_load_acquire(&theap->tld->park_state) == MI_PARK_SWEEPING);
@@ -1220,6 +1242,13 @@ static inline mi_tld_t* mi_page_tld(const mi_page_t* page) {
 }
 
 
+// The heap of a page. `mi_heap_delete` re-points this to the main heap and then frees the heap (and its
+// `arena_pages`) while other threads may still be freeing blocks of the heap. It waits for such a thread
+// only while that thread owns an abandoned arena page whose bit in the heap's `arena_pages` is still set
+// (`arena.c:mi_heap_visit_page_at`; a page that a theap still holds is moved without waiting, as only its
+// own thread touches it). So on a free of a block of another thread, dereference this (or `mi_page_subproc`)
+// only after owning the page (not in `free.c:mi_stat_free`), and not anymore after clearing that bit
+// (`arena.c:mi_arenas_page_free_prim`).
 static inline mi_heap_t* mi_page_heap(const mi_page_t* page) {
   mi_heap_t* heap = page->heap;
   mi_assert_internal(heap != NULL);

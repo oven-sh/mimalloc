@@ -19,6 +19,9 @@ terms of the MIT license. A copy of the license can be found in the file
 // an open-addressed hash map from block address -> sample index for inuse
 // tracking. Backtraces are deduplicated at dump time.
 
+#if defined(__linux__) && !defined(_GNU_SOURCE)
+#define _GNU_SOURCE   // dl_iterate_phdr / struct dl_phdr_info (must precede the first libc header)
+#endif
 #include "mimalloc.h"
 #include "mimalloc/internal.h"
 #include "mimalloc/atomic.h"
@@ -219,12 +222,17 @@ static intptr_t mi_prof_next_countdown(mi_theap_t* theap) {
 // ---------------------------------------------------------------------------
 
 void _mi_prof_sample(mi_theap_t* theap, mi_page_t* page, void* p, size_t req_size) {
-  // reset countdown first so re-entrancy can't loop
   theap->prof_countdown = mi_prof_next_countdown(theap);
   if (p == NULL || mi_prof.rate == 0) return;
+  // Taking the backtrace can allocate (glibc's `backtrace` dlopen's libgcc_s on first use, and that dlopen
+  // calls calloc before it is re-entrant); with a rate of 1 that allocation would sample again, without end.
+  mi_tld_t* const tld = theap->tld;
+  if (tld == NULL || tld->prof_sampling) return;
+  tld->prof_sampling = true;
 
   uintptr_t frames[MI_PROF_MAX_FRAMES];
   uint8_t n = mi_prof_backtrace(frames);
+  tld->prof_sampling = false;
 
   mi_lock(&mi_prof.lock) {
     mi_prof_sample_t* s = mi_prof_samples_push();

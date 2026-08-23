@@ -294,9 +294,8 @@ void _mi_free_subproc_safe(void* p) mi_attr_noexcept {
 static bool mi_abandoned_page_try_free(mi_page_t* page)
 {
   if (!mi_page_all_free(page)) return false;
-  // first remove it from the abandoned pages in the arena (if mapped, this might wait for any readers to finish)
-  _mi_arenas_page_unabandon(page,NULL);
-  _mi_arenas_page_free(page,NULL); // we can now free the page directly
+  // remove it from the abandoned pages in the arena (if mapped, this might wait for any readers to finish) and free it
+  _mi_arenas_abandoned_page_free(page,NULL);
   return true;
 }
 
@@ -710,16 +709,28 @@ static void mi_check_padding(const mi_page_t* page, const mi_block_t* block) {
 
 // only maintain stats for smaller objects if requested
 #if (MI_STAT>0)
+// The subproc to account a free on when we cannot use our own theap. On a multi-threaded free we do not
+// own `page`, so we cannot go through `page->heap` (see `mi_page_heap`): a concurrent `mi_heap_delete`
+// moves the page to the main heap and frees the heap struct. The arena of a page is constant for the
+// lifetime of the page instead; for the (rare) OS allocated pages we fall back to our own subproc.
+static mi_subproc_t* mi_stat_free_subproc(const mi_page_t* page) {
+  if mi_likely(page->memid.memkind == MI_MEM_ARENA) {
+    return page->memid.mem.arena.arena->subproc;
+  }
+  else {
+    return _mi_subproc();
+  }
+}
+
 static void mi_stat_free(const mi_page_t* page, const mi_block_t* block) {
   MI_UNUSED(block);  
   mi_theap_t* theap = _mi_theap_default();
   mi_lock_t* lock = NULL;
-  mi_subproc_t* const subproc = mi_page_subproc(page);
-  mi_theap_t* const theap_meta = subproc->theap_meta;
-  if mi_unlikely(!mi_theap_is_initialized(theap) || // can happen if free'd after thread_done was called (usually a thread cleanup call by the OS)
-                  // page->theap == subproc->theap_meta  .. but we cannot read `theap` if we don't own the page
-                  (theap_meta != NULL && mi_page_thread_id(page) == theap_meta->tld->thread_id)) { 
-    theap = theap_meta;
+  if mi_unlikely(!mi_theap_is_initialized(theap) ||             // can happen if free'd after thread_done was called (usually a thread cleanup call by the OS)
+                 mi_page_thread_id(page) == MI_THREADID_DETACHED) { // page->theap == subproc->theap_meta .. but we cannot read `theap` if we don't own the page (only the meta theap has the detached thread id)
+    mi_subproc_t* const subproc = mi_stat_free_subproc(page);
+    if (subproc->theap_meta == NULL) return;  // give up (the subproc is being destroyed)
+    theap = subproc->theap_meta;
     lock = &subproc->theap_meta_lock;
     mi_lock_acquire(lock);
   }

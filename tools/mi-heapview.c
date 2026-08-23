@@ -228,7 +228,7 @@ static bool hv_parse(hv_reader_t* r, hv_snapshot_t* s) {
 
 static uint64_t hv_popcount_bytes(const uint8_t* p, size_t n) {
   uint64_t c = 0;
-  for (size_t i = 0; i < n; i++) c += (uint64_t)__builtin_popcount(p[i]);
+  for (size_t i = 0; i < n; i++) { uint8_t b = p[i]; while (b) { c += (b & 1); b >>= 1; } }
   return c;
 }
 

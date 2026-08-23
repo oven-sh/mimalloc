@@ -1,6 +1,11 @@
 // Adversarial tests for the sampling heap profiler.
 // Each case targets a specific race or edge condition; failures abort.
 
+#if defined(_WIN32)
+#include <stdio.h>
+int main(void) { printf("test-prof-adversarial: skipped on Windows (uses pthreads/fork)\n"); return 0; }
+#else
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -147,15 +152,14 @@ static void case_realloc(void) {
   void* keep[500];
   for (int i = 0; i < 500; i++) {
     void* p = mi_malloc(200);
-    p = mi_realloc(p, 800);  // free 200B, alloc 800B
+    p = mi_realloc(p, 20000);  // free 200B, alloc 20000B (too large to grow in place, even in a guarded block)
     keep[i] = p;
   }
   mi_prof_dump_to_file("/tmp/prof-realloc.pb");
   pb_stats_t st; CHECK(pb_validate("/tmp/prof-realloc.pb", &st) == 0, "realloc: parses");
-  // inuse should reflect only the 800B blocks (old 200B freed)
-  // alloc_bytes counts both. ratio ~ 800/(200+800) = 0.8; allow slack for rounding
+  // inuse should reflect only the 20000B blocks (old 200B freed); alloc_bytes counts both
   double ratio = (double)st.inuse_bytes / (double)st.alloc_bytes;
-  CHECK(ratio > 0.5 && ratio < 0.95, "realloc: old block freed, not double-counted");
+  CHECK(st.inuse_bytes < st.alloc_bytes && ratio > 0.5, "realloc: old block freed, not double-counted");
   for (int i = 0; i < 500; i++) mi_free(keep[i]);
   mi_prof_enable(0);
   OK("realloc");
@@ -379,3 +383,5 @@ int main(void) {
   fprintf(stderr, "all cases passed\n");
   return 0;
 }
+
+#endif  // !_WIN32

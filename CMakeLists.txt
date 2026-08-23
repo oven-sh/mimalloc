@@ -332,7 +332,7 @@ if(MI_SEE_ASM)
   if(CMAKE_C_COMPILER_ID MATCHES "MSVC" OR MI_CLANG_CL)
     list(APPEND mi_cflags -FA)
   else()
-    list(APPEND mi_cflags -save-temps)
+    list(APPEND mi_cflags -save-temps=obj)  # =obj: per object directory, so targets that compile the same sources do not race on the temporaries
     if(CMAKE_C_COMPILER_ID MATCHES "AppleClang|Clang" AND CMAKE_C_COMPILER_VERSION VERSION_GREATER 14)
       message(STATUS "No GNU Line marker")
       list(APPEND mi_cflags -Wno-gnu-line-marker)
@@ -658,6 +658,9 @@ endif()
 if(MI_USE_CXX)
   set_source_files_properties(${mi_sources} PROPERTIES LANGUAGE CXX )
   set_source_files_properties(src/static.c test/test-api.c test/test-api-fill.c test/test-stress.c test/test-stress-heaps.c  test/test-stress-subprocs.c PROPERTIES LANGUAGE CXX )
+  # the white-box tests call internal functions, whose names are mangled now; the heap tests use C11 atomics, which MSVC lacks in C mode
+  set_source_files_properties(test/test-theap-sentinel.c test/test-purge-holes.c test/test-commit-fail.c
+                              test/test-heap-aba.c test/test-heap-delete-race.c test/test-heap-teardown.c PROPERTIES LANGUAGE CXX )
 endif()
 
 
@@ -874,7 +877,17 @@ if (MI_BUILD_TESTS)
   enable_testing()
 
   # static link tests
-  set(mi_static_tests api api-fill stress-heaps stress-subprocs stress heap-mt heap-delete-race heap-churn fork-user-heap snapshot prof prof-adversarial theap-sentinel purge-holes purge-zero park-handoff)
+  set(mi_static_tests api api-fill stress-heaps stress-subprocs stress heap-mt heap-teardown heap-delete-race heap-churn heap-aba fork-user-heap snapshot prof prof-adversarial purge-zero park-handoff)
+  if(NOT (MI_DEBUG_TSAN OR MI_TRACK_ASAN OR MI_DEBUG_UBSAN))
+    list(APPEND mi_static_tests thp-optout)  # counts madvise calls by interposing it, which a sanitizer runtime does first
+  endif()
+  if(MI_BUILD_STATIC AND NOT MI_DEBUG_TSAN)
+    # these reach into internals that the shared library (which the TSAN build links the tests against) does not export
+    list(APPEND mi_static_tests theap-sentinel)
+    if(NOT MI_GUARDED)   # and these two know the page layout, which guard pages change
+      list(APPEND mi_static_tests purge-holes)
+    endif()
+  endif()
   if (MI_DEBUG_FULL OR CMAKE_BUILD_TYPE MATCHES "Debug")
     list(APPEND mi_static_tests commit-fail)  # uses mi_debug_fail_os_commit_after (MI_DEBUG>0 only)
   endif()
@@ -894,13 +907,19 @@ if (MI_BUILD_TESTS)
     add_test(NAME test-${TEST_NAME} COMMAND ${CMAKE_COMMAND} -E env MIMALLOC_GUARDED_SAMPLE_RATE=1 $<TARGET_FILE:mimalloc-test-${TEST_NAME}>)
     elseif(TEST_NAME STREQUAL "stress-heaps")
     add_test(NAME test-${TEST_NAME} COMMAND ${CMAKE_COMMAND} -E env MIMALLOC_ARENA_EAGER_COMMIT=0 MIMALLOC_PAGE_COMMIT_ON_DEMAND=1 $<TARGET_FILE:mimalloc-test-${TEST_NAME}>)
+    elseif(TEST_NAME STREQUAL "thp-optout")
+    add_test(NAME test-${TEST_NAME} COMMAND ${CMAKE_COMMAND} -E env MIMALLOC_ALLOW_THP=0 $<TARGET_FILE:mimalloc-test-${TEST_NAME}>)  # off from the start: covers the mappings made during initialization too
+    elseif(TEST_NAME STREQUAL "fork-user-heap" AND MI_DEBUG_TSAN)
+    add_test(NAME test-${TEST_NAME} COMMAND ${CMAKE_COMMAND} -E env TSAN_OPTIONS=die_after_fork=0 $<TARGET_FILE:mimalloc-test-${TEST_NAME}>)  # the forked child starts the scavenger thread
     else()
     add_test(NAME test-${TEST_NAME} COMMAND mimalloc-test-${TEST_NAME})
     endif()
   endforeach()
 
   # the same hole-purging tests with the feature turned off: it must be a no-op
-  add_test(NAME test-purge-holes-off COMMAND ${CMAKE_COMMAND} -E env MIMALLOC_PURGE_HOLES=0 $<TARGET_FILE:mimalloc-test-purge-holes>)
+  if(TARGET mimalloc-test-purge-holes)
+    add_test(NAME test-purge-holes-off COMMAND ${CMAKE_COMMAND} -E env MIMALLOC_PURGE_HOLES=0 $<TARGET_FILE:mimalloc-test-purge-holes>)
+  endif()
 
   # with no scavenger to hand off to, `mi_on_thread_idle_start` must do the work inline instead
   add_test(NAME test-park-handoff-no-scavenger COMMAND ${CMAKE_COMMAND} -E env MIMALLOC_SCAVENGER=0 $<TARGET_FILE:mimalloc-test-park-handoff>)
@@ -913,7 +932,7 @@ if (MI_BUILD_TESTS)
   # allocator once more with emulated TLS, as malloc, in the TLS model Android uses, and link
   # test/test-emulated-tls.c against that build. Only compilers that can emulate TLS (clang); the
   # sanitizers bring their own malloc.
-  if(MI_OVERRIDE AND NOT WIN32 AND NOT (MI_TRACK_ASAN OR MI_TRACK_VALGRIND OR MI_DEBUG_TSAN OR MI_DEBUG_UBSAN))
+  if(MI_OVERRIDE AND CMAKE_SYSTEM_NAME MATCHES "Linux|Android" AND NOT (MI_TRACK_ASAN OR MI_TRACK_VALGRIND OR MI_DEBUG_TSAN OR MI_DEBUG_UBSAN))
     include(CheckCCompilerFlag)
     check_c_compiler_flag("-femulated-tls" MI_HAS_EMULATED_TLS)
     if(MI_HAS_EMULATED_TLS)
@@ -937,6 +956,7 @@ if (MI_BUILD_TESTS)
   # heap snapshot reader CLI (standalone, no mimalloc dependency)
   add_executable(mi-heapview tools/mi-heapview.c)
   target_compile_options(mi-heapview PRIVATE ${mi_cflags})
+  target_link_libraries(mi-heapview PRIVATE ${mi_libraries})
 
   # dynamic override test
   if(MI_BUILD_SHARED AND NOT (MI_CYGWIN OR MI_TRACK_ASAN OR MI_DEBUG_TSAN OR MI_DEBUG_UBSAN)) # AND NOT (APPLE AND MI_USE_CXX))
