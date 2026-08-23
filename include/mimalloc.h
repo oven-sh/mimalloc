@@ -189,8 +189,6 @@ mi_decl_export void mi_register_output(mi_output_fun* out, void* arg) mi_attr_no
 
 typedef void (mi_cdecl mi_error_fun)(int err, void* arg);
 mi_decl_export void mi_register_error(mi_error_fun* fun, void* arg);
-typedef void (mi_cdecl mi_error_message_fun)(int err, const char* msg, void* arg);
-mi_decl_export void mi_register_error_message(mi_error_message_fun* fun, void* arg);
 
 mi_decl_export void mi_collect(bool force)      mi_attr_noexcept;
 

@@ -613,15 +613,6 @@ void mi_register_error(mi_error_fun* fun, void* arg) {
   mi_atomic_store_ptr_release(void,&mi_error_arg, arg);
 }
 
-// As `mi_register_error`, but the handler also receives the formatted message (whether or not
-// `show_errors` printed it), e.g. to put it in a crash report.
-static mi_error_message_fun* volatile mi_error_message_handler; // = NULL
-
-void mi_register_error_message(mi_error_message_fun* fun, void* arg) {
-  mi_error_message_handler = fun;  // can be NULL
-  mi_atomic_store_ptr_release(void,&mi_error_arg, arg);
-}
-
 void _mi_error_message(int err, const char* fmt, ...) {
   // show detailed error message
   va_list args;
@@ -629,14 +620,7 @@ void _mi_error_message(int err, const char* fmt, ...) {
   mi_show_error_message(fmt, args);
   va_end(args);
   // and call the error handler which may abort (or return normally, potentially setting errno)
-  if (mi_error_message_handler != NULL) {
-    char msg[384];
-    va_start(args, fmt);
-    _mi_vsnprintf(msg, sizeof(msg) - 1, fmt, args);
-    va_end(args);
-    mi_error_message_handler(err, msg, mi_atomic_load_ptr_acquire(void,&mi_error_arg));
-  }
-  else if (mi_error_handler != NULL) {
+  if (mi_error_handler != NULL) {
     mi_error_handler(err, mi_atomic_load_ptr_acquire(void,&mi_error_arg));
   }
   else {

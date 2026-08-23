@@ -659,7 +659,7 @@ if(MI_USE_CXX)
   set_source_files_properties(${mi_sources} PROPERTIES LANGUAGE CXX )
   set_source_files_properties(src/static.c test/test-api.c test/test-api-fill.c test/test-stress.c test/test-stress-heaps.c  test/test-stress-subprocs.c PROPERTIES LANGUAGE CXX )
   # the white-box tests call internal functions, whose names are mangled now; the heap tests use C11 atomics, which MSVC lacks in C mode
-  set_source_files_properties(test/test-theap-sentinel.c test/test-purge-holes.c test/test-freelist-corruption.c test/test-commit-fail.c
+  set_source_files_properties(test/test-theap-sentinel.c test/test-purge-holes.c test/test-commit-fail.c
                               test/test-heap-aba.c test/test-heap-delete-race.c test/test-heap-teardown.c PROPERTIES LANGUAGE CXX )
 endif()
 
@@ -886,9 +886,6 @@ if (MI_BUILD_TESTS)
     list(APPEND mi_static_tests theap-sentinel)
     if(NOT MI_GUARDED)   # and these two know the page layout, which guard pages change
       list(APPEND mi_static_tests purge-holes)
-      if(NOT MI_TRACK_ASAN)
-        list(APPEND mi_static_tests freelist-corruption)  # writes into freed blocks on purpose, which the address sanitizer poisons
-      endif()
     endif()
   endif()
   if (MI_DEBUG_FULL OR CMAKE_BUILD_TYPE MATCHES "Debug")

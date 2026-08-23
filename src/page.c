@@ -253,107 +253,6 @@ bool _mi_page_is_valid(mi_page_t* page) {
 
 
 /* -----------------------------------------------------------
-  Free list corruption.
-
-  A free block carries its `next` link in its own first word, so a write into a block after
-  it was freed, or a stale free that linked a still-live object, leaves a link that can point
-  anywhere. The allocation path pops a link without looking at it; the cold paths that read a
-  whole list (`mi_page_thread_collect_to_local`, the forced collect in `mi_page_free_collect_ex`,
-  and the idle sweep's `mi_page_purge_holes_walk`) are the ones that reach such a link first
-  in practice, and without a check they fault on it (oven-sh/bun BUN-40BH and its siblings).
-  So they check every link: a valid link is NULL or the start of a formed block of this page,
-  a list never holds more blocks than the page has free, and (in the sweep, which counts the
-  blocks) no block is on it twice. (`MI_ENCODE_FREELIST` builds already reject a link that
-  leaves the page in `mi_block_next`; release builds do not encode.) The checks cost a division
-  per block walked. Of the three walks only the thread-free collect is reached from allocation
-  (`_mi_malloc_generic`), and it already chases every link it collects; popping `page->free`
-  in `_mi_page_malloc` is not touched.
------------------------------------------------------------ */
-
-#define MI_PAGE_MAX_CAPACITY  (1 << 16)   // `page->capacity` is a uint16_t (`mi_page_sweep_state_fits` checks that)
-
-// Is `block` the start of a formed block of `page`? On success `*idx` is its block index.
-static inline bool mi_page_block_index_of(const mi_page_t* page, const mi_block_t* block, size_t* idx) {
-  const uintptr_t offset = (uintptr_t)block - (uintptr_t)mi_page_start(page);   // wraps around when `block` lies before the page
-  const size_t i = (size_t)(offset / page->block_size);
-  *idx = i;
-  return (i < page->capacity && (uintptr_t)(i * page->block_size) == offset);
-}
-
-// The most blocks the free lists of this page can hold between them: the blocks not in use.
-// (A block whose memory is discarded is free as well but on no list, so this is an upper bound.)
-static inline size_t mi_page_max_free_listed(const mi_page_t* page) {
-  return (page->used <= page->capacity ? (size_t)(page->capacity - page->used) : 0);
-}
-
-// Cut the list rooted at `*list` so that it ends at `last` (NULL empties it). What is cut off
-// is the block holding a bad link (possibly a live object, or a block something still writes
-// to), a block that is on the list for the second time, or the blocks past the page's free
-// count -- and everything linked behind it. Nothing cut off is handed out again: it is counted
-// as used from now on, which also keeps the page from being given back to the arena while such
-// a block is linked into it (for a double free this simply restores the count; anything else
-// is leaked). `listed` is the number of blocks the page's free lists hold after the cut, if the
-// caller knows it (the sweep does: it has just collected the other lists into this one), and
-// then `used` becomes exact; otherwise (`MI_LISTED_UNKNOWN`) `used` goes up by one for the
-// block holding the bad link, and what hung behind it stays uncounted, which only makes the
-// page look emptier than it is. The error is reported before the cut, so an error handler that
-// aborts sees the list as it was: `bad` is the link or block that failed the check, `holder`
-// the block whose link it was (NULL for the head of the list).
-#define MI_LISTED_UNKNOWN  SIZE_MAX
-
-static void mi_page_free_list_cut(mi_page_t* page, mi_block_t** list, mi_block_t* last, size_t listed,
-                                  const char* what, const char* problem, const mi_block_t* bad, const mi_block_t* holder) {
-  if (holder == NULL) {
-    _mi_error_message(EFAULT, "corrupted %s list in page %p (block size %zu): %s %p\n",
-                      what, page, page->block_size, problem, bad);
-  }
-  else {
-    _mi_error_message(EFAULT, "corrupted %s list in page %p (block size %zu): %s %p in block %p\n",
-                      what, page, page->block_size, problem, bad, holder);
-  }
-  if (last == NULL) { *list = NULL; }
-  else { mi_block_set_next(page, last, NULL); }
-  if (listed == MI_LISTED_UNKNOWN) {
-    if (page->used < page->capacity) { page->used++; }
-  }
-  else {
-    const size_t off_list = listed + _mi_page_purged_count(page);   // free, but on the list or discarded
-    page->used = (off_list < page->capacity ? (uint32_t)(page->capacity - off_list) : 0);
-  }
-}
-
-// Walk the list rooted at `*list`, checking it. Returns its last block, or NULL when the list is
-// (or, after a cut, has become) empty.
-static mi_block_t* mi_page_free_list_checked_tail(mi_page_t* page, mi_block_t** list, const char* what) {
-  mi_block_t* block = *list;
-  if (block == NULL) return NULL;
-  size_t idx;
-  if mi_unlikely(!mi_page_block_index_of(page, block, &idx)) {
-    mi_page_free_list_cut(page, list, NULL, MI_LISTED_UNKNOWN, what, "invalid head", block, NULL);
-    return NULL;
-  }
-  const size_t max_count = mi_page_max_free_listed(page);
-  mi_block_t* prev = NULL;
-  size_t count = 1;
-  for (;;) {
-    if mi_unlikely(count > max_count) {
-      mi_page_free_list_cut(page, list, prev, MI_LISTED_UNKNOWN, what, "more blocks than the page has free, at block", block, NULL);
-      return prev;
-    }
-    mi_block_t* const next = mi_block_next(page, block);
-    if (next == NULL) return block;
-    if mi_unlikely(!mi_page_block_index_of(page, next, &idx)) {
-      mi_page_free_list_cut(page, list, prev, MI_LISTED_UNKNOWN, what, "invalid link", next, block);
-      return prev;
-    }
-    prev = block;
-    block = next;
-    count++;
-  }
-}
-
-
-/* -----------------------------------------------------------
   Page collect the `local_free` and `thread_free` lists
 ----------------------------------------------------------- */
 
@@ -366,17 +265,7 @@ static void mi_page_thread_collect_to_local(mi_page_t* page, mi_block_t* head)
   size_t count = 1;
   mi_block_t* last = head;
   mi_block_t* next;
-  size_t idx;
-  if mi_unlikely(!mi_page_block_index_of(page, head, &idx)) {
-    _mi_error_message(EFAULT, "corrupted thread-free list in page %p (block size %zu): invalid head %p\n", page, page->block_size, head);
-    return; // the thread-free items cannot be freed
-  }
   while ((next = mi_block_next(page, last)) != NULL && count <= max_count) {
-    // a link that is not a block of this page is followed by no one (see "Free list corruption" above)
-    if mi_unlikely(!mi_page_block_index_of(page, next, &idx)) {
-      _mi_error_message(EFAULT, "corrupted thread-free list in page %p (block size %zu): invalid link %p in block %p\n", page, page->block_size, next, last);
-      return; // the thread-free items cannot be freed
-    }
     count++;
     last = next;
   }
@@ -797,10 +686,10 @@ void _mi_page_unpurge_unformed_upto(mi_page_t* page, uintptr_t end) {
 
 
 // Walk the free list of a page and discard every OS page in it that holds no live block.
-// Returns false if any discard failed, or if the free list turned out to be corrupted: in both
-// cases the page must be swept again, so the caller must not record it as swept. (A failed
-// discard puts its blocks straight back on the free list; a corrupted list is cut at the
-// corruption, see "Free list corruption" above, and is walked afresh by the next sweep.)
+// Returns false if any discard failed (those blocks went straight back on the free list) or the
+// free list did not check out: the page must be swept again, so the caller must not record it as swept.
+#define MI_HOLES_MAX_CAP  (1 << 16)   // `page->capacity` is a uint16_t
+
 static bool mi_page_purge_holes_walk(mi_page_t* page, mi_tld_t* tld) {
   if (page->free == NULL) return true;                    // nothing to take off the free list
 
@@ -810,29 +699,25 @@ static bool mi_page_purge_holes_walk(mi_page_t* page, mi_tld_t* tld) {
   if (nbits > MI_PAGE_PURGE_BITS) return true;
   bool complete = true;
 
-  // 1. count, per OS page, the blocks on the free list that overlap it. The list is checked on
-  //    the way (see "Free list corruption"), including that no block is on it twice: a block
-  //    listed twice (a double free) would be counted twice, and an OS page holding it and one
-  //    live block would then look entirely free and be discarded from under the live block.
-  //    (`listed` also bounds the walk: a list of distinct blocks of this page ends within
-  //    `capacity` links.) After a cut the counts are not usable; the page is consistent again
-  //    and the next sweep walks it afresh.
+  // 1. count, per OS page, the blocks on the free list that overlap it. The counts decide what
+  //    memory is discarded, so they must not trust the list more than the discard can afford:
+  //    a block that is on the list twice (someone freed it twice) would be counted twice and
+  //    make an OS page that still holds a live block look free, and a link that is not a block
+  //    of this page (someone wrote into a freed block) would index outside `nfree`/`seen`.
+  //    Either way the page is left alone; the list itself is not touched here.
   uint16_t nfree[MI_PAGE_PURGE_BITS];
   _mi_memzero(nfree, nbits * sizeof(uint16_t));
-  uint64_t listed[MI_PAGE_MAX_CAPACITY / 64];                     // by block index: seen on the list already?
-  _mi_memzero(listed, _mi_divide_up(page->capacity, 64) * sizeof(uint64_t));
+  uint64_t seen[MI_HOLES_MAX_CAP / 64];
+  _mi_memzero(seen, _mi_divide_up(page->capacity, 64) * sizeof(uint64_t));
   size_t nvisited = 0;
-  size_t idx;
-  if mi_unlikely(!mi_page_block_index_of(page, page->free, &idx)) {
-    mi_page_free_list_cut(page, &page->free, NULL, 0, "free", "invalid head", page->free, NULL);
-    return false;
-  }
-  mi_block_t* prev = NULL;
-  mi_block_t* b = page->free;
-  for (;;) {
-    mi_assert_internal(idx < page->capacity);
+  for (mi_block_t* b = page->free; b != NULL; b = mi_block_next(page, b)) {
+    const size_t idx = mi_page_block_index(page, b);
+    mi_assert_internal(idx < page->capacity && mi_page_block_index_at(page, idx) == b);
+    if mi_unlikely(idx >= page->capacity || mi_page_block_index_at(page, idx) != b) return false;
+    mi_assert_internal((seen[idx / 64] & ((uint64_t)1 << (idx % 64))) == 0);
+    if mi_unlikely((seen[idx / 64] & ((uint64_t)1 << (idx % 64))) != 0) return false;
+    seen[idx / 64] |= ((uint64_t)1 << (idx % 64));
     mi_assert_internal(!mi_page_block_index_is_purged(page, idx));   // it is on the free list, so not purged
-    listed[idx / 64] |= ((uint64_t)1 << (idx % 64));
     nvisited++;
     size_t kfirst, klast;
     mi_page_block_os_pages(page, idx, &kfirst, &klast);
@@ -840,22 +725,6 @@ static bool mi_page_purge_holes_walk(mi_page_t* page, mi_tld_t* tld) {
       mi_assert_internal(nfree[k] < UINT16_MAX);
       nfree[k]++;
     }
-    mi_block_t* const next = mi_block_next(page, b);
-    if (next == NULL) break;
-    if mi_unlikely(!mi_page_block_index_of(page, next, &idx)) {
-      // `b` holds the bad link, so it goes as well: `prev` becomes the last block, `nvisited - 1` remain
-      mi_page_free_list_cut(page, &page->free, prev, nvisited - 1, "free", "invalid link", next, b);
-      tld->holes_sweep_visited += nvisited;
-      return false;
-    }
-    if mi_unlikely((listed[idx / 64] & ((uint64_t)1 << (idx % 64))) != 0) {
-      // `next` is on the list for the second time: its first occurrence stays, the list ends at `b`
-      mi_page_free_list_cut(page, &page->free, b, nvisited, "free", "block listed twice:", next, b);
-      tld->holes_sweep_visited += nvisited;
-      return false;
-    }
-    prev = b;
-    b = next;
   }
   tld->holes_sweep_visited += nvisited;   // folded into the process-wide counter at the end of the pass
 
@@ -882,10 +751,10 @@ static bool mi_page_purge_holes_walk(mi_page_t* page, mi_tld_t* tld) {
 
   // 3. rebuild the free list without the blocks that are about to lose memory. This must
   //    happen *before* the discard: it walks `next` pointers that live in the very memory
-  //    we are about to discard. (The list was checked in step 1 and nothing has touched it since.)
+  //    we are about to discard.
   mi_block_t* keep = NULL;
   size_t ndropped = 0;
-  b = page->free;
+  mi_block_t* b = page->free;
   while (b != NULL) {
     mi_block_t* const next = mi_block_next(page, b);
     if (mi_page_block_overlaps(page, mi_page_block_index(page, b), todo)) {
@@ -1095,7 +964,7 @@ void _mi_page_holes_report_page(const mi_page_t* page, mi_holes_report_t* rep) {
   if (page == NULL || rep == NULL) return;
   const size_t bs = page->block_size;
   const size_t cap = page->capacity;
-  if (bs == 0 || cap > MI_PAGE_MAX_CAPACITY) return;
+  if (bs == 0 || cap > MI_HOLES_MAX_CAP) return;
   mi_holes_bin_t* const r = &rep->bin[_mi_bin(bs)];
   r->pages++;
   if (bs > r->block_size) { r->block_size = bs; }
@@ -1105,7 +974,7 @@ void _mi_page_holes_report_page(const mi_page_t* page, mi_holes_report_t* rep) {
   rep->unformed_discarded_bytes += _mi_page_unformed_purged_bytes(page);
   if (cap == 0) return;
 
-  uint64_t freelisted[MI_PAGE_MAX_CAPACITY / 64];
+  uint64_t freelisted[MI_HOLES_MAX_CAP / 64];
   const size_t nwords = _mi_divide_up(cap, 64);
   _mi_memzero(freelisted, nwords * sizeof(uint64_t));
   mi_holes_mark_free_list(page, page->free, freelisted);
@@ -1345,16 +1214,16 @@ static void mi_page_free_collect_ex(mi_page_t* page, bool force, bool allow_unpu
       page->free_is_zero = false;
     }
     else if (force) {
-      // append -- only on shutdown and in the idle sweep (force) as this is a linear operation;
-      // a corrupted `local_free` is cut at the corruption (see "Free list corruption") and what
-      // is left of it is appended
-      mi_block_t* const tail = mi_page_free_list_checked_tail(page, &page->local_free, "local free");
-      if (tail != NULL) {
-        mi_block_set_next(page, tail, page->free);
-        page->free = page->local_free;
-        page->free_is_zero = false;
+      // append -- only on shutdown (force) as this is a linear operation
+      mi_block_t* tail = page->local_free;
+      mi_block_t* next;
+      while ((next = mi_block_next(page, tail)) != NULL) {
+        tail = next;
       }
+      mi_block_set_next(page, tail, page->free);
+      page->free = page->local_free;
       page->local_free = NULL;
+      page->free_is_zero = false;
     }
   }
 
