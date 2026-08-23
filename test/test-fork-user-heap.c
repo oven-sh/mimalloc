@@ -52,7 +52,9 @@ int main(void) { fprintf(stderr, "test-fork-user-heap: skipped on Windows\n"); r
 #include <mimalloc.h>
 
 #if MI_DEBUG > 0
-extern volatile int mi_debug_stall_in_thread_theaps_done;
+#include <stdint.h>
+#include <stdatomic.h>
+extern _Atomic(uintptr_t) mi_debug_stall_in_thread_theaps_done;
 #endif
 
 static mi_heap_t* g_heap;

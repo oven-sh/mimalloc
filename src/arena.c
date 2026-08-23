@@ -2577,7 +2577,7 @@ static bool mi_heap_visit_page(mi_page_t* page, mi_heap_visit_info_t* vinfo) {
 // `mi_arena_page_purge_holes_at` against `_mi_arenas_page_unabandon`).
 // Returns `true` if we own the page, `false` if it is gone.
 #if MI_DEBUG > 0
-mi_decl_export volatile int mi_debug_stall_in_heap_delete_claim = 0;   // test hook (test-heap-teardown): stall while a page is pinned but not yet claimed
+mi_decl_export _Atomic(uintptr_t) mi_debug_stall_in_heap_delete_claim;   // test hook (test-heap-teardown): stall while a page is pinned but not yet claimed
 #endif
 
 static void mi_heap_visit_page_seize(mi_page_t* page) {
@@ -2592,9 +2592,9 @@ static bool mi_heap_visit_page_claim(mi_heap_visit_info_t* vinfo, mi_page_t* pag
     if (!mi_bitmap_clear(pages, slice_index)) return false;   // freed by a concurrent `mi_free`
     // pinned
     #if MI_DEBUG > 0
-    if (mi_debug_stall_in_heap_delete_claim == 1) {
-      mi_debug_stall_in_heap_delete_claim = 2;  // signal: pinned, not yet claimed
-      while (mi_debug_stall_in_heap_delete_claim == 2) { _mi_prim_thread_yield(); }
+    if (mi_atomic_load_acquire(&mi_debug_stall_in_heap_delete_claim) == 1) {
+      mi_atomic_store_release(&mi_debug_stall_in_heap_delete_claim, (uintptr_t)2);  // signal: pinned, not yet claimed
+      while (mi_atomic_load_acquire(&mi_debug_stall_in_heap_delete_claim) == 2) { _mi_prim_thread_yield(); }
     }
     #endif
     if mi_unlikely(_mi_process_is_forked_child) {

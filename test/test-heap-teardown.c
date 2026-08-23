@@ -105,8 +105,9 @@ static void churn(intptr_t tid) {
 /* -----------------------------------------------------------
   pin: deterministic, needs the debug hook in `mi_heap_visit_page_claim`
 ----------------------------------------------------------- */
-#if !defined(NDEBUG) && !defined(MI_TSAN)   // needs the debug hook; the hook itself is a plain int that TSAN would flag
-extern volatile int mi_debug_stall_in_heap_delete_claim;
+#if !defined(NDEBUG)
+#include <stdatomic.h>
+extern _Atomic(uintptr_t) mi_debug_stall_in_heap_delete_claim;
 
 static volatile void* pin_heap;
 static volatile void* pin_block;
@@ -453,7 +454,7 @@ int main(int argc, char** argv) {
   }
   fprintf(stderr, "Using %d iterations\n", ITER);
 
-  #if !defined(NDEBUG) && !defined(MI_TSAN)
+  #if !defined(NDEBUG)
   fprintf(stderr, "test: pin...  ");            test_pin();           fprintf(stderr, " %s.\n", failed ? "FAILED" : "ok");
   #endif
   fprintf(stderr, "test: os-pages...  ");       test_os_pages();      fprintf(stderr, " %s.\n", failed ? "FAILED" : "ok");

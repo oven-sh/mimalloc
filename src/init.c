@@ -408,7 +408,7 @@ void mi_decl_noinline mi_thread_init(void) mi_attr_noexcept {
 
 // Free the thread local theaps
 #if MI_DEBUG > 0
-mi_decl_export volatile int mi_debug_stall_in_thread_theaps_done = 0;   // fork test hook (test-theap-sentinel): stall teardown while holding the tld lock
+mi_decl_export _Atomic(uintptr_t) mi_debug_stall_in_thread_theaps_done;   // fork test hook (test-theap-sentinel): stall teardown while holding the tld lock
 #endif
 
 static void mi_thread_theaps_done(mi_tld_t* tld)
@@ -416,9 +416,9 @@ static void mi_thread_theaps_done(mi_tld_t* tld)
   // abandon the pages of all theaps in this thread
   mi_lock(&tld->theaps_lock) {
     #if MI_DEBUG > 0
-    if (mi_debug_stall_in_thread_theaps_done) {
-      mi_debug_stall_in_thread_theaps_done = 2; // signal: tld->theaps_lock held
-      while (mi_debug_stall_in_thread_theaps_done) { _mi_prim_thread_yield(); }
+    if (mi_atomic_load_acquire(&mi_debug_stall_in_thread_theaps_done) != 0) {
+      mi_atomic_store_release(&mi_debug_stall_in_thread_theaps_done, (uintptr_t)2); // signal: tld->theaps_lock held
+      while (mi_atomic_load_acquire(&mi_debug_stall_in_thread_theaps_done) != 0) { _mi_prim_thread_yield(); }
     }
     #endif
     mi_theap_t* theap = tld->theaps;

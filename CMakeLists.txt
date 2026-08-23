@@ -903,6 +903,8 @@ if (MI_BUILD_TESTS)
     add_test(NAME test-${TEST_NAME} COMMAND ${CMAKE_COMMAND} -E env MIMALLOC_ARENA_EAGER_COMMIT=0 MIMALLOC_PAGE_COMMIT_ON_DEMAND=1 $<TARGET_FILE:mimalloc-test-${TEST_NAME}>)
     elseif(TEST_NAME STREQUAL "thp-optout")
     add_test(NAME test-${TEST_NAME} COMMAND ${CMAKE_COMMAND} -E env MIMALLOC_ALLOW_THP=0 $<TARGET_FILE:mimalloc-test-${TEST_NAME}>)  # off from the start: covers the mappings made during initialization too
+    elseif(TEST_NAME STREQUAL "fork-user-heap" AND MI_DEBUG_TSAN)
+    add_test(NAME test-${TEST_NAME} COMMAND ${CMAKE_COMMAND} -E env TSAN_OPTIONS=die_after_fork=0 $<TARGET_FILE:mimalloc-test-${TEST_NAME}>)  # the forked child starts the scavenger thread
     else()
     add_test(NAME test-${TEST_NAME} COMMAND mimalloc-test-${TEST_NAME})
     endif()
