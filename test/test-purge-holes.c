@@ -486,7 +486,7 @@ static bool test_large_pages(void) {
     pattern_fill(ptrs[i], LARGE_SZ, i);
   }
   eligible = mi_page_can_purge_holes(_mi_ptr_page(ptrs[0]));
-  singleton = (_mi_ptr_page(ptrs[0])->reserved <= 1);   // (32-bit: 128 KiB does not fit a large page and gets a page of its own)
+  singleton = (_mi_ptr_page(ptrs[0])->reserved <= 1);
   for (size_t i = 1; i < LARGE_N; i += 2) { mi_free(ptrs[i]); ptrs[i] = NULL; }
 
   before = hole_stats();
@@ -506,7 +506,9 @@ static bool test_large_pages(void) {
       fprintf(stderr, "\n  an ineligible large page was purged after all\n");
       ok_all = false;
     }
-    if (after.inelig_pages <= 0 || (after.inelig_free <= 0 && !singleton)) {   // a singleton page in use has no free bytes
+    // (a singleton page -- 32-bit, where 128 KiB does not fit a large page -- is full while in use, and a full page
+    //  may be abandoned, out of reach of the sweep; there is nothing to purge or report in it either way)
+    if (!singleton && (after.inelig_pages <= 0 || after.inelig_free <= 0)) {
       fprintf(stderr, "\n  the ineligible large pages are not reported (%lld pages, %lld free bytes)\n",
               (long long)after.inelig_pages, (long long)after.inelig_free);
       ok_all = false;
@@ -1293,56 +1295,59 @@ static bool test_sweep_skip(void) {
     if (ptrs[i] == NULL) { ok = false; goto done; }
     pattern_fill(ptrs[i], SKIP_SZ, i);
   }
-  // In every 8th OS page keep the first block that starts in it, free everything else: most OS pages
-  // become free (discardable), and the kept ones are each pinned by exactly one live block -- whatever
-  // the block size (padding) and the OS page size are.
+  // In every other OS page keep the first block that starts in it, free everything else: half the OS
+  // pages become free (discardable), the others are each pinned by exactly one live block, and every
+  // mimalloc page keeps a few live blocks -- whatever the block size (padding) and the OS page size are.
   for (size_t i = 0; i < SKIP_N; i++) {
     const uintptr_t os_page = (uintptr_t)ptrs[i] / os;
-    bool keep = ((os_page % 8) == 0);
+    bool keep = ((os_page % 2) == 0);
     for (size_t j = 0; keep && j < i; j++) {   // only the first block of that OS page (blocks are not always handed out in address order)
       if (ptrs[j] != NULL && ((uintptr_t)ptrs[j] / os) == os_page) { keep = false; }
     }
     if (!keep) { mi_free(ptrs[i]); ptrs[i] = NULL; }
   }
-  for (size_t i = 0; i < SKIP_N && ptrs[0] == NULL; i++) {   // `ptrs[0]` names the page under test below
-    if (ptrs[i] != NULL) { ptrs[0] = ptrs[i]; ptrs[i] = NULL; }
-  }
-  if (ptrs[0] == NULL) { fprintf(stderr, "\n  no block was kept\n"); ok = false; goto done; }
 
-  // The page we will make a new hole in, and the live blocks left in it.
-  page = _mi_ptr_page(ptrs[0]);
-  bs = page->block_size;
-  cap = page->capacity;
-  pstart = (uintptr_t)mi_page_start(page);
-  live = (uint64_t*)calloc((cap + 63) / 64, sizeof(uint64_t));
-  if (live == NULL) { ok = false; goto done; }
-  for (size_t i = 0; i < SKIP_N; i++) {
-    if (ptrs[i] == NULL || _mi_ptr_page(ptrs[i]) != page) continue;
-    const size_t idx = (size_t)((uintptr_t)ptrs[i] - pstart) / bs;
-    live[idx / 64] |= ((uint64_t)1 << (idx % 64));
-    nmine++;
-  }
-  if (page->used != nmine) {   // the oracle below assumes every other block in the page is free
-    fprintf(stderr, "\n  page %p is not exclusively ours: used=%zu but we hold %zu\n", (void*)page, (size_t)page->used, nmine);
-    ok = false; goto done;
-  }
-  // the block to free later: the ONLY live block in an OS page that lies wholly inside the block
+  // The page we will make a new hole in (any page we hold blocks in will do), the live blocks left in it,
+  // and the block to free later: the ONLY live block in an OS page that lies wholly inside the block
   // area, so freeing it -- and nothing else -- makes that OS page discardable.
-  for (size_t k = 0; k < (mi_page_size(page) / os) + 1 && victim == SKIP_N; k++) {
-    size_t first, last;
-    if (!_mi_page_purge_os_page_blocks(os, bs, pstart, cap, k, &first, &last)) continue;
-    size_t nlive = 0, only = 0;
-    for (size_t idx = first; idx <= last; idx++) {
-      if (bit_get(live, idx)) { nlive++; only = idx; }
-    }
-    if (nlive != 1) continue;
+  for (size_t p0 = 0; p0 < SKIP_N && victim == SKIP_N; p0++) {
+    if (ptrs[p0] == NULL) continue;
+    if (page != NULL && _mi_ptr_page(ptrs[p0]) == page) continue;   // (pages come in runs; only re-examine on a new one)
+    page = _mi_ptr_page(ptrs[p0]);
+    bs = page->block_size;
+    cap = page->capacity;
+    pstart = (uintptr_t)mi_page_start(page);
+    free(live);
+    live = (uint64_t*)calloc((cap + 63) / 64, sizeof(uint64_t));
+    if (live == NULL) { ok = false; goto done; }
+    nmine = 0;
     for (size_t i = 0; i < SKIP_N; i++) {
       if (ptrs[i] == NULL || _mi_ptr_page(ptrs[i]) != page) continue;
-      if ((size_t)((uintptr_t)ptrs[i] - pstart) / bs == only) { victim = i; break; }
+      const size_t idx = (size_t)((uintptr_t)ptrs[i] - pstart) / bs;
+      live[idx / 64] |= ((uint64_t)1 << (idx % 64));
+      nmine++;
+    }
+    if (page->used != nmine) {   // the oracle below assumes every other block in the page is free
+      fprintf(stderr, "\n  page %p is not exclusively ours: used=%zu but we hold %zu\n", (void*)page, (size_t)page->used, nmine);
+      ok = false; goto done;
+    }
+    if (nmine < 2) continue;     // freeing the victim must not free the page
+    for (size_t k = 0; k < (mi_page_size(page) / os) + 1 && victim == SKIP_N; k++) {
+      size_t first, last;
+      if (!_mi_page_purge_os_page_blocks(os, bs, pstart, cap, k, &first, &last)) continue;
+      size_t nlive = 0, only = 0;
+      for (size_t idx = first; idx <= last; idx++) {
+        if (bit_get(live, idx)) { nlive++; only = idx; }
+      }
+      if (nlive != 1) continue;
+      for (size_t i = 0; i < SKIP_N; i++) {
+        if (ptrs[i] == NULL || _mi_ptr_page(ptrs[i]) != page) continue;
+        if ((size_t)((uintptr_t)ptrs[i] - pstart) / bs == only) { victim = i; break; }
+      }
     }
   }
   if (victim == SKIP_N) {
-    fprintf(stderr, "\n  no OS page in page %p is pinned by exactly one live block\n", (void*)page);
+    fprintf(stderr, "\n  no OS page in any of our pages is pinned by exactly one of our blocks\n");
     ok = false; goto done;
   }
 
