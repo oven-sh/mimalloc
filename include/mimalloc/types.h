@@ -731,6 +731,7 @@ struct mi_tld_s {
   bool                  holes_sweep_full;     // this sweep ignores `page->swept_state` (see `_mi_page_purge_holes`)
   size_t                holes_sweep_skipped;  // per-sweep counters, folded into the process-wide ones in `_mi_page_purge_holes_end`
   size_t                holes_sweep_visited;
+  bool                  prof_sampling;        // inside `_mi_prof_sample`: an allocation made while taking the backtrace is not sampled
 };
 
 

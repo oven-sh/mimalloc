@@ -596,6 +596,13 @@ static void dirty_arena_slices(size_t bsize, size_t n) {
   mi_collect(true);   // hand the pages back to the arena
 }
 
+static bool malloc_is_mimalloc(void) {
+  void* p = malloc(24);
+  const bool is = mi_is_in_heap_region(p);
+  free(p);
+  return is;
+}
+
 // The page holding `p` must have a tail worth discarding (several OS pages).
 static bool tail_page_is_interesting(const mi_page_t* page, const char* what) {
   const size_t os_page = _mi_os_page_size();
@@ -738,14 +745,17 @@ static bool test_unformed_tail_freed(void) {
     return false;
   }
 
-  // free the only live block: the page goes back to the arena with its tail still discarded
+  // free the only live block: the page goes back to the arena with its tail still discarded.
+  // (Compare deltas, not absolutes: when malloc is overridden the C runtime has live pages of its
+  // own whose tails the sweep above discarded too, and those stay.)
+  const hole_stats_t before = hole_stats();
   mi_free(keep);
   mi_collect(true);
 
   const hole_stats_t after = hole_stats();
-  if (after.unformed_now != 0) {
-    fprintf(stderr, "\n  unformed-tail-freed: %lld bytes of tail are still discarded after the page was freed\n",
-            (long long)after.unformed_now);
+  if (before.unformed_now - after.unformed_now < (long long)discarded) {
+    fprintf(stderr, "\n  unformed-tail-freed: only %lld of the %zu discarded tail bytes came back when the page was freed\n",
+            (long long)(before.unformed_now - after.unformed_now), discarded);
     return false;
   }
 
@@ -1659,8 +1669,14 @@ int main(void) {
   fprintf(stderr, "holes: unformed tail: %lld bytes discarded in total over %lld discards / %lld reuses; %lld bytes still discarded\n",
           (long long)end.unformed_total, (long long)end.unformed_discards, (long long)end.unformed_reuses,
           (long long)end.unformed_now);
-  CHECK("no-holes-outstanding-at-exit", (end.bytes_now == 0 && end.blocks_now == 0));
-  CHECK("no-unformed-tail-outstanding-at-exit", (end.unformed_now == 0));
+  if (malloc_is_mimalloc()) {
+    // the C runtime (stdio buffers, the `calloc`s in this file) has live pages of its own then
+    fprintf(stderr, "(malloc is overridden: not checking that no hole is outstanding at exit)\n");
+  }
+  else {
+    CHECK("no-holes-outstanding-at-exit", (end.bytes_now == 0 && end.blocks_now == 0));
+    CHECK("no-unformed-tail-outstanding-at-exit", (end.unformed_now == 0));
+  }
 
   mi_stats_print(NULL);
   return print_test_summary();
