@@ -625,7 +625,9 @@ size_t mi_stats_get_bin_size(size_t bin) mi_attr_noexcept {
 static bool mi_stats_copy(mi_stats_t* stats_to, const mi_stats_t* stats_from) mi_attr_noexcept {
   if (stats_to == NULL || stats_to->size != sizeof(mi_stats_t) || stats_to->version != MI_STAT_VERSION) return false;
   if (stats_from == NULL || stats_from->size != stats_to->size) return false;
-  _mi_memcpy(stats_to, stats_from, stats_to->size);
+  // the source is live (other threads update it with atomic operations): copy it a counter at a time
+  mi_stats_init(stats_to);
+  mi_stats_add(stats_to, stats_from);
   return true;
 }
 

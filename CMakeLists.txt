@@ -332,7 +332,7 @@ if(MI_SEE_ASM)
   if(CMAKE_C_COMPILER_ID MATCHES "MSVC" OR MI_CLANG_CL)
     list(APPEND mi_cflags -FA)
   else()
-    list(APPEND mi_cflags -save-temps)
+    list(APPEND mi_cflags -save-temps=obj)  # =obj: per object directory, so targets that compile the same sources do not race on the temporaries
     if(CMAKE_C_COMPILER_ID MATCHES "AppleClang|Clang" AND CMAKE_C_COMPILER_VERSION VERSION_GREATER 14)
       message(STATUS "No GNU Line marker")
       list(APPEND mi_cflags -Wno-gnu-line-marker)
@@ -658,8 +658,9 @@ endif()
 if(MI_USE_CXX)
   set_source_files_properties(${mi_sources} PROPERTIES LANGUAGE CXX )
   set_source_files_properties(src/static.c test/test-api.c test/test-api-fill.c test/test-stress.c test/test-stress-heaps.c  test/test-stress-subprocs.c PROPERTIES LANGUAGE CXX )
-  # the white-box tests call internal functions, whose names are mangled now
-  set_source_files_properties(test/test-theap-sentinel.c test/test-purge-holes.c test/test-freelist-corruption.c test/test-commit-fail.c PROPERTIES LANGUAGE CXX )
+  # the white-box tests call internal functions, whose names are mangled now; the heap tests use C11 atomics, which MSVC lacks in C mode
+  set_source_files_properties(test/test-theap-sentinel.c test/test-purge-holes.c test/test-freelist-corruption.c test/test-commit-fail.c
+                              test/test-heap-aba.c test/test-heap-delete-race.c test/test-heap-teardown.c PROPERTIES LANGUAGE CXX )
 endif()
 
 
@@ -891,10 +892,6 @@ if (MI_BUILD_TESTS)
     add_executable(mimalloc-test-${TEST_NAME} test/test-${TEST_NAME}.c)
     target_compile_definitions(mimalloc-test-${TEST_NAME} PRIVATE ${mi_defines})
     target_compile_options(mimalloc-test-${TEST_NAME} PRIVATE ${mi_cflags})
-    if(MSVC AND NOT MI_CLANG_CL)
-      # the tests that stay C use <stdatomic.h>, which MSVC has behind a switch (VS 2022 17.5+)
-      target_compile_options(mimalloc-test-${TEST_NAME} PRIVATE $<$<COMPILE_LANGUAGE:C>:/std:c11 /experimental:c11atomics>)
-    endif()
     target_include_directories(mimalloc-test-${TEST_NAME} PRIVATE include)
     if(MI_BUILD_STATIC AND NOT MI_DEBUG_TSAN)
       target_link_libraries(mimalloc-test-${TEST_NAME} PRIVATE mimalloc-static ${mi_libraries})

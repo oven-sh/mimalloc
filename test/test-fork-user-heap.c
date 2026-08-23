@@ -53,8 +53,13 @@ int main(void) { fprintf(stderr, "test-fork-user-heap: skipped on Windows\n"); r
 
 #if MI_DEBUG > 0
 #include <stdint.h>
+#ifdef __cplusplus
+#include <atomic>
+extern "C" std::atomic<uintptr_t> mi_debug_stall_in_thread_theaps_done;
+#else
 #include <stdatomic.h>
 extern _Atomic(uintptr_t) mi_debug_stall_in_thread_theaps_done;
+#endif
 #endif
 
 static mi_heap_t* g_heap;

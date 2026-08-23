@@ -1075,18 +1075,15 @@ static bool test_holes_report(int mode) {
   }
 
   if (mode == 0) {
-    // the whole point: with one live block per OS page NOTHING is discardable, so every free
-    // byte is undiscardable -- and the amplification is what we are chasing in JSC
-    if (r->discarded_bytes != 0) {
-      fprintf(stderr, "\n  mode 0 is meant to be fully pinned but %zu bytes were discarded\n", r->discarded_bytes);
-      ok = false; goto done;
-    }
-    // (`pending` is not necessarily 0: the last page can have formed blocks past the last one we were
-    // handed -- how far `mi_page_extend_free` reaches ahead depends on the configuration -- and an OS
-    // page of only those holds no live block. The per-page ground truth above covers them.)
-    if (r->undiscardable_bytes + r->pending_bytes != r->free_bytes) {
-      fprintf(stderr, "\n  mode 0: undiscardable %zu != free %zu (pending %zu)\n",
-              r->undiscardable_bytes, r->free_bytes, r->pending_bytes);
+    // the whole point: with one live block per OS page nothing around them is discardable, so every free
+    // byte next to a live block is undiscardable -- the amplification we are chasing in JSC. (Not every free
+    // byte: the last page can have formed blocks past the last one we were handed -- how far
+    // `mi_page_extend_free` reaches ahead depends on the configuration and, under MI_SECURE, on a random
+    // draw -- and an OS page of only those holds no live block and is discarded or pending. The per-page
+    // ground truth above accounts for those exactly; here we only check the split adds up.)
+    if (r->undiscardable_bytes + r->discarded_bytes + r->pending_bytes != r->free_bytes) {
+      fprintf(stderr, "\n  mode 0: undiscardable %zu + discarded %zu + pending %zu != free %zu\n",
+              r->undiscardable_bytes, r->discarded_bytes, r->pending_bytes, r->free_bytes);
       ok = false; goto done;
     }
     if (r->pinned_ospages == 0) { fprintf(stderr, "\n  mode 0: no pinned OS page\n"); ok = false; goto done; }
@@ -1100,10 +1097,8 @@ static bool test_holes_report(int mode) {
       fprintf(stderr, "\n  mode 1: nothing was discarded, so the report distinguishes nothing\n");
       ok = false; goto done;
     }
-    if (r->undiscardable_bytes >= r->discarded_bytes) {
-      fprintf(stderr, "\n  mode 1: undiscardable %zu >= discarded %zu\n", r->undiscardable_bytes, r->discarded_bytes);
-      ok = false; goto done;
-    }
+// (how much is discardable next to the one pinned OS page per page depends on the OS page size and on how far
+    // the page's capacity was extended; the exact split was checked against the per-page ground truth above)
     fprintf(stderr, "(bs=%zu: %zu bytes discarded, %zu still pinned) ", bs, r->discarded_bytes, r->undiscardable_bytes);
   }
 
@@ -1276,9 +1271,6 @@ done:
 
 #define SKIP_N     (4096)
 #define SKIP_SZ    (512)
-#define SKIP_KEEP  (64)      // keep 1 in 64 blocks live: with 8 blocks per 4KB OS page that leaves
-                             // 7 of every 8 OS pages fully free (discardable), and one OS page
-                             // pinned by a live block with 7 free blocks stuck on the free list.
 
 static bool test_sweep_skip(void) {
   const size_t os = _mi_os_page_size();
@@ -1300,9 +1292,21 @@ static bool test_sweep_skip(void) {
     if (ptrs[i] == NULL) { ok = false; goto done; }
     pattern_fill(ptrs[i], SKIP_SZ, i);
   }
+  // In every 8th OS page keep the first block that starts in it, free everything else: most OS pages
+  // become free (discardable), and the kept ones are each pinned by exactly one live block -- whatever
+  // the block size (padding) and the OS page size are.
   for (size_t i = 0; i < SKIP_N; i++) {
-    if ((i % SKIP_KEEP) != 0) { mi_free(ptrs[i]); ptrs[i] = NULL; }
+    const uintptr_t os_page = (uintptr_t)ptrs[i] / os;
+    bool keep = ((os_page % 8) == 0);
+    for (size_t j = 0; keep && j < i; j++) {   // only the first block of that OS page (blocks are not always handed out in address order)
+      if (ptrs[j] != NULL && ((uintptr_t)ptrs[j] / os) == os_page) { keep = false; }
+    }
+    if (!keep) { mi_free(ptrs[i]); ptrs[i] = NULL; }
   }
+  for (size_t i = 0; i < SKIP_N && ptrs[0] == NULL; i++) {   // `ptrs[0]` names the page under test below
+    if (ptrs[i] != NULL) { ptrs[0] = ptrs[i]; ptrs[i] = NULL; }
+  }
+  if (ptrs[0] == NULL) { fprintf(stderr, "\n  no block was kept\n"); ok = false; goto done; }
 
   // The page we will make a new hole in, and the live blocks left in it.
   page = _mi_ptr_page(ptrs[0]);

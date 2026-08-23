@@ -62,7 +62,7 @@ jobs:
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: ${{ matrix.os }}-alloc.c.s
-          path: out/release/CMakeFiles/mimalloc-static.dir/src/alloc.c.s
+          path: out/release/CMakeFiles/mimalloc-static.dir/src/alloc*.s
 
 
       - name: Secure
@@ -180,7 +180,7 @@ jobs:
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: ${{ matrix.os }}-clang-cxx-alloc.s
-          path: out/release-clang-cxx/alloc.s
+          path: out/release-clang-cxx/CMakeFiles/mimalloc-static.dir/src/alloc*.s
 
       - name: Debug, ASAN
         if: matrix.tests == 'extra' && runner.os == 'Linux'

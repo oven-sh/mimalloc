@@ -106,8 +106,13 @@ static void churn(intptr_t tid) {
   pin: deterministic, needs the debug hook in `mi_heap_visit_page_claim`
 ----------------------------------------------------------- */
 #if !defined(NDEBUG)
+#ifdef __cplusplus
+#include <atomic>
+extern "C" std::atomic<uintptr_t> mi_debug_stall_in_heap_delete_claim;
+#else
 #include <stdatomic.h>
 extern _Atomic(uintptr_t) mi_debug_stall_in_heap_delete_claim;
+#endif
 
 static volatile void* pin_heap;
 static volatile void* pin_block;

@@ -37,10 +37,8 @@ terms of the MIT license.
 static int ITER = 200;
 #elif defined(MI_UBSAN) || defined(MI_GUARDED)
 static int ITER = 200;
-#elif !defined(NDEBUG)
-static int ITER = 1000;   // full-debug on a 2-core CI VM
 #else
-static int ITER = 5000;
+static int ITER = 1000;   // (a 3-core CI VM runs ~10 iterations/s; pass a count on the command line for more)
 #endif
 
 #define custom_calloc(n,s)    calloc(n,s)

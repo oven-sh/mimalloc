@@ -27,7 +27,11 @@ terms of the MIT license.
 #include <mimalloc.h>
 
 #if MI_DEBUG > 0
+#ifdef __cplusplus
+extern "C" volatile long mi_debug_fail_os_commit_after;
+#else
 extern volatile long mi_debug_fail_os_commit_after;
+#endif
 #else
 #error "test-commit-fail requires MI_DEBUG>0"
 #endif
