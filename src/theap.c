@@ -674,8 +674,9 @@ void _mi_theap_decref(mi_theap_t* theap) {
 // Remove the theaps in this heap from any thread local tld lists.
 // A detached theap has `theap->heap == NULL`: its thread no longer finds it (`_mi_heap_theap`,
 // `_mi_page_associated_theap_peek` check that field), so it does not allocate from it, reclaim into it,
-// or abandon its pages on termination anymore. The struct (and its `tld` pointer) stays valid until the
-// last reference is dropped (`heap.c:mi_heap_free_theaps`, or a thread's `_mi_theap_cached`).
+// or abandon its pages on termination anymore. The struct stays valid until the last reference is dropped
+// (`heap.c:mi_heap_free_theaps`, or a thread's `_mi_theap_cached`); its `tld` points to a thread that may
+// terminate at any time from here on, so only that thread may still dereference it.
 void _mi_heap_detach_theaps( mi_heap_t* heap ) {
   bool all_detached;
   do {

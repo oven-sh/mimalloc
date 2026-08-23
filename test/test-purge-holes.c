@@ -660,8 +660,10 @@ static bool test_unformed_tail(void) {
   if (discarded > 0) {
     const uintptr_t lo = pstart + page->unformed_purged_lo;
     const uintptr_t hi = pstart + page->unformed_purged_hi;
-    if (lo < pstart + ((size_t)cap0 * bsize) || hi > pstart + ((size_t)reserved * bsize)) {
-      fprintf(stderr, "\n  unformed-tail: the discarded range escapes the unformed tail!\n");
+    const size_t stride = mi_page_block_size(page);   // includes the debug padding
+    if (lo < pstart + ((size_t)cap0 * stride) || hi > pstart + ((size_t)reserved * stride)) {
+      fprintf(stderr, "\n  unformed-tail: the discarded range [%zu,%zu) escapes the unformed tail [%zu,%zu)!\n",
+              (size_t)page->unformed_purged_lo, (size_t)page->unformed_purged_hi, (size_t)cap0 * stride, (size_t)reserved * stride);
       mi_free(first);
       return false;
     }

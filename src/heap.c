@@ -209,7 +209,7 @@ static void mi_heap_free_theaps(mi_heap_t* heap) {
       mi_theap_t* next = theap->hnext;
       theap->hnext = NULL;
       theap->hprev = NULL;
-      mi_assert_internal(_mi_theap_heap_peek(theap)==NULL && (theap->page_count==0 || _mi_process_is_forked_child));
+      mi_assert_internal(_mi_theap_heap_peek(theap)==NULL && (theap->page_count==0 || _mi_is_heap_main(heap) || _mi_process_is_forked_child));
       _mi_stats_merge_into(&heap->stats, &theap->stats);
       _mi_theap_decref(theap);  // a thread's `_mi_theap_cached` can still reference (but no longer use) it
       theap = next;

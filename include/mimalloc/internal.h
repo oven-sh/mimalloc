@@ -273,6 +273,7 @@ void          _mi_arenas_unsafe_destroy_all(mi_subproc_t* subproc);
 
 mi_page_t*    _mi_arenas_page_alloc(mi_theap_t* theap, size_t block_size, size_t page_alignment);
 void          _mi_arenas_page_free(mi_page_t* page, mi_theap_t* current_theapx /* can be NULL */);
+void          _mi_arenas_abandoned_page_free(mi_page_t* page, mi_theap_t* current_theapx);
 void          _mi_arenas_page_abandon(mi_page_t* page, mi_theap_t* current_theap);
 void          _mi_arenas_page_unabandon(mi_page_t* page, mi_theap_t* current_theapx /* can be NULL */);
 bool          _mi_arenas_page_try_reabandon_to_mapped(mi_page_t* page);
@@ -709,9 +710,10 @@ static inline bool mi_theap_is_detached(mi_theap_t* theap) {
 
 static inline bool _mi_theap_can_touch(const mi_theap_t* theap) {
   if (theap == NULL || theap->tld == NULL) return true;
+  // detached from its heap by `mi_heap_delete`: belongs to the deleting thread (and its own thread may have terminated since, taking `tld` with it)
+  if (mi_atomic_load_ptr_relaxed(mi_heap_t, &((mi_theap_t*)theap)->heap) == NULL) return true;
   if (theap->tld->thread_id == _mi_thread_id()) return true;
   if (mi_theap_is_detached((mi_theap_t*)theap)) return true;   // upstream's detached theaps (meta-data / heaps without a thread) belong to no thread
-  if (mi_atomic_load_ptr_relaxed(mi_heap_t, &((mi_theap_t*)theap)->heap) == NULL) return true;  // detached from its heap by `mi_heap_delete`: belongs to the deleting thread
   return (mi_atomic_load_acquire(&theap->tld->park_state) == MI_PARK_SWEEPING);
 }
 

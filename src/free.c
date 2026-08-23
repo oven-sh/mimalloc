@@ -294,9 +294,8 @@ void _mi_free_subproc_safe(void* p) mi_attr_noexcept {
 static bool mi_abandoned_page_try_free(mi_page_t* page)
 {
   if (!mi_page_all_free(page)) return false;
-  // first remove it from the abandoned pages in the arena (if mapped, this might wait for any readers to finish)
-  _mi_arenas_page_unabandon(page,NULL);
-  _mi_arenas_page_free(page,NULL); // we can now free the page directly
+  // remove it from the abandoned pages in the arena (if mapped, this might wait for any readers to finish) and free it
+  _mi_arenas_abandoned_page_free(page,NULL);
   return true;
 }
 

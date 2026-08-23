@@ -874,7 +874,14 @@ if (MI_BUILD_TESTS)
   enable_testing()
 
   # static link tests
-  set(mi_static_tests api api-fill stress-heaps stress-subprocs stress heap-mt heap-delete-race heap-churn heap-aba fork-user-heap snapshot prof prof-adversarial theap-sentinel purge-holes purge-zero park-handoff thp-optout freelist-corruption)
+  set(mi_static_tests api api-fill stress-heaps stress-subprocs stress heap-mt heap-teardown heap-delete-race heap-churn heap-aba fork-user-heap snapshot prof prof-adversarial purge-zero park-handoff thp-optout)
+  if(MI_BUILD_STATIC AND NOT MI_DEBUG_TSAN)
+    # these reach into internals that the shared library (which the TSAN build links the tests against) does not export
+    list(APPEND mi_static_tests theap-sentinel purge-holes)
+    if(NOT MI_TRACK_ASAN)
+      list(APPEND mi_static_tests freelist-corruption)  # writes into freed blocks on purpose, which the address sanitizer poisons
+    endif()
+  endif()
   if (MI_DEBUG_FULL OR CMAKE_BUILD_TYPE MATCHES "Debug")
     list(APPEND mi_static_tests commit-fail)  # uses mi_debug_fail_os_commit_after (MI_DEBUG>0 only)
   endif()
@@ -902,7 +909,9 @@ if (MI_BUILD_TESTS)
   endforeach()
 
   # the same hole-purging tests with the feature turned off: it must be a no-op
-  add_test(NAME test-purge-holes-off COMMAND ${CMAKE_COMMAND} -E env MIMALLOC_PURGE_HOLES=0 $<TARGET_FILE:mimalloc-test-purge-holes>)
+  if(TARGET mimalloc-test-purge-holes)
+    add_test(NAME test-purge-holes-off COMMAND ${CMAKE_COMMAND} -E env MIMALLOC_PURGE_HOLES=0 $<TARGET_FILE:mimalloc-test-purge-holes>)
+  endif()
 
   # with no scavenger to hand off to, `mi_on_thread_idle_start` must do the work inline instead
   add_test(NAME test-park-handoff-no-scavenger COMMAND ${CMAKE_COMMAND} -E env MIMALLOC_SCAVENGER=0 $<TARGET_FILE:mimalloc-test-park-handoff>)
@@ -939,6 +948,7 @@ if (MI_BUILD_TESTS)
   # heap snapshot reader CLI (standalone, no mimalloc dependency)
   add_executable(mi-heapview tools/mi-heapview.c)
   target_compile_options(mi-heapview PRIVATE ${mi_cflags})
+  target_link_libraries(mi-heapview PRIVATE ${mi_libraries})
 
   # dynamic override test
   if(MI_BUILD_SHARED AND NOT (MI_CYGWIN OR MI_TRACK_ASAN OR MI_DEBUG_TSAN OR MI_DEBUG_UBSAN)) # AND NOT (APPLE AND MI_USE_CXX))

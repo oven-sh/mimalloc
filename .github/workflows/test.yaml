@@ -3,8 +3,12 @@ on:
   push:
     branches:
       - 'dev*'
+      - 'bun*'
     tags:
       - 'v*'
+  pull_request:
+    branches:
+      - 'bun*'
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
