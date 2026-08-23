@@ -329,6 +329,9 @@ bool mi_on_thread_idle_start(void) mi_attr_noexcept {
   // the scavenger only sweeps the main subproc, so a thread elsewhere would never be swept
   if (!_mi_scavenger_is_running() || tld->subproc != _mi_subproc_main()) return false;
 
+  // Already parked (a second `_start` without an `_end`): the scavenger may be reading the fields
+  // below right now. Only this thread takes the state out of RUNNING, so past this check they are ours.
+  if (mi_atomic_load_acquire(&tld->park_state) != MI_PARK_RUNNING) return false;
   // The scavenger has no TLS of ours to find the default theap with, so leave it here.
   tld->park_theap0 = theap0;
   mi_atomic_store_release(&tld->park_reclaim, 0);
