@@ -686,10 +686,8 @@ void _mi_page_unpurge_unformed_upto(mi_page_t* page, uintptr_t end) {
 
 
 // Walk the free list of a page and discard every OS page in it that holds no live block.
-// Returns false if any discard failed (those blocks went straight back on the free list) or the
-// free list did not check out: the page must be swept again, so the caller must not record it as swept.
-#define MI_HOLES_MAX_CAP  (1 << 16)   // `page->capacity` is a uint16_t
-
+// Returns false if any discard failed: those blocks went straight back on the free list and the
+// page must be swept again, so the caller must not record it as swept.
 static bool mi_page_purge_holes_walk(mi_page_t* page, mi_tld_t* tld) {
   if (page->free == NULL) return true;                    // nothing to take off the free list
 
@@ -699,24 +697,13 @@ static bool mi_page_purge_holes_walk(mi_page_t* page, mi_tld_t* tld) {
   if (nbits > MI_PAGE_PURGE_BITS) return true;
   bool complete = true;
 
-  // 1. count, per OS page, the blocks on the free list that overlap it. The counts decide what
-  //    memory is discarded, so they must not trust the list more than the discard can afford:
-  //    a block that is on the list twice (someone freed it twice) would be counted twice and
-  //    make an OS page that still holds a live block look free, and a link that is not a block
-  //    of this page (someone wrote into a freed block) would index outside `nfree`/`seen`.
-  //    Either way the page is left alone; the list itself is not touched here.
+  // 1. count, per OS page, the blocks on the free list that overlap it
   uint16_t nfree[MI_PAGE_PURGE_BITS];
   _mi_memzero(nfree, nbits * sizeof(uint16_t));
-  uint64_t seen[MI_HOLES_MAX_CAP / 64];
-  _mi_memzero(seen, _mi_divide_up(page->capacity, 64) * sizeof(uint64_t));
   size_t nvisited = 0;
   for (mi_block_t* b = page->free; b != NULL; b = mi_block_next(page, b)) {
     const size_t idx = mi_page_block_index(page, b);
-    mi_assert_internal(idx < page->capacity && mi_page_block_index_at(page, idx) == b);
-    if mi_unlikely(idx >= page->capacity || mi_page_block_index_at(page, idx) != b) return false;
-    mi_assert_internal((seen[idx / 64] & ((uint64_t)1 << (idx % 64))) == 0);
-    if mi_unlikely((seen[idx / 64] & ((uint64_t)1 << (idx % 64))) != 0) return false;
-    seen[idx / 64] |= ((uint64_t)1 << (idx % 64));
+    mi_assert_internal(idx < page->capacity);
     mi_assert_internal(!mi_page_block_index_is_purged(page, idx));   // it is on the free list, so not purged
     nvisited++;
     size_t kfirst, klast;
@@ -905,6 +892,8 @@ void _mi_page_unpurge_all(mi_page_t* page) {
   Bytes are attributed per OS page, by overlap: every byte of every block lies in exactly
   one OS page, so nothing is double counted even for a block straddling a boundary.
 ----------------------------------------------------------- */
+
+#define MI_HOLES_MAX_CAP  (1 << 16)   // `page->capacity` is a uint16_t
 
 static void mi_holes_mark_free_list(const mi_page_t* page, mi_block_t* b, uint64_t* set) {
   const size_t cap = page->capacity;

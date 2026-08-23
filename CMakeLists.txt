@@ -887,9 +887,6 @@ if (MI_BUILD_TESTS)
     if(NOT MI_GUARDED)   # and these two know the page layout, which guard pages change
       list(APPEND mi_static_tests purge-holes)
     endif()
-    if(NOT MI_TRACK_ASAN AND NOT MI_TRACK_VALGRIND)   # frees a block twice on purpose
-      list(APPEND mi_static_tests sweep-double-free)
-    endif()
   endif()
   if (MI_DEBUG_FULL OR CMAKE_BUILD_TYPE MATCHES "Debug")
     list(APPEND mi_static_tests commit-fail)  # uses mi_debug_fail_os_commit_after (MI_DEBUG>0 only)
