@@ -20,6 +20,7 @@ jobs:
     name: Test
     runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false   # one platform's failure should not hide the others' results
       matrix:
         tests: [basic,extra]
         os: [windows-latest, macos-latest, ubuntu-latest, macos-14, macos-15-intel, ubuntu-22.04-arm, windows-11-arm]
