@@ -1092,7 +1092,7 @@ mi_page_t* _mi_arenas_page_alloc(mi_theap_t* theap, size_t block_size, size_t bl
 // concurrent `mi_heap_delete` waits for before it frees the heap (see `mi_heap_visit_page_claim`).
 static void mi_arenas_page_free_prim(mi_page_t* page, mi_subproc_t* subproc, mi_arena_pages_t* arena_pages) {
   mi_assert_internal(_mi_is_aligned(mi_page_slice_start(page), MI_PAGE_ALIGN));
-  mi_assert_internal(_mi_ptr_page(mi_page_start(page))==page);
+  mi_assert_internal(_mi_safe_ptr_page(mi_page_start(page))==page || _mi_safe_ptr_page(mi_page_start(page))==NULL);  // (NULL: `_mi_page_map_register` failed in `mi_arenas_page_alloc_fresh`)
   mi_assert_internal(mi_page_is_owned(page));
   mi_assert_internal(mi_page_all_free(page));
   mi_assert_internal(page->next==NULL && page->prev==NULL);
