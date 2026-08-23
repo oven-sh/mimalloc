@@ -356,7 +356,8 @@ typedef struct mi_pb_s {
 } mi_pb_t;
 
 static void pb_flush(mi_pb_t* w) {
-  if (w->err || w->pos == 0) return;
+  if (w->err) { w->pos = 0; return; }   // discard, so pb_raw keeps making progress and the dump returns -1
+  if (w->pos == 0) return;
   if (w->fd >= 0) {
     if (mi_prof_write(w->fd, w->buf, w->pos) != (long)w->pos) w->err = true;
   }
@@ -446,8 +447,24 @@ static void mi_prof_hex(char* dst, const uint8_t* src, size_t n) {
 
 static inline size_t mi_prof_loc_find(mi_prof_loc_t* locs, size_t cap, uintptr_t a) {
   size_t h = (size_t)(a * 0x9E3779B97F4A7C15ull) & (cap - 1);
-  while (locs[h].addr != 0 && locs[h].addr != a) h = (h + 1) & (cap - 1);
+  while (locs[h].addr != 0 && locs[h].addr != a) h = (h + 1) & (cap - 1);   // callers keep the table at most half full
   return h;
+}
+
+// Double the location table (kept at most half full so `mi_prof_loc_find` always terminates). Returns false on OOM.
+static bool mi_prof_loc_grow(mi_prof_loc_t** plocs, size_t* pcap, mi_memid_t* pmemid) {
+  const size_t old_cap = *pcap;
+  const size_t new_cap = 2 * old_cap;
+  mi_memid_t nm;
+  mi_prof_loc_t* nlocs = (mi_prof_loc_t*)_mi_os_zalloc(_mi_subproc_main(), new_cap * sizeof(mi_prof_loc_t), &nm);
+  if (nlocs == NULL) return false;
+  mi_prof_loc_t* olocs = *plocs;
+  for (size_t i = 0; i < old_cap; i++) {
+    if (olocs[i].addr != 0) { nlocs[mi_prof_loc_find(nlocs, new_cap, olocs[i].addr)] = olocs[i]; }
+  }
+  _mi_os_free(_mi_subproc_main(), olocs, old_cap * sizeof(mi_prof_loc_t), *pmemid);
+  *plocs = nlocs; *pcap = new_cap; *pmemid = nm;
+  return true;
 }
 
 #if defined(__linux__) || defined(__FreeBSD__)
@@ -584,24 +601,31 @@ static int mi_prof_dump_pb(mi_pb_t* wp) {
   size_t loc_cap = 4096;
   mi_memid_t lm;
   mi_prof_loc_t* locs = (mi_prof_loc_t*)_mi_os_zalloc(_mi_subproc_main(), loc_cap * sizeof(mi_prof_loc_t), &lm);
+  if (locs == NULL) { *wp = w; return -1; }
   size_t nlocs = 0;
+  bool oom = false;
 
   mi_lock(&mi_prof.lock) {
-    for (size_t i = 0; i < mi_prof.sample_count; i++) {
+    for (size_t i = 0; i < mi_prof.sample_count && !oom; i++) {
       mi_prof_sample_t* s = &mi_prof.samples[i];
       for (uint8_t f = 0; f < s->nframes; f++) {
         uintptr_t a = s->frames[f]; if (a==0) continue;
         size_t h = mi_prof_loc_find(locs, loc_cap, a);
         if (locs[h].addr == 0) {
+          if (2 * (nlocs + 1) > loc_cap) {
+            if (!mi_prof_loc_grow(&locs, &loc_cap, &lm)) { oom = true; break; }
+            h = mi_prof_loc_find(locs, loc_cap, a);
+          }
           locs[h].addr = a;
           locs[h].id = ++nlocs;
           locs[h].mapping_id = mi_prof_mapping_for(maps, nmaps, a);
         }
       }
     }
+    if (oom) { w.err = true; }
 
     // emit samples (field 2): location_id[] (packed), value[] (packed)
-    for (size_t i = 0; i < mi_prof.sample_count; i++) {
+    for (size_t i = 0; i < mi_prof.sample_count && !oom; i++) {
       mi_prof_sample_t* s = &mi_prof.samples[i];
       // scale: a sample triggers after `rate` bytes of countdown, decremented by
       // block_size per alloc. So a sample of size s represents ~max(rate, s) bytes:
@@ -653,6 +677,7 @@ static int mi_prof_dump_pb(mi_pb_t* wp) {
 
   pb_flush(&w);
   *wp = w;
+  _mi_os_free(_mi_subproc_main(), locs, loc_cap * sizeof(mi_prof_loc_t), lm);
   return (w.err ? -1 : 0);
 }
 
