@@ -1,6 +1,11 @@
 // Adversarial tests for the sampling heap profiler.
 // Each case targets a specific race or edge condition; failures abort.
 
+#if defined(_WIN32)
+#include <stdio.h>
+int main(void) { printf("test-prof-adversarial: skipped on Windows (uses pthreads/fork)\n"); return 0; }
+#else
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -379,3 +384,5 @@ int main(void) {
   fprintf(stderr, "all cases passed\n");
   return 0;
 }
+
+#endif  // !_WIN32

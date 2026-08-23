@@ -560,7 +560,9 @@ bool _mi_os_commit_ex(mi_subproc_t* subproc, void* addr, size_t size, bool* is_z
   // commit
   bool os_is_zero = false;
   #if MI_DEBUG > 0
-  if (mi_debug_fail_os_commit_after > 0 && --mi_debug_fail_os_commit_after == 0) {
+  const long fail_after = mi_debug_fail_os_commit_after;
+  if (fail_after > 0) { mi_debug_fail_os_commit_after = fail_after - 1; }
+  if (fail_after == 1) {
     _mi_warning_message("mi_debug_fail_os_commit_after: injecting commit failure at %p, size 0x%zx\n", start, csize);
     return false;
   }

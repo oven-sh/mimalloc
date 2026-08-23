@@ -292,7 +292,7 @@ void          _mi_prof_theap_init(mi_theap_t* theap);
 // scavenger.c
 void          _mi_scavenger_start(void);
 void          _mi_scavenger_forked_child(void);
-void          _mi_scavenger_start_if_forked(void);
+void          _mi_scavenger_start_lazy(void);
 void          _mi_scavenger_stop(void);
 void          _mi_scavenger_wake(mi_subproc_t* subproc);
 bool          _mi_scavenger_is_running(void);
@@ -347,6 +347,20 @@ void          _mi_theap_page_reclaim(mi_theap_t* theap, mi_page_t* page);
 
 void          _mi_heap_detach_theaps( mi_heap_t* heap );
 void          _mi_theap_abandon(mi_theap_t* theap);
+
+#if MI_DEBUG>0
+// Test hooks (see the tests named at their definitions). Declared here so that they keep C linkage
+// when the library is compiled as C++ and the tests are not.
+#ifdef __cplusplus
+extern "C" {
+#endif
+extern mi_decl_export _Atomic(uintptr_t) mi_debug_stall_in_thread_theaps_done;
+extern mi_decl_export _Atomic(uintptr_t) mi_debug_stall_in_heap_delete_claim;
+extern mi_decl_export volatile long      mi_debug_fail_os_commit_after;
+#ifdef __cplusplus
+}
+#endif
+#endif
 void          _mi_tld_detach_theaps( mi_tld_t* tld );
 void          _mi_theap_incref(mi_theap_t* theap);
 void          _mi_theap_decref(mi_theap_t* theap);

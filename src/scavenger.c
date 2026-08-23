@@ -20,7 +20,7 @@ void _mi_scavenger_stop(void)  { }
 void _mi_scavenger_wake(mi_subproc_t* subproc) { MI_UNUSED(subproc); }
 bool _mi_scavenger_is_running(void) { return false; }
 void _mi_scavenger_forked_child(void) { }
-void _mi_scavenger_start_if_forked(void) { }
+void _mi_scavenger_start_lazy(void) { _mi_scavenger_start(); }
 
 #else
 
@@ -287,7 +287,12 @@ void _mi_scavenger_stop(void) {
 }
 
 void _mi_scavenger_forked_child(void) { }    // no fork on Windows
-void _mi_scavenger_start_if_forked(void) { }
+void _mi_scavenger_start_lazy(void) {        // see the POSIX one
+  if (mi_atomic_load_relaxed(&_mi_scavenger_running) != 0) return;
+  static _Atomic(uintptr_t) started;
+  if (mi_atomic_exchange_acq_rel(&started, (uintptr_t)1) != 0) return;
+  _mi_scavenger_start();
+}
 
 #else  // POSIX
 
@@ -367,11 +372,16 @@ void _mi_scavenger_forked_child(void) {
   mi_atomic_store_release(&_mi_scavenger_needs_restart, (uintptr_t)1);
 }
 
-// Restart once, on the first purge that wanted a scavenger. Not in the fork handler: most children
-// exec immediately, and starting a thread there would charge every spawn for one it throws away.
-void _mi_scavenger_start_if_forked(void) {
-  if (mi_atomic_load_relaxed(&_mi_scavenger_needs_restart) == 0) return;
-  if (mi_atomic_exchange_acq_rel(&_mi_scavenger_needs_restart, (uintptr_t)0) == 0) return;
+// Start the scavenger on first demand (a purge was scheduled, or a thread parks): not at process
+// initialization, which for an inserted/preloaded library runs before the other libraries' initializers
+// (on macOS the Objective-C runtime aborts if a thread exists before it initializes), and would give
+// every short-lived process a thread it never uses. Also the restart after fork(): not in the fork
+// handler, as most children exec immediately.
+void _mi_scavenger_start_lazy(void) {
+  if (mi_atomic_load_relaxed(&_mi_scavenger_running) != 0) return;
+  static _Atomic(uintptr_t) started;   // once per process image, plus once per fork
+  const bool forked = (mi_atomic_exchange_acq_rel(&_mi_scavenger_needs_restart, (uintptr_t)0) != 0);
+  if (mi_atomic_exchange_acq_rel(&started, (uintptr_t)1) != 0 && !forked) return;
   _mi_scavenger_start();
 }
 

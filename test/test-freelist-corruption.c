@@ -308,7 +308,9 @@ static bool test_local_free_link(void) {
     mi_on_thread_idle();
     ok_ = reported_once("local-free-link")
        && on_no_list(&v, v.block[0])
-       && (list_occurrences(v.page, v.page->free, v.block[2]) == 1)
+       // block 2 survives the cut: on `free`, or discarded by the sweep if its OS page became all free
+       // (which one depends on the page layout; MI_SECURE randomizes it)
+       && (list_occurrences(v.page, v.page->free, v.block[2]) + (mi_page_block_is_purged(v.page, v.block[2]) ? 1 : 0) == 1)
        && (v.page->local_free == NULL)
        && page_accounts(&v, "after the cut")
        && page_recovered(&v, v.block[0], &pass_sweep);

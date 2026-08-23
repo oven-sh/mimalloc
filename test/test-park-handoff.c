@@ -14,6 +14,11 @@ terms of the MIT license. A copy of the license can be found in the file
 // used. Freeing a contiguous run instead would empty whole mimalloc pages, which go back through
 // the arena and never exercise hole punching at all.
 
+#if defined(_WIN32)
+#include <stdio.h>
+int main(void) { printf("test-park-handoff: skipped on Windows (uses pthreads/fork)\n"); return 0; }
+#else
+
 #include "mimalloc.h"
 #include <pthread.h>
 #include <stdint.h>
@@ -490,3 +495,5 @@ int main(void) {
   fprintf(stderr, "\n%s\n", failures == 0 ? "all tests passed." : "SOME TESTS FAILED.");
   return failures == 0 ? 0 : 1;
 }
+
+#endif  // !_WIN32

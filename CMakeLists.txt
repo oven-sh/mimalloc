@@ -658,6 +658,8 @@ endif()
 if(MI_USE_CXX)
   set_source_files_properties(${mi_sources} PROPERTIES LANGUAGE CXX )
   set_source_files_properties(src/static.c test/test-api.c test/test-api-fill.c test/test-stress.c test/test-stress-heaps.c  test/test-stress-subprocs.c PROPERTIES LANGUAGE CXX )
+  # the white-box tests call internal functions, whose names are mangled now
+  set_source_files_properties(test/test-theap-sentinel.c test/test-purge-holes.c test/test-freelist-corruption.c test/test-commit-fail.c PROPERTIES LANGUAGE CXX )
 endif()
 
 
@@ -889,6 +891,10 @@ if (MI_BUILD_TESTS)
     add_executable(mimalloc-test-${TEST_NAME} test/test-${TEST_NAME}.c)
     target_compile_definitions(mimalloc-test-${TEST_NAME} PRIVATE ${mi_defines})
     target_compile_options(mimalloc-test-${TEST_NAME} PRIVATE ${mi_cflags})
+    if(MSVC AND NOT MI_CLANG_CL)
+      # the tests that stay C use <stdatomic.h>, which MSVC has behind a switch (VS 2022 17.5+)
+      target_compile_options(mimalloc-test-${TEST_NAME} PRIVATE $<$<COMPILE_LANGUAGE:C>:/std:c11 /experimental:c11atomics>)
+    endif()
     target_include_directories(mimalloc-test-${TEST_NAME} PRIVATE include)
     if(MI_BUILD_STATIC AND NOT MI_DEBUG_TSAN)
       target_link_libraries(mimalloc-test-${TEST_NAME} PRIVATE mimalloc-static ${mi_libraries})
@@ -926,7 +932,7 @@ if (MI_BUILD_TESTS)
   # allocator once more with emulated TLS, as malloc, in the TLS model Android uses, and link
   # test/test-emulated-tls.c against that build. Only compilers that can emulate TLS (clang); the
   # sanitizers bring their own malloc.
-  if(MI_OVERRIDE AND NOT WIN32 AND NOT (MI_TRACK_ASAN OR MI_TRACK_VALGRIND OR MI_DEBUG_TSAN OR MI_DEBUG_UBSAN))
+  if(MI_OVERRIDE AND CMAKE_SYSTEM_NAME MATCHES "Linux|Android" AND NOT (MI_TRACK_ASAN OR MI_TRACK_VALGRIND OR MI_DEBUG_TSAN OR MI_DEBUG_UBSAN))
     include(CheckCCompilerFlag)
     check_c_compiler_flag("-femulated-tls" MI_HAS_EMULATED_TLS)
     if(MI_HAS_EMULATED_TLS)

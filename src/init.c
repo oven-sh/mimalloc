@@ -638,7 +638,7 @@ static void mi_process_init_once(void) {
       mi_reserve_os_memory((size_t)ksize*MI_KiB, true, true);
     }
   }
-  _mi_scavenger_start();
+  // (the scavenger thread starts on first demand, see `_mi_scavenger_start_lazy`)
 }
 
 /* -----------------------------------------------------------
