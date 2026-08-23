@@ -877,7 +877,10 @@ if (MI_BUILD_TESTS)
   enable_testing()
 
   # static link tests
-  set(mi_static_tests api api-fill stress-heaps stress-subprocs stress heap-mt heap-teardown heap-delete-race heap-churn heap-aba fork-user-heap snapshot prof prof-adversarial purge-zero park-handoff thp-optout)
+  set(mi_static_tests api api-fill stress-heaps stress-subprocs stress heap-mt heap-teardown heap-delete-race heap-churn heap-aba fork-user-heap snapshot prof prof-adversarial purge-zero park-handoff)
+  if(NOT (MI_DEBUG_TSAN OR MI_TRACK_ASAN OR MI_DEBUG_UBSAN))
+    list(APPEND mi_static_tests thp-optout)  # counts madvise calls by interposing it, which a sanitizer runtime does first
+  endif()
   if(MI_BUILD_STATIC AND NOT MI_DEBUG_TSAN)
     # these reach into internals that the shared library (which the TSAN build links the tests against) does not export
     list(APPEND mi_static_tests theap-sentinel)

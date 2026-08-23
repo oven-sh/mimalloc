@@ -813,7 +813,7 @@ static inline mi_page_map_t* _mi_page_map(void) {
 }
 
 static inline mi_submap_t _mi_page_map_at(const mi_page_map_t* pmap, size_t idx) {
-  return mi_atomic_load_ptr_acquire(mi_page_t*, &pmap->submaps[idx]);
+  return mi_atomic_load_ptr_relaxed(mi_page_t*, &pmap->submaps[idx]);
 }
 
 static inline mi_page_t* _mi_unchecked_ptr_page(const void* p) {
