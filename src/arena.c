@@ -2610,7 +2610,7 @@ static bool mi_heap_visit_page_claim(mi_heap_visit_info_t* vinfo, mi_page_t* pag
     if mi_unlikely(!mi_page_is_abandoned(page)) {
       // A thread that allocated from this heap before is using it during the delete (it allocated this
       // page, or reclaimed it on a free just now): that is outside the contract of `mi_heap_delete`.
-      _mi_error_message(EINVAL, "heap 0x%zx is deleted while thread 0x%zx still uses it\n", (uintptr_t)vinfo->heap, mi_page_thread_id(page));
+      mi_assert(false && "a heap is deleted while a thread that allocated from it still uses it");
       mi_bitmap_set(pages, slice_index);
       mi_heap_visit_page_seize(page);
       break;

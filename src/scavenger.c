@@ -133,8 +133,8 @@ static void mi_scav_wake_one(_Atomic(uint32_t)* addr) {
 
 // One scavenger per process, so a file-static mutex/cond is sufficient and
 // avoids bloating mi_subproc_s with platform-conditional fields.
-static pthread_mutex_t _mi_scav_mutex = PTHREAD_MUTEX_INITIALIZER;
-static pthread_cond_t  _mi_scav_cond  = PTHREAD_COND_INITIALIZER;
+static pthread_mutex_t _mi_scav_mutex;   // initialized in `mi_scav_init` (from `_mi_scavenger_start`, before any wait or wake)
+static pthread_cond_t  _mi_scav_cond;
 
 static void mi_scav_wait(_Atomic(uint32_t)* addr, mi_msecs_t timeout_ms) {
   if (timeout_ms <= 0) timeout_ms = 1;

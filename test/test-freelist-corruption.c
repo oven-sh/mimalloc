@@ -40,15 +40,13 @@ static int         error_last  = 0;
 static const char* report_needle = NULL;    // the message the walker under test is expected to print ...
 static int         report_count  = 0;       // ... and how often it was printed
 
-static void on_error(int err, void* arg) {
+// registered with `mi_register_error_message`, so the text arrives here whether or not
+// `show_errors` prints it
+static void on_error(int err, const char* msg, void* arg) {
   MI_UNUSED(arg);
   error_count++;
   error_last = err;
-}
-
-static void on_output(const char* msg, void* arg) {
-  MI_UNUSED(arg);
-  fputs(msg, stderr);
+  fprintf(stderr, "mimalloc: error: %s", msg);
   if (report_needle != NULL && strstr(msg, report_needle) != NULL) { report_count++; }
 }
 
@@ -370,9 +368,8 @@ static bool selected(int argc, char** argv, const char* name) {
 
 int main(int argc, char** argv) {
   mi_version();
-  mi_register_error(&on_error, NULL);
-  mi_register_output(&on_output, NULL);
-  mi_option_set(mi_option_show_errors, 1);            // the messages are part of what is tested: they have to format without faulting
+  mi_register_error_message(&on_error, NULL);
+  mi_option_set(mi_option_show_errors, 0);            // the handler prints; the library printing them as well would count every report twice
   mi_option_set(mi_option_purge_holes_full_every, 1); // walk every page on every sweep: a scribbled link changes nothing the skip check looks at
 
   if (mi_option_is_enabled(mi_option_purge_holes)) {
