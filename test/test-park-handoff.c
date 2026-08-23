@@ -98,6 +98,62 @@ static bool wait_for_discard_after(size_t before) {
 }
 
 // ---------------------------------------------------------------------------
+// The scavenger thread exists only once there is something for it to do (a second thread, or a
+// park), and it must not block the signals a fault on it raises, or a crash during a sweep it does
+// for a parked thread ends the process without the host's crash report. Linux only: both are read
+// from /proc.
+// ---------------------------------------------------------------------------
+#if defined(__linux__)
+#include <dirent.h>
+#include <signal.h>
+// the blocked-signal mask of the thread named "mi-scavenger" (0 if there is none yet)
+static unsigned long long scavenger_sigblk(int* count) {
+  unsigned long long mask = 0;
+  *count = 0;
+  DIR* d = opendir("/proc/self/task");
+  if (d == NULL) return 0;
+  struct dirent* e;
+  while ((e = readdir(d)) != NULL) {
+    if (e->d_name[0] == '.') continue;
+    char path[300]; char line[256];
+    snprintf(path, sizeof(path), "/proc/self/task/%s/comm", e->d_name);
+    FILE* f = fopen(path, "r");
+    if (f == NULL) continue;
+    const bool is_scav = (fgets(line, sizeof(line), f) != NULL && strncmp(line, "mi-scavenger", 12) == 0);
+    fclose(f);
+    if (!is_scav) continue;
+    (*count)++;
+    snprintf(path, sizeof(path), "/proc/self/task/%s/status", e->d_name);
+    f = fopen(path, "r");
+    if (f == NULL) continue;
+    while (fgets(line, sizeof(line), f) != NULL) {
+      if (strncmp(line, "SigBlk:", 7) == 0) { mask = strtoull(line + 7, NULL, 16); break; }
+    }
+    fclose(f);
+  }
+  closedir(d);
+  return mask;
+}
+static void test_lazy_start_and_signals(void) {
+  if (!mi_option_is_enabled(mi_option_scavenger)) { fprintf(stderr, "test: scavenger lazy start...  skipped (scavenger disabled)\n"); return; }
+  void* q = mi_malloc(100); mi_free(q);
+  int n = 0;
+  scavenger_sigblk(&n);
+  check("no scavenger thread for a process that only ever had one thread", n == 0);
+  if (mi_on_thread_idle_start()) { mi_on_thread_idle_end(); }
+  // it names itself and sets its mask first thing; wait for that rather than assume it
+  unsigned long long blk = 0;
+  for (int i = 0; i < 20000 && (blk = scavenger_sigblk(&n)) == 0; i++) { usleep(100); }
+  check("the first park starts it", n == 1);
+  const unsigned long long segv = 1ULL << (SIGSEGV - 1), bus = 1ULL << (SIGBUS - 1), term = 1ULL << (SIGTERM - 1);
+  check("the scavenger blocks process-directed signals", (blk & term) != 0);
+  check("but not the ones a fault on it raises", (blk & (segv | bus)) == 0);
+}
+#else
+static void test_lazy_start_and_signals(void) { fprintf(stderr, "test: scavenger lazy start / signal mask...  skipped (needs /proc)\n"); }
+#endif
+
+// ---------------------------------------------------------------------------
 // The handoff does the same work as the inline sweep -- and when there is nobody to hand off to
 // it says so rather than sweeping inline behind the caller's back.
 // ---------------------------------------------------------------------------
@@ -485,6 +541,7 @@ static void test_scavenger_stop(void) {
 }
 
 int main(void) {
+  test_lazy_start_and_signals();   // first: nothing may have started the scavenger yet
   test_handoff_sweeps();
   test_survivors_intact();
   test_unbalanced();
