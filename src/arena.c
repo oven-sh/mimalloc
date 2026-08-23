@@ -1265,13 +1265,12 @@ bool _mi_arenas_page_try_reabandon_to_mapped(mi_page_t* page) {
     return false;
   }
   else {
-    // do not use _mi_heap_theap as we may call this during shutdown of threads and don't want to reinitialize the theap
-    mi_theap_t* const theapx = _mi_page_associated_theap_peek(page); // can be NULL
-    mi_heap_t* const heap = mi_page_heap(page);   
-    // if (theapx==NULL) return false;
-    mi_theapx_stat_counter_increase(heap, theapx, pages_reabandon_full, 1);
-    mi_theapx_stat_adjust_decrease(heap, theapx, pages_abandoned, 1);  // adjust as we are not abandoning fresh
-    _mi_arenas_page_abandon(page, theapx);
+    // Account on the heap and not on this thread's theap for it (`_mi_page_associated_theap_peek`): the theap
+    // was only used for its statistics here, and a concurrent `mi_heap_delete` may be detaching and merging it.
+    mi_heap_t* const heap = mi_page_heap(page);
+    mi_heap_stat_counter_increase(heap, pages_reabandon_full, 1);
+    mi_heap_stat_adjust_decrease(heap, pages_abandoned, 1);  // adjust as we are not abandoning fresh
+    _mi_arenas_page_abandon(page, NULL);
     return true;
   }
 }

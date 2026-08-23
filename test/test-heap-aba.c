@@ -49,8 +49,14 @@ static void thread_yield(void) { sched_yield(); }
 #define ALLOCS_PER_ROUND (16)
 
 /* hand-shake between the two threads: B publishes a heap, A uses it, B recycles it */
-static mi_heap_t* volatile g_heap;
-static volatile int g_step;       /* even: B's turn, odd: A's turn */
+#ifdef __cplusplus
+#include <atomic>
+#define _Atomic(T) std::atomic<T>
+#else
+#include <stdatomic.h>
+#endif
+static _Atomic(mi_heap_t*) g_heap;
+static _Atomic(int) g_step;       /* even: B's turn, odd: A's turn */
 static int g_same_address;        /* rounds where the recycled heap came back at the same address */
 static int g_failures;
 

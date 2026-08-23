@@ -40,8 +40,14 @@ static void thread_create(thread_t* t, void* arg) { pthread_create(t, NULL, thre
 static void thread_join(thread_t t) { pthread_join(t, NULL); }
 #endif
 
-static mi_heap_t* volatile g_heap;
-static volatile int g_allocated;
+#ifdef __cplusplus
+#include <atomic>
+#define _Atomic(T) std::atomic<T>
+#else
+#include <stdatomic.h>
+#endif
+static _Atomic(mi_heap_t*) g_heap;
+static _Atomic(int) g_allocated;
 
 #ifdef _WIN32
 static DWORD WINAPI thread_main(LPVOID arg)
