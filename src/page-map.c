@@ -215,12 +215,19 @@ mi_decl_nodiscard mi_decl_export bool mi_is_in_heap_region(const void* p) mi_att
 #define MI_PAGE_MAP_SUB_SIZE          (MI_PAGE_MAP_SUB_COUNT * sizeof(mi_page_t*))
 
 // Use an initial empty page map so `free(NULL)` works even if mimalloc is not yet initialized (issue #1341)
+// The sub-map for the NULL address must itself be a valid (zero initialized) array rather than
+// NULL: the default (non-secure, non-debug) build resolves pointers via `_mi_unchecked_ptr_page`,
+// which loads `submaps[idx][sub_idx]` without checking the sub-map for NULL. A single entry is
+// enough since `_mi_page_map_index(NULL)` is 0 at both levels, and no other pointer can belong
+// to mimalloc before it is initialized (any `malloc` initializes the page map first).
+static mi_page_t* mi_page_map_empty_sub[1] = { NULL };   // so that `_mi_ptr_page(NULL) == NULL`
+
 static mi_page_map_t mi_page_map_empty = { 
   MI_ATOMIC_VAR_INIT(1),
   sizeof(mi_page_map_t),
   MI_MEMID_STATIC,
   MI_LOCK_INITIALIZER,
-  { MI_ATOMIC_VAR_INIT(NULL) } 
+  { MI_ATOMIC_VAR_INIT(mi_page_map_empty_sub) } 
 };
 
 mi_decl_hidden mi_decl_cache_align _Atomic(mi_page_map_t*) __mi_page_map  = MI_ATOMIC_VAR_INIT(&mi_page_map_empty);
