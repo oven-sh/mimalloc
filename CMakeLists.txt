@@ -877,7 +877,7 @@ if (MI_BUILD_TESTS)
   enable_testing()
 
   # static link tests
-  set(mi_static_tests api api-fill stress-heaps stress-subprocs stress heap-mt heap-teardown heap-delete-race heap-churn heap-aba fork-user-heap snapshot prof prof-adversarial purge-zero park-handoff)
+  set(mi_static_tests api api-fill stress-heaps stress-subprocs stress heap-mt heap-teardown heap-delete-race heap-churn heap-aba fork-user-heap snapshot prof prof-adversarial purge-zero park-handoff free-before-init)
   if(NOT (MI_DEBUG_TSAN OR MI_TRACK_ASAN OR MI_DEBUG_UBSAN))
     list(APPEND mi_static_tests thp-optout)  # counts madvise calls by interposing it, which a sanitizer runtime does first
   endif()
