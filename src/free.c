@@ -276,10 +276,29 @@ void _mi_free_subproc_safe_in_page(void* p, mi_page_t* page) mi_attr_noexcept {
   mi_free_ex(p, page, NULL, false);
 }
 
-// Free a pointer that is potentially allocated in a different sub-process
+// The sub-process of a page we do not own. On a multi-threaded free we cannot go through `page->heap`
+// (see `mi_page_heap`): a concurrent `mi_heap_delete` moves the page to the main heap and frees the heap
+// struct. The arena of a page is constant for the lifetime of the page instead; for the (rare) OS
+// allocated pages we fall back to our own subproc.
+static mi_subproc_t* mi_page_subproc_unowned(const mi_page_t* page) {
+  if mi_likely(page->memid.memkind == MI_MEM_ARENA) {
+    return page->memid.mem.arena.arena->subproc;
+  }
+  else {
+    return _mi_subproc();
+  }
+}
+
+// Free a pointer that is potentially allocated in a different sub-process.
+// Collecting an abandoned page (free it, reclaim it, or re-map it) must not cross sub-processes,
+// but inside our own it must still happen: a full page is abandoned and unmapped, and a block
+// freed into it without collecting is never found again and pins the page (`mi_heap_free` frees
+// every `mi_heap_t` and `mi_arena_pages_t` through here).
 void _mi_free_subproc_safe(void* p) mi_attr_noexcept {
   mi_page_t* const page = mi_validate_ptr_page(p,"_mi_free_subproc_safe");  
-  mi_free_ex(p, page, NULL, false);
+  if mi_unlikely(page==NULL) return;
+  const bool allow_collect = (mi_page_subproc_unowned(page) == _mi_subproc());
+  mi_free_ex(p, page, NULL, allow_collect);
 }
 
 
@@ -709,26 +728,14 @@ static void mi_check_padding(const mi_page_t* page, const mi_block_t* block) {
 
 // only maintain stats for smaller objects if requested
 #if (MI_STAT>0)
-// The subproc to account a free on when we cannot use our own theap. On a multi-threaded free we do not
-// own `page`, so we cannot go through `page->heap` (see `mi_page_heap`): a concurrent `mi_heap_delete`
-// moves the page to the main heap and frees the heap struct. The arena of a page is constant for the
-// lifetime of the page instead; for the (rare) OS allocated pages we fall back to our own subproc.
-static mi_subproc_t* mi_stat_free_subproc(const mi_page_t* page) {
-  if mi_likely(page->memid.memkind == MI_MEM_ARENA) {
-    return page->memid.mem.arena.arena->subproc;
-  }
-  else {
-    return _mi_subproc();
-  }
-}
-
 static void mi_stat_free(const mi_page_t* page, const mi_block_t* block) {
   MI_UNUSED(block);  
   mi_theap_t* theap = _mi_theap_default();
   mi_lock_t* lock = NULL;
   if mi_unlikely(!mi_theap_is_initialized(theap) ||             // can happen if free'd after thread_done was called (usually a thread cleanup call by the OS)
                  mi_page_thread_id(page) == MI_THREADID_DETACHED) { // page->theap == subproc->theap_meta .. but we cannot read `theap` if we don't own the page (only the meta theap has the detached thread id)
-    mi_subproc_t* const subproc = mi_stat_free_subproc(page);
+    // account on the subproc of the page (we cannot use our own theap here)
+    mi_subproc_t* const subproc = mi_page_subproc_unowned(page);
     if (subproc->theap_meta == NULL) return;  // give up (the subproc is being destroyed)
     theap = subproc->theap_meta;
     lock = &subproc->theap_meta_lock;
