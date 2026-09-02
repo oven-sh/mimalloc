@@ -229,7 +229,7 @@ static void mi_heap_free(mi_heap_t* heap, bool acquire_heaps_lock) {
         mi_arena_pages_t* arena_pages = mi_atomic_load_ptr_relaxed(mi_arena_pages_t, &heap->arena_pages[i]);
         if (arena_pages!=NULL) {
           mi_atomic_store_ptr_relaxed(mi_arena_pages_t, &heap->arena_pages[i], NULL);
-          _mi_free_subproc_safe(arena_pages);
+          _mi_arena_pages_free(arena_pages);
         }
       }
     }

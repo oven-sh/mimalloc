@@ -277,6 +277,7 @@ void          _mi_arenas_abandoned_page_free(mi_page_t* page, mi_theap_t* curren
 void          _mi_arenas_page_abandon(mi_page_t* page, mi_theap_t* current_theap);
 void          _mi_arenas_page_unabandon(mi_page_t* page, mi_theap_t* current_theapx /* can be NULL */);
 bool          _mi_arenas_page_try_reabandon_to_mapped(mi_page_t* page);
+void          _mi_arena_pages_free(mi_arena_pages_t* arena_pages);
 size_t        mi_arenas_get_count(mi_subproc_t* subproc);
 uint8_t*      mi_arena_slice_start(mi_arena_t* arena, size_t slice_index);
 
