@@ -336,7 +336,8 @@ bool _mi_process_is_forked_child;          // set once in fork_child, never clea
 // Lock order (prepare acquires in this order; parent releases in reverse; child re-initializes everything):
 //   subprocs registry -> thread locals -> per subproc: main heap's arena_pages (it may allocate while held) -> heaps list ->
 //   every other heap's arena_pages/theaps/os_abandoned -> main heap's theaps/os_abandoned -> tlds registry (leaf) ->
-//   arena reserve -> meta-data theap.
+//   meta-data theap -> arena reserve (a meta-data allocation may have to reserve a fresh arena while it holds the
+//   meta lock, `arena.c:mi_arenas_try_alloc`; nothing under the reserve lock allocates meta data).
 static void mi_subproc_fork_prepare(mi_subproc_t* sp) {
   mi_heap_t* const heap_main = _mi_subproc_heap_main(sp);
   if (heap_main != NULL) { mi_lock_acquire(&heap_main->arena_pages_lock); }
@@ -352,14 +353,14 @@ static void mi_subproc_fork_prepare(mi_subproc_t* sp) {
     mi_lock_acquire(&heap_main->os_abandoned_pages_lock);
   }
   mi_lock_acquire(&sp->tlds_lock);
-  mi_lock_acquire(&sp->arena_reserve_lock);
   mi_lock_acquire(&sp->theap_meta_lock);
+  mi_lock_acquire(&sp->arena_reserve_lock);
 }
 
 static void mi_subproc_fork_parent(mi_subproc_t* sp) {
   mi_heap_t* const heap_main = _mi_subproc_heap_main(sp);
-  mi_lock_release(&sp->theap_meta_lock);
   mi_lock_release(&sp->arena_reserve_lock);
+  mi_lock_release(&sp->theap_meta_lock);
   mi_lock_release(&sp->tlds_lock);
   if (heap_main != NULL) {
     mi_lock_release(&heap_main->os_abandoned_pages_lock);
