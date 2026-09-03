@@ -85,7 +85,8 @@ static mi_prof_state_t mi_prof;
 // Hash table (addr -> sample index)
 // ---------------------------------------------------------------------------
 
-static inline size_t mi_prof_hash(uintptr_t k, size_t cap) {
+static inline size_t mi_prof_hash(uintptr_t key, size_t cap) {
+  uint64_t k = (uint64_t)key;  // 64-bit even on 32-bit targets, where `>> 33` on a uintptr_t is undefined
   k ^= k >> 33; k *= 0xff51afd7ed558ccdull; k ^= k >> 33;
   return (size_t)(k & (cap - 1));
 }
