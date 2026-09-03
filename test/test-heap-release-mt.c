@@ -37,6 +37,7 @@ int main(void) { printf("test-heap-release-mt: skipped on Windows (uses pthreads
 #include <mimalloc.h>
 #include <pthread.h>
 #include <stdatomic.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
