@@ -1,0 +1,167 @@
+/* ----------------------------------------------------------------------------
+Copyright (c) 2026, Microsoft Research, Daan Leijen
+This is free software; you can redistribute it and/or modify it under the
+terms of the MIT license.
+-----------------------------------------------------------------------------*/
+
+/* Release heaps on many threads at once while other threads free into them.
+
+   - NCHURN threads loop: `mi_heap_new`, allocate mixed sizes, hand a third of the blocks to a shared
+     ring, free a third, leak a third, then `mi_heap_delete` (or `mi_heap_destroy` when nothing was
+     handed out). Some heaps are also published for a while so that short-lived threads allocate from
+     them and exit with their blocks live (the abandon path, and the per-bin abandoned maps).
+   - NFREE threads pop blocks from the ring and `mi_free` them: those frees land before, during and
+     after the delete of the owning heap, so pages are freed and re-abandoned by a foreign thread while
+     `mi_heap_delete` claims them (`arena.c:mi_heap_visit_page_claim` against `mi_arenas_page_free_prim`).
+   - NSPAWN threads keep creating batches of threads that allocate from a published heap (or the main
+     heap) and exit at once.
+
+   Meant to be run under TSAN and ASAN as well as with MI_DEBUG_FULL: it must finish without a report.
+
+   > mimalloc-test-heap-release-mt [SECONDS]
+*/
+#if defined(_WIN32)
+#include <stdio.h>
+int main(void) { printf("test-heap-release-mt: skipped on Windows (uses pthreads)\n"); return 0; }
+#else
+
+#include <mimalloc.h>
+#include <pthread.h>
+#include <stdatomic.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+
+#define NCHURN 8
+#define NFREE  4
+#define NSPAWN 4
+#define RING (1<<16)
+static _Atomic(void*) ring[RING];
+static _Atomic unsigned long ring_head, ring_tail;
+static _Atomic int stop;
+static _Atomic unsigned long heaps_done, frees_done, exits_done;
+
+static const size_t sizes[] = {8,16,48,96,200,512,1024,2048,5000,8192,20000,40000,70000,200000};
+#define NS (sizeof(sizes)/sizeof(sizes[0]))
+
+static void push(void* p) {
+  for (;;) {
+    unsigned long h = atomic_fetch_add(&ring_head, 1);
+    void* expect = NULL;
+    if (atomic_compare_exchange_strong(&ring[h % RING], &expect, p)) return;
+    // slot busy: free it ourselves instead of spinning
+    mi_free(p); return;
+  }
+}
+static void* pop(void) {
+  unsigned long t = atomic_fetch_add(&ring_tail, 1);
+  return atomic_exchange(&ring[t % RING], NULL);
+}
+
+static unsigned rnd(unsigned* s){ *s = *s*1103515245u+12345u; return *s>>8; }
+
+// shared live heaps for the exiting threads
+#define NSHARED 4
+static _Atomic(mi_heap_t*) shared[NSHARED];
+static _Atomic int users[NSHARED];
+
+static void* churn(void* arg) {
+  unsigned seed = (unsigned)(uintptr_t)arg * 7919u + 1;
+  while (!atomic_load(&stop)) {
+    mi_heap_t* h = mi_heap_new();
+    int slot = -1;
+    // sometimes publish as a shared heap for exiting threads to allocate from
+    if ((rnd(&seed) % 4) == 0) {
+      slot = rnd(&seed) % NSHARED;
+      mi_heap_t* expect = NULL;
+      if (!atomic_compare_exchange_strong(&shared[slot], &expect, h)) slot = -1;
+    }
+    int handed = 0;
+    int n = 50 + rnd(&seed) % 400;
+    for (int i = 0; i < n; i++) {
+      size_t sz = sizes[rnd(&seed) % NS];
+      void* p = mi_heap_malloc(h, sz);
+      if (!p) { fprintf(stderr,"oom\n"); abort(); }
+      memset(p, 0xAB, sz < 64 ? sz : 64);
+      unsigned r = rnd(&seed) % 3;
+      if (r == 0) { push(p); handed++; }
+      else if (r == 1) mi_free(p);
+      // else leak into the heap; delete moves it to main / destroy frees it
+    }
+    if (slot >= 0) {
+      // let exiting threads use it for a bit, then unpublish
+      usleep(200);
+      atomic_store(&shared[slot], NULL);
+      while (atomic_load(&users[slot]) != 0) usleep(10); // in-flight allocators finish (contract: no alloc during delete)
+      handed = 1; // exiting threads may hold blocks: must delete, not destroy
+    }
+    if (handed == 0 && (rnd(&seed) & 1)) mi_heap_destroy(h);
+    else mi_heap_delete(h);
+    atomic_fetch_add(&heaps_done, 1);
+  }
+  return NULL;
+}
+
+static void* freer(void* arg) {
+  (void)arg;
+  while (!atomic_load(&stop) || atomic_load(&ring_tail) < atomic_load(&ring_head)) {
+    void* p = pop();
+    if (p) { mi_free(p); atomic_fetch_add(&frees_done,1); }
+    else if (atomic_load(&stop)) break;
+  }
+  return NULL;
+}
+
+static void* exiter(void* arg) {
+  unsigned seed = (unsigned)(uintptr_t)arg;
+  int slot = rnd(&seed) % NSHARED;
+  atomic_fetch_add(&users[slot], 1);
+  mi_heap_t* h = atomic_load(&shared[slot]);
+  for (int i = 0; i < 40; i++) {
+    size_t sz = sizes[rnd(&seed) % 8];
+    void* p = h ? mi_heap_malloc(h, sz) : mi_malloc(sz);
+    if (p) { memset(p, 0xCD, sz < 64 ? sz : 64); push(p); }
+  }
+  atomic_fetch_sub(&users[slot], 1);
+  atomic_fetch_add(&exits_done,1);
+  return NULL; // exit with blocks live -> pages abandoned (mapped, lazy bitmap alloc)
+}
+
+static void* spawner(void* arg) {
+  unsigned k = (unsigned)(uintptr_t)arg * 100000u;
+  while (!atomic_load(&stop)) {
+    pthread_t t[8];
+    for (int i = 0; i < 8; i++) pthread_create(&t[i], NULL, exiter, (void*)(uintptr_t)(k++));
+    for (int i = 0; i < 8; i++) pthread_join(t[i], NULL);
+  }
+  return NULL;
+}
+
+int main(int argc, char** argv) {
+  int secs = (argc > 1 ? atoi(argv[1]) : 0);
+  if (secs <= 0) {
+    #if defined(MI_TSAN) || !defined(NDEBUG)
+    secs = 4;
+    #else
+    secs = 6;
+    #endif
+  }
+  pthread_t tc[NCHURN], tf[NFREE], ts[NSPAWN];
+  for (long i = 0; i < NFREE; i++) pthread_create(&tf[i], NULL, freer, (void*)i);
+  for (long i = 0; i < NCHURN; i++) pthread_create(&tc[i], NULL, churn, (void*)(i+1));
+  for (long i = 0; i < NSPAWN; i++) pthread_create(&ts[i], NULL, spawner, (void*)(i+1));
+  sleep(secs);
+  atomic_store(&stop, 1);
+  for (int i = 0; i < NCHURN; i++) pthread_join(tc[i], NULL);
+  for (int i = 0; i < NSPAWN; i++) pthread_join(ts[i], NULL);
+  for (int i = 0; i < NFREE; i++) pthread_join(tf[i], NULL);
+  // drain
+  void* p; while (atomic_load(&ring_tail) < atomic_load(&ring_head) && (p = pop(), 1)) { if (p) mi_free(p); }
+  for (unsigned i = 0; i < RING; i++) { void* q = atomic_exchange(&ring[i], NULL); if (q) mi_free(q); }
+  mi_collect(true);
+  printf("test-heap-release-mt: ok (heaps=%lu frees=%lu thread-exits=%lu)\n", (unsigned long)heaps_done, (unsigned long)frees_done, (unsigned long)exits_done);
+  return 0;
+}
+
+#endif

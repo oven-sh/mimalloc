@@ -2640,7 +2640,10 @@ static bool mi_heap_visit_page(mi_page_t* page, mi_heap_visit_info_t* vinfo) {
 // owned we give the bit back and retry; once we own it nobody else can free it and the bit goes back too.
 // This is the same protocol the abandoned-page map uses (`mi_arena_try_claim_abandoned`,
 // `mi_arena_page_purge_holes_at` against `_mi_arenas_page_unabandon`).
-// Returns `true` if we own the page, `false` if it is gone.
+// The page struct is only located (`mi_arena_page_at_slice`, which reads `block_size` with separated page
+// meta) once the slice is pinned: before that a concurrent `mi_free` may be freeing the page and the slice
+// may already be a fresh page of another heap.
+// Returns the page if we own it, or NULL if it is gone.
 #if MI_DEBUG > 0
 mi_decl_export _Atomic(uintptr_t) mi_debug_stall_in_heap_delete_claim;   // test hook (test-heap-teardown): stall while a page is pinned but not yet claimed
 #endif
@@ -2651,11 +2654,13 @@ static void mi_heap_visit_page_seize(mi_page_t* page) {
   mi_page_set_theap(page, NULL);
 }
 
-static bool mi_heap_visit_page_claim(mi_heap_visit_info_t* vinfo, mi_page_t* page, size_t slice_index) {
+static mi_page_t* mi_heap_visit_page_claim(mi_heap_visit_info_t* vinfo, mi_arena_t* arena, size_t slice_index) {
   mi_bitmap_t* const pages = vinfo->arena_pages->pages;
+  mi_page_t* page = NULL;
   for (;;) {
-    if (!mi_bitmap_clear(pages, slice_index)) return false;   // freed by a concurrent `mi_free`
-    // pinned
+    if (!mi_bitmap_clear(pages, slice_index)) return NULL;   // freed by a concurrent `mi_free`
+    // pinned: now it is a page of this heap and stays one while we hold the bit
+    page = mi_arena_page_at_slice(arena, slice_index);
     #if MI_DEBUG > 0
     if (mi_atomic_load_acquire(&mi_debug_stall_in_heap_delete_claim) == 1) {
       mi_atomic_store_release(&mi_debug_stall_in_heap_delete_claim, (uintptr_t)2);  // signal: pinned, not yet claimed
@@ -2666,8 +2671,8 @@ static bool mi_heap_visit_page_claim(mi_heap_visit_info_t* vinfo, mi_page_t* pag
       // After a multi-threaded fork() the child may inherit a torn snapshot of a page that another
       // thread was allocating or freeing: the bit propagated but the page-map entry or the owned bit
       // did not, and that thread is gone. Re-derive what we can and take the page.
-      if (mi_page_start(page) == NULL) return false;  // the page struct never made it across: leave it unpublished
-      if (_mi_safe_ptr_page(mi_page_start(page)) != page && !_mi_page_map_register(page)) return false;
+      if (mi_page_start(page) == NULL) return NULL;  // the page struct never made it across: leave it unpublished
+      if (_mi_safe_ptr_page(mi_page_start(page)) != page && !_mi_page_map_register(page)) return NULL;
       mi_page_claim_ownership(page);   // ours now, whether or not the dead thread held it
       mi_bitmap_set(pages, slice_index);
       if (!mi_page_is_abandoned(page)) { mi_heap_visit_page_seize(page); }
@@ -2693,15 +2698,19 @@ static bool mi_heap_visit_page_claim(mi_heap_visit_info_t* vinfo, mi_page_t* pag
   mi_assert_internal(mi_page_is_owned(page) && mi_page_is_abandoned(page));
   mi_assert_internal(mi_bitmap_is_set(pages, slice_index));
   mi_assert_internal(_mi_ptr_page(mi_page_start(page)) == page && mi_page_heap(page) == vinfo->heap);
-  return true;
+  return page;
 }
 
 static bool mi_heap_visit_page_at(size_t slice_index, size_t slice_count, mi_arena_t* arena, void* arg) {
   MI_UNUSED(slice_count);
   mi_heap_visit_info_t* vinfo = (mi_heap_visit_info_t*)arg;
-  mi_page_t* page = mi_arena_page_at_slice(arena, slice_index);
+  mi_page_t* page;
   if (vinfo->claim_pages) {
-    if (!mi_heap_visit_page_claim(vinfo, page, slice_index)) return true;
+    page = mi_heap_visit_page_claim(vinfo, arena, slice_index);
+    if (page == NULL) return true;  // gone: freed by a concurrent `mi_free`
+  }
+  else {
+    page = mi_arena_page_at_slice(arena, slice_index);
   }
   return mi_heap_visit_page(page, vinfo);
 }
