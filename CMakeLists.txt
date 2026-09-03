@@ -923,6 +923,7 @@ if (MI_BUILD_TESTS)
 
   # with no scavenger to hand off to, `mi_on_thread_idle_start` must do the work inline instead
   add_test(NAME test-park-handoff-no-scavenger COMMAND ${CMAKE_COMMAND} -E env MIMALLOC_SCAVENGER=0 $<TARGET_FILE:mimalloc-test-park-handoff>)
+  add_test(NAME test-heap-release-mt-no-scavenger COMMAND ${CMAKE_COMMAND} -E env MIMALLOC_SCAVENGER=0 $<TARGET_FILE:mimalloc-test-heap-release-mt>)
   # and sweep every park, so the reclaim path is hit as hard as possible
   add_test(NAME test-park-handoff-eager COMMAND ${CMAKE_COMMAND} -E env MIMALLOC_PURGE_HOLES_MIN_INTERVAL=0 $<TARGET_FILE:mimalloc-test-park-handoff>)
 
