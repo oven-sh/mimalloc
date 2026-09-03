@@ -628,6 +628,7 @@ typedef struct mi_heap_s {
   mi_lock_t             theaps_lock;                    // lock for the theaps list operations
 
   _Atomic(size_t)       abandoned_count[MI_BIN_COUNT];  // total count of abandoned pages in this heap
+  _Atomic(uintptr_t)    releasing;                      // set when `mi_heap_delete`/`mi_heap_destroy` starts: its pages are abandoned unmapped
   mi_page_t*            os_abandoned_pages;             // list of pages that are OS allocated and not in an arena
   mi_lock_t             os_abandoned_pages_lock;        // lock for the os abandoned pages list (this lock protects list operations)
 

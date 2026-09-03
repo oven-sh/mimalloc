@@ -181,6 +181,10 @@ mi_heap_t* mi_heap_new(void) {
 static void mi_heap_release_pages(mi_heap_t* heap, mi_heap_t* heap_target) {
   _mi_heap_detach_theaps(heap);
   if (_mi_is_heap_main(heap)) return;  // (`_mi_heap_force_destroy` of a main heap at sub-process teardown: the arenas go as a whole)
+  // Step 3 claims every page through the `arena_pages->pages` bitmap, so the pages abandoned in step 2
+  // do not need to be findable by size class: `_mi_arenas_page_abandon` leaves them out of the
+  // per-bin abandoned maps, which are then never allocated for a heap that only lives to be released.
+  mi_atomic_store_release(&heap->releasing, (uintptr_t)1);
   mi_lock(&heap->theaps_lock) {
     for (mi_theap_t* theap = heap->theaps; theap != NULL; theap = theap->hnext) {
       mi_assert_internal(_mi_theap_heap_peek(theap)==NULL);

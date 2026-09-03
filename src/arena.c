@@ -1211,8 +1211,9 @@ void _mi_arenas_page_abandon(mi_page_t* page, mi_theap_t* current_theapx) {
   // mi_assert_internal(current_theap == _mi_page_associated_theap(page));
 
   // add to abandoned?
+  // (not for a heap that is being released: its teardown claims every page through `pages`, see `mi_heap_release_pages`)
   mi_heap_t* heap = mi_page_heap(page);   
-  if (page->memid.memkind==MI_MEM_ARENA && !mi_page_is_full(page)) {
+  if (page->memid.memkind==MI_MEM_ARENA && !mi_page_is_full(page) && mi_atomic_load_relaxed(&heap->releasing) == 0) {
     // make available for allocations
     size_t bin = _mi_bin(mi_page_block_size(page));
     mi_assert_internal(bin < MI_ARENA_BIN_COUNT);
@@ -1271,6 +1272,9 @@ bool _mi_arenas_page_try_reabandon_to_mapped(mi_page_t* page) {
   mi_assert_internal(!mi_page_is_singleton(page));
   if (mi_page_is_full(page) || mi_page_is_abandoned_mapped(page) || page->memid.memkind != MI_MEM_ARENA) {
     return false;
+  }
+  else if (mi_atomic_load_relaxed(&mi_page_heap(page)->releasing) != 0) {
+    return false;  // the heap is being released and claims the page through `pages` (see `mi_heap_release_pages`)
   }
   else {
     // Account on the heap and not on this thread's theap for it (`_mi_page_associated_theap_peek`): the theap
@@ -1728,6 +1732,10 @@ static mi_bitmap_t* mi_arena_pages_abandoned(mi_arena_pages_t* arena_pages, size
 // foreign free re-abandoning a page), where allocating from a regular heap is not. Publishing
 // is a CAS so no lock is needed: a loser frees its copy and uses the winner's. Returns NULL only
 // if the allocation failed.
+#if MI_DEBUG > 0
+mi_decl_export _Atomic(uintptr_t) mi_debug_abandoned_maps_allocated;   // test hook (test-abandoned-lazy): per-bin abandoned maps published so far
+#endif
+
 static mi_bitmap_t* mi_arena_pages_abandoned_ensure(mi_arena_t* arena, mi_arena_pages_t* arena_pages, size_t bin) {
   mi_bitmap_t* bitmap = mi_arena_pages_abandoned(arena_pages, bin);
   if mi_likely(bitmap != NULL) return bitmap;
@@ -1738,6 +1746,9 @@ static mi_bitmap_t* mi_arena_pages_abandoned_ensure(mi_arena_t* arena, mi_arena_
   mi_bitmap_init(fresh, slice_count, true /* already zero */);
   mi_bitmap_t* expected = NULL;
   if (mi_atomic_cas_ptr_strong_acq_rel(mi_bitmap_t, &arena_pages->pages_abandoned[bin], &expected, fresh)) {
+    #if MI_DEBUG > 0
+    mi_atomic_increment_relaxed(&mi_debug_abandoned_maps_allocated);
+    #endif
     return fresh;
   }
   // another thread published one first
@@ -1750,6 +1761,7 @@ static mi_bitmap_t* mi_arena_pages_abandoned_ensure(mi_arena_t* arena, mi_arena_
 // the `arena_pages` allocation itself).
 static void mi_arena_pages_free_abandoned(mi_arena_pages_t* arena_pages) {
   for (size_t bin = 0; bin < MI_ARENA_BIN_COUNT; bin++) {
+    if (mi_atomic_load_ptr_relaxed(mi_bitmap_t, &arena_pages->pages_abandoned[bin]) == NULL) continue;  // the common case
     mi_bitmap_t* bitmap = mi_atomic_exchange_ptr_acq_rel(mi_bitmap_t, &arena_pages->pages_abandoned[bin], NULL);
     if (bitmap != NULL) { _mi_free_subproc_safe(bitmap); }
   }

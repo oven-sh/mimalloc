@@ -17,6 +17,15 @@ terms of the MIT license.
    - the same with the main heap, whose bitmaps are never freed, and with blocks
      freed by a thread that never allocated (re-abandon of a mostly free page).
 
+   A heap that is deleted or destroyed abandons all of its pages during its own
+   teardown, which claims them back through the `pages` bitmap. Those pages are
+   not mapped, so a heap that lives only to be released never allocates a map:
+
+   - a debug build counts the maps allocated while heaps are created, used and
+     destroyed on one thread, and the count must not move;
+   - several threads create, use and delete heaps while other threads free the
+     blocks of each heap during its delete (a free that would re-map a page).
+
    A debug build checks the bitmap invariants on each of these paths.
 
    > mimalloc-test-abandoned-lazy [ITER]
@@ -125,6 +134,116 @@ static void run_round(bool use_main_heap) {
   }
 }
 
+/* -----------------------------------------------------------
+   Released heaps: no maps
+----------------------------------------------------------- */
+
+#if !defined(NDEBUG)
+#ifdef __cplusplus
+#include <atomic>
+extern "C" std::atomic<uintptr_t> mi_debug_abandoned_maps_allocated;
+static uintptr_t maps_allocated(void) { return mi_debug_abandoned_maps_allocated.load(); }
+#else
+#include <stdatomic.h>
+extern _Atomic(uintptr_t) mi_debug_abandoned_maps_allocated;
+static uintptr_t maps_allocated(void) { return atomic_load(&mi_debug_abandoned_maps_allocated); }
+#endif
+#define HAS_MAP_COUNTER 1
+#else
+#define HAS_MAP_COUNTER 0
+#endif
+
+static void fill_heap(mi_heap_t* heap, void** keep) {
+  for (int s = 0; s < NSIZES; s++) {
+    for (int b = 0; b < NBLOCKS; b++) {
+      void* p = mi_heap_malloc(heap, sizes[s]);
+      if (p == NULL) { fprintf(stderr, "allocation failed\n"); abort(); }
+      memset(p, s + 1, sizes[s]);
+      if (keep != NULL) { keep[s*NBLOCKS + b] = p; }
+    }
+  }
+}
+
+static void released_heaps_map_nothing(void) {
+  static void* keep[NSIZES*NBLOCKS];
+  // one delete first: the main heap takes the moved pages and maps them, and its maps stay
+  mi_heap_t* heap = mi_heap_new();
+  fill_heap(heap, keep);
+  mi_heap_delete(heap);
+  for (int i = 0; i < NSIZES*NBLOCKS; i++) { mi_free(keep[i]); }
+
+  #if HAS_MAP_COUNTER
+  const uintptr_t before = maps_allocated();
+  #endif
+  for (int n = 0; n < 50; n++) {
+    heap = mi_heap_new();
+    fill_heap(heap, NULL);
+    mi_heap_destroy(heap);
+
+    heap = mi_heap_new();
+    fill_heap(heap, keep);
+    mi_heap_delete(heap);   // the blocks now belong to the main heap
+    for (int i = 0; i < NSIZES*NBLOCKS; i++) { mi_free(keep[i]); }
+  }
+  #if HAS_MAP_COUNTER
+  const uintptr_t after = maps_allocated();
+  if (after != before) {
+    fprintf(stderr, "released heaps allocated %lu abandoned maps\n", (unsigned long)(after - before));
+    abort();
+  }
+  #endif
+}
+
+/* -----------------------------------------------------------
+   Concurrent delete: blocks freed by another thread while their heap is deleted
+----------------------------------------------------------- */
+
+#define NPAIRS   4       // a deleter and a freer each
+#define DBLOCKS  8       // per size: the pages stay mostly free, so a free would re-map them
+
+static void* atomic_exchange_ptr(volatile void** p, void* newval);
+static long  atomic_load_long(volatile long* p);
+static void  atomic_store_long(volatile long* p, long x);
+
+static volatile void* dslots[NPAIRS][NSIZES*DBLOCKS];
+static volatile long  dgo[NPAIRS];
+static volatile long  ddone[NPAIRS];
+static int            dround_count;
+
+static void delete_pair(intptr_t tid) {
+  const int pair = (int)(tid / 2);
+  if ((tid % 2) == 0) {
+    // deleter: allocate, let the freer start, and delete while it frees
+    for (int r = 1; r <= dround_count; r++) {
+      mi_heap_t* heap = mi_heap_new();
+      for (int s = 0; s < NSIZES; s++) {
+        for (int b = 0; b < DBLOCKS; b++) {
+          void* p = mi_heap_malloc(heap, sizes[s]);
+          if (p == NULL) { fprintf(stderr, "allocation failed\n"); abort(); }
+          memset(p, s + 1, sizes[s]);
+          atomic_exchange_ptr(&dslots[pair][s*DBLOCKS + b], p);
+        }
+      }
+      atomic_store_long(&dgo[pair], r);
+      mi_heap_delete(heap);
+      while (atomic_load_long(&ddone[pair]) != r) { /* spin */ }
+    }
+  }
+  else {
+    // freer: never allocates from the heap, so it may free into it during the delete
+    for (int r = 1; r <= dround_count; r++) {
+      while (atomic_load_long(&dgo[pair]) != r) { /* spin */ }
+      for (int i = 0; i < NSIZES*DBLOCKS; i++) {
+        unsigned char* p = (unsigned char*)atomic_exchange_ptr(&dslots[pair][i], NULL);
+        if (p == NULL) { fprintf(stderr, "missing block\n"); abort(); }
+        if (p[0] != (unsigned char)(i / DBLOCKS + 1)) { fprintf(stderr, "block corrupted\n"); abort(); }
+        mi_free(p);
+      }
+      atomic_store_long(&ddone[pair], r);
+    }
+  }
+}
+
 int main(int argc, char** argv) {
   if (argc >= 2) {
     char* end;
@@ -135,6 +254,9 @@ int main(int argc, char** argv) {
     run_round(false);
     run_round(true);
   }
+  released_heaps_map_nothing();
+  dround_count = ITER;
+  run_os_threads(NPAIRS*2, &delete_pair);
   printf("test-abandoned-lazy: %d rounds, ok\n", ITER);
   mi_stats_print(NULL);
   return 0;
@@ -173,6 +295,20 @@ static void run_os_threads(size_t nthreads, thread_entry_fun_t* fun) {
   free(thandles);
 }
 
+static void* atomic_exchange_ptr(volatile void** p, void* newval) {
+  #if (INTPTR_MAX == INT32_MAX)
+  return (void*)InterlockedExchange((volatile LONG*)p, (LONG)newval);
+  #else
+  return (void*)InterlockedExchange64((volatile LONG64*)p, (LONG64)newval);
+  #endif
+}
+static long atomic_load_long(volatile long* p) {
+  return InterlockedCompareExchange(p, 0, 0);
+}
+static void atomic_store_long(volatile long* p, long x) {
+  InterlockedExchange(p, x);
+}
+
 #else
 
 #include <pthread.h>
@@ -196,5 +332,29 @@ static void run_os_threads(size_t nthreads, thread_entry_fun_t* fun) {
   }
   free(threads);
 }
+
+#ifdef __cplusplus
+#include <atomic>
+static void* atomic_exchange_ptr(volatile void** p, void* newval) {
+  return std::atomic_exchange((volatile std::atomic<void*>*)p, newval);
+}
+static long atomic_load_long(volatile long* p) {
+  return std::atomic_load((volatile std::atomic<long>*)p);
+}
+static void atomic_store_long(volatile long* p, long x) {
+  std::atomic_store((volatile std::atomic<long>*)p, x);
+}
+#else
+#include <stdatomic.h>
+static void* atomic_exchange_ptr(volatile void** p, void* newval) {
+  return atomic_exchange((volatile _Atomic(void*)*)p, newval);
+}
+static long atomic_load_long(volatile long* p) {
+  return atomic_load((volatile _Atomic(long)*)p);
+}
+static void atomic_store_long(volatile long* p, long x) {
+  atomic_store((volatile _Atomic(long)*)p, x);
+}
+#endif
 
 #endif
