@@ -277,6 +277,7 @@ void          _mi_arenas_abandoned_page_free(mi_page_t* page, mi_theap_t* curren
 void          _mi_arenas_page_abandon(mi_page_t* page, mi_theap_t* current_theap);
 void          _mi_arenas_page_unabandon(mi_page_t* page, mi_theap_t* current_theapx /* can be NULL */);
 bool          _mi_arenas_page_try_reabandon_to_mapped(mi_page_t* page);
+void          _mi_arena_pages_free(mi_arena_pages_t* arena_pages);
 size_t        mi_arenas_get_count(mi_subproc_t* subproc);
 uint8_t*      mi_arena_slice_start(mi_arena_t* arena, size_t slice_index);
 
@@ -356,6 +357,7 @@ extern "C" {
 #endif
 extern mi_decl_export _Atomic(uintptr_t) mi_debug_stall_in_thread_theaps_done;
 extern mi_decl_export _Atomic(uintptr_t) mi_debug_stall_in_heap_delete_claim;
+extern mi_decl_export _Atomic(uintptr_t) mi_debug_abandoned_maps_allocated;
 extern mi_decl_export volatile long      mi_debug_fail_os_commit_after;
 #ifdef __cplusplus
 }

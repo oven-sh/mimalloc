@@ -660,7 +660,8 @@ if(MI_USE_CXX)
   set_source_files_properties(src/static.c test/test-api.c test/test-api-fill.c test/test-stress.c test/test-stress-heaps.c  test/test-stress-subprocs.c PROPERTIES LANGUAGE CXX )
   # the white-box tests call internal functions, whose names are mangled now; the heap tests use C11 atomics, which MSVC lacks in C mode
   set_source_files_properties(test/test-theap-sentinel.c test/test-purge-holes.c test/test-commit-fail.c
-                              test/test-heap-aba.c test/test-heap-delete-race.c test/test-heap-teardown.c PROPERTIES LANGUAGE CXX )
+                              test/test-heap-aba.c test/test-heap-delete-race.c test/test-heap-teardown.c
+                              test/test-abandoned-lazy.c PROPERTIES LANGUAGE CXX )
 endif()
 
 
@@ -877,7 +878,7 @@ if (MI_BUILD_TESTS)
   enable_testing()
 
   # static link tests
-  set(mi_static_tests api api-fill stress-heaps stress-subprocs stress heap-mt heap-teardown heap-delete-race heap-churn heap-aba heap-burst-destroy fork-user-heap snapshot prof prof-adversarial purge-zero park-handoff free-before-init)
+  set(mi_static_tests api api-fill stress-heaps stress-subprocs stress heap-mt heap-teardown heap-delete-race heap-churn heap-release-mt heap-aba heap-burst-destroy abandoned-lazy fork-user-heap snapshot prof prof-adversarial purge-zero park-handoff free-before-init)
   if(NOT (MI_DEBUG_TSAN OR MI_TRACK_ASAN OR MI_DEBUG_UBSAN))
     list(APPEND mi_static_tests thp-optout)  # counts madvise calls by interposing it, which a sanitizer runtime does first
   endif()
@@ -923,6 +924,7 @@ if (MI_BUILD_TESTS)
 
   # with no scavenger to hand off to, `mi_on_thread_idle_start` must do the work inline instead
   add_test(NAME test-park-handoff-no-scavenger COMMAND ${CMAKE_COMMAND} -E env MIMALLOC_SCAVENGER=0 $<TARGET_FILE:mimalloc-test-park-handoff>)
+  add_test(NAME test-heap-release-mt-no-scavenger COMMAND ${CMAKE_COMMAND} -E env MIMALLOC_SCAVENGER=0 $<TARGET_FILE:mimalloc-test-heap-release-mt>)
   # and sweep every park, so the reclaim path is hit as hard as possible
   add_test(NAME test-park-handoff-eager COMMAND ${CMAKE_COMMAND} -E env MIMALLOC_PURGE_HOLES_MIN_INTERVAL=0 $<TARGET_FILE:mimalloc-test-park-handoff>)
 
