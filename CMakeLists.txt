@@ -660,7 +660,8 @@ if(MI_USE_CXX)
   set_source_files_properties(src/static.c test/test-api.c test/test-api-fill.c test/test-stress.c test/test-stress-heaps.c  test/test-stress-subprocs.c PROPERTIES LANGUAGE CXX )
   # the white-box tests call internal functions, whose names are mangled now; the heap tests use C11 atomics, which MSVC lacks in C mode
   set_source_files_properties(test/test-theap-sentinel.c test/test-purge-holes.c test/test-commit-fail.c
-                              test/test-heap-aba.c test/test-heap-delete-race.c test/test-heap-teardown.c PROPERTIES LANGUAGE CXX )
+                              test/test-heap-aba.c test/test-heap-delete-race.c test/test-heap-teardown.c
+                              test/test-abandoned-lazy.c PROPERTIES LANGUAGE CXX )
 endif()
 
 
