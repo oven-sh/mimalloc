@@ -35,6 +35,13 @@ static void (*mi_test_preinit)(void) = &free_null_before_init;
 #elif defined(__GNUC__) || defined(__clang__)
 __attribute__((constructor))
 static void free_null_before_init_ctor(void) { free_null_before_init(); }
+#elif defined(_MSC_VER)
+// MSVC has no constructor attribute: put a pointer in the CRT's C initializer section, which the
+// startup code walks before `main` (and, for a static mimalloc, in no guaranteed order relative
+// to mimalloc's own initializer there -- the same caveat as the constructor above).
+#pragma section(".CRT$XCU", read)
+static void __cdecl free_null_before_init_ctor(void) { free_null_before_init(); }
+__declspec(allocate(".CRT$XCU")) void (__cdecl* mi_test_free_before_init_ctor)(void) = &free_null_before_init_ctor;
 #endif
 
 int main(void) {

@@ -357,6 +357,7 @@ extern "C" {
 #endif
 extern mi_decl_export _Atomic(uintptr_t) mi_debug_stall_in_thread_theaps_done;
 extern mi_decl_export _Atomic(uintptr_t) mi_debug_stall_in_heap_delete_claim;
+extern mi_decl_export _Atomic(uintptr_t) mi_debug_abandoned_maps_allocated;
 extern mi_decl_export volatile long      mi_debug_fail_os_commit_after;
 #ifdef __cplusplus
 }
