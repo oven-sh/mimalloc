@@ -334,6 +334,10 @@ static bool mi_arena_reserve(mi_subproc_t* subproc, size_t req_size, bool allow_
   if (!_mi_os_has_virtual_reserve()) {
     arena_reserve = arena_reserve/4;  // be conservative if virtual reserve is not supported (for WASM for example)
   }
+  const size_t virtual_limit = _mi_os_virtual_address_limit();
+  if (virtual_limit > 0 && arena_reserve > virtual_limit/4) {
+    arena_reserve = virtual_limit/4;  // when the address space is limited (RLIMIT_AS) the reservation counts towards it; leave room for other mappings
+  }
   arena_reserve = _mi_align_up(arena_reserve, MI_ARENA_SLICE_SIZE);
 
   if (arena_count >= 1 && arena_count <= 128) {
