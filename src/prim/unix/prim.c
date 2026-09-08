@@ -29,6 +29,7 @@ terms of the MIT license. A copy of the license can be found in the file
 #include <sched.h>     // sched_yield
 #include <fcntl.h>     // open, close, read, access
 #include <stdlib.h>    // getenv, arc4random_buf
+#include <sys/resource.h> // getrlimit
 
 #if defined(__linux__)
   #include <features.h>
@@ -261,6 +262,18 @@ static size_t unix_detect_virtual_address_bits(void) {
   return MI_MAX_VABITS;
 }
 
+// RLIMIT_AS (`ulimit -v`) caps the address space of the process, and reserved (PROT_NONE or
+// MAP_NORESERVE) memory counts towards it. macOS does not enforce it for mmap.
+static size_t unix_detect_virtual_address_limit(void) {
+  #if !defined(__APPLE__)
+  struct rlimit limit;
+  if (getrlimit(RLIMIT_AS, &limit) == 0 && limit.rlim_cur != RLIM_INFINITY && limit.rlim_cur < SIZE_MAX) {
+    return (size_t)limit.rlim_cur;
+  }
+  #endif
+  return 0;
+}
+
 void _mi_prim_mem_init( mi_os_mem_config_t* config )
 {
   long psize = sysconf(_SC_PAGESIZE);
@@ -275,6 +288,7 @@ void _mi_prim_mem_init( mi_os_mem_config_t* config )
   config->has_virtual_reserve = true; // todo: check if this true for NetBSD?  (for anonymous mmap with PROT_NONE)
   config->has_transparent_huge_pages = unix_detect_thp();
   config->virtual_address_bits = unix_detect_virtual_address_bits();
+  config->virtual_address_limit = unix_detect_virtual_address_limit();
 
   // With THP disallowed, mimalloc's mappings opt out individually via MADV_NOHUGEPAGE in
   // `unix_mmap` -- not prctl(PR_SET_THP_DISABLE), which is process-wide and inherited across
