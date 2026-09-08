@@ -262,6 +262,7 @@ void          _mi_thread_locals_thread_done(void);
 mi_arena_id_t _mi_arena_id_none(void);
 mi_arena_t*   _mi_arena_from_id(mi_arena_id_t id);
 bool          _mi_arena_memid_is_suitable(mi_memid_t memid, mi_arena_t* request_arena);
+size_t        _mi_arenas_max_object_size(void);
 
 void*         _mi_arenas_alloc(mi_heap_t* heap, size_t size, bool commit, bool allow_pinned, mi_arena_t* req_arena, size_t tseq, int numa_node, mi_memid_t* memid);
 void*         _mi_arenas_alloc_aligned(mi_heap_t* heap, size_t size, size_t alignment, size_t align_offset, bool commit, bool allow_pinned, mi_arena_t* req_arena, size_t tseq, int numa_node, mi_memid_t* memid);

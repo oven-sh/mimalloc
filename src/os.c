@@ -119,7 +119,7 @@ bool _mi_os_commit(mi_subproc_t* subproc, void* addr, size_t size, bool* is_zero
 // Return a MI_HINT_ALIGN (4MiB) aligned address that is probably available.
 // If this returns NULL, the OS will determine the address but on some OS's that may not be
 // properly aligned which can be more costly as it needs to be adjusted afterwards.
-// In secure mode, for a size > 16GiB this always returns NULL in order to guarantee good ASLR randomization;
+// For a size above `arena_max_object_size` (2GiB) this always returns NULL (see below), which also keeps ASLR effective;
 // (otherwise an initial large allocation of say 2TiB has a 50% chance to include (known) addresses
 //  in the middle of the 2TiB - 6TiB address range (see issue #372))
 
@@ -135,10 +135,15 @@ void* _mi_os_get_aligned_hint(size_t try_alignment, size_t size)
   // todo: perhaps only do alignment hints if THP is enabled?
   if (try_alignment <= mi_os_mem_config.alloc_granularity || try_alignment > MI_HINT_ALIGN) return NULL;
   if (mi_os_mem_config.virtual_address_bits < 46) return NULL;  // < 64TiB virtual address space
+  // Hinted address space is handed out once and never comes back, and every 512 MiB of it that a page
+  // starts in pins a 64 KiB page-map submap for the life of the process (`mi_page_map_alloc_submap_at`).
+  // That is fine for arena reservations, which are kept and reused. An object too large for an arena
+  // however is mapped from the OS by its `malloc` and unmapped by its `free`: with a hint, every such
+  // cycle starts in address space the page map has not seen and leaves one more submap behind.
+  // Let the OS place those; it hands back the range that was just unmapped, and with it the submap
+  // that already covers it. (v1 and v2 drew this line at 1 GiB, to keep hinted addresses unpredictable, issue #372.)
+  if (size > _mi_arenas_max_object_size()) return NULL;
   size = _mi_align_up(size, MI_HINT_ALIGN);
-  #if (MI_SECURE>=1)
-  if (size > 16*MI_GiB) return NULL;  // guarantee the chance of fixed valid address is at most 1/(MI_HINT_AREA / 1<<34) = 1/256
-  #endif
   size += MI_HINT_ALIGN;              // put in virtual gaps between hinted blocks; this splits VLA's but increases guarded areas.
 
   uintptr_t hint = mi_atomic_add_acq_rel(&aligned_base, size);

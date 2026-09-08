@@ -101,7 +101,8 @@ size_t mi_arena_min_size(void) {
   return MI_ARENA_MIN_SIZE;
 }
 
-static size_t mi_arena_max_object_size(void) {
+// The largest object an arena serves; anything larger is mapped from the OS per object (also see `_mi_os_get_aligned_hint`).
+size_t _mi_arenas_max_object_size(void) {
   size_t max_size = mi_option_get_size(mi_option_arena_max_object_size);
   max_size = _mi_align_up(max_size, MI_ARENA_SLICE_SIZE);
   if (max_size <= MI_ARENA_MIN_OBJ_SIZE) {
@@ -586,7 +587,7 @@ void* _mi_arenas_alloc_aligned( mi_heap_t* heap,
 
   // try to allocate in an arena if the alignment is small enough and the object is not too small (as for theap meta data)
   if (!mi_option_is_enabled(mi_option_disallow_arena_alloc) &&                // is arena allocation allowed?
-      size >= MI_ARENA_MIN_OBJ_SIZE && size <= mi_arena_max_object_size() &&  // and not too small or too large
+      size >= MI_ARENA_MIN_OBJ_SIZE && size <= _mi_arenas_max_object_size() &&  // and not too small or too large
       alignment <= MI_ARENA_SLICE_ALIGN && align_offset == 0)                 // and good alignment
   {
     const size_t slice_count = mi_slice_count_of_size(size);
@@ -779,7 +780,7 @@ static uint8_t* mi_arenas_page_alloc_fresh_area(mi_theap_t* theap, size_t slice_
   const size_t alloc_size = mi_size_of_slices(slice_count);
   if (!mi_option_is_enabled(mi_option_disallow_arena_alloc) &&       // allowed to allocate from arena's?
       !os_align &&                                                   // not large alignment
-      slice_count <= mi_arena_max_object_size()/MI_ARENA_SLICE_SIZE) // and not too large
+      slice_count <= _mi_arenas_max_object_size()/MI_ARENA_SLICE_SIZE) // and not too large
   {
     start = (uint8_t*)mi_arenas_try_alloc(heap, slice_count, page_alignment, commit, allow_large, req_arena, tld->thread_seq, numa_node, memid);
     if (start != NULL) {
