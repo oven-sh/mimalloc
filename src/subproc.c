@@ -189,6 +189,13 @@ mi_subproc_id_t mi_subproc_new(void) {
   mi_assert_internal(parent->theap_meta->tld!=NULL);
   mi_assert_internal(parent->theap_meta->tld->thread_id == MI_THREADID_DETACHED);
   _mi_theap_init(theap_meta,heap_main,parent->theap_meta->tld /* detached tld */);
+  // as for the meta theap of the main sub-process (`init.c:mi_heap_main_init_once`): it is not shared with other threads.
+  // (abandoning one of its pages would also allocate the per-bin abandoned bitmap (`arena.c:mi_arena_pages_abandoned_ensure`)
+  //  from the meta theap itself, under the `theap_meta_lock` that the allocation that filled the page still holds)
+  theap_meta->allow_page_abandon = false;
+  theap_meta->page_full_retain = 2;
+  theap_meta->sample_rate = 0;        // no sampling for meta data
+  theap_meta->sample_countdown = 0;
   subproc->theap_meta = theap_meta;
 
   return _mi_subproc_to_id(subproc);
