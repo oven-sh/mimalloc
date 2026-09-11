@@ -530,8 +530,7 @@ void _mi_thread_done(mi_theap_t* _theap_main)
   // get the current tld
   mi_tld_t* const tld = _theap_main->tld;
 
-  // release dynamic thread_local's
-  _mi_thread_locals_thread_done();
+  // (the dynamic thread_local's are released below, after the park leave)
 
   // adjust stats
   mi_subproc_stat_decrease(tld->subproc, threads, 1);  // todo: or `_theap_main->heap`?
