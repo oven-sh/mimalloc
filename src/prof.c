@@ -8,16 +8,22 @@ terms of the MIT license. A copy of the license can be found in the file
 // Sampling heap profiler that emits pprof's profile.proto format so the
 // output can be read directly by `go tool pprof`, Polar Signals, etc.
 //
-// Design: zero overhead on the malloc/free fast paths when profiling is
-// disabled at runtime. When enabled:
-//   - `theap->prof_force_slow` poisons `pages_free_direct` so every malloc
-//     routes through `_mi_malloc_generic`, where the byte countdown lives.
+// Design: nothing is added to any path a program takes while profiling is
+// off, fast or generic; everything hangs off branches that were already there
+// and already cold. When enabled, per theap:
+//   - `pages_free_direct` is poisoned (and kept so by pointing
+//     `pages_free_direct_update` at a scratch array) and `generic_count` is
+//     saturated, so every malloc reaches the once-in-a-thousand administrative
+//     branch of `_mi_malloc_generic`, which hands it to `mi_malloc_generic_prof`
+//     (page.c), where the byte countdown lives.
 //   - sampled blocks set `MI_PAGE_HAS_PROF_SAMPLES` on their page so frees
-//     route through the existing generic-free path, which calls `_mi_prof_free`.
+//     route through the existing generic-free path (its test for interior
+//     pointers tests this flag too), which calls `_mi_prof_free`.
 //
-// Samples are stored in a flat array (so allocation totals survive frees) plus
-// an open-addressed hash map from block address -> sample index for inuse
-// tracking. Backtraces are deduplicated at dump time.
+// Samples are aggregated per call stack (allocation totals and in-use totals),
+// plus an open-addressed hash map from block address -> stack for the sampled
+// blocks that are still live. Memory is bounded by the number of distinct
+// stacks and the number of live sampled blocks, not by how long profiling runs.
 
 #if defined(__linux__) && !defined(_GNU_SOURCE)
 #define _GNU_SOURCE   // dl_iterate_phdr / struct dl_phdr_info (must precede the first libc header)
@@ -35,6 +41,7 @@ terms of the MIT license. A copy of the license can be found in the file
   #define mi_prof_write(fd,buf,n)  _write(fd,buf,(unsigned)(n))
   #define mi_prof_open(p)          _open(p, _O_WRONLY|_O_CREAT|_O_TRUNC|_O_BINARY, 0644)
   #define mi_prof_close(fd)        _close(fd)
+  #define mi_prof_getpid()         ((unsigned long)GetCurrentProcessId())
 #else
   #include <unistd.h>
   #include <fcntl.h>
@@ -53,110 +60,186 @@ terms of the MIT license. A copy of the license can be found in the file
   #define mi_prof_write(fd,buf,n)  write(fd,buf,n)
   #define mi_prof_open(p)          open(p, O_WRONLY|O_CREAT|O_TRUNC, 0644)
   #define mi_prof_close(fd)        close(fd)
+  #define mi_prof_getpid()         ((unsigned long)getpid())
 #endif
 
 #define MI_PROF_MAX_FRAMES   32
 #define MI_PROF_SKIP_FRAMES  1     // skip backtrace() itself; mimalloc frames are filtered by pprof via mapping
 
-typedef struct mi_prof_sample_s {
-  uintptr_t addr;      // block address (0 once freed; kept for alloc totals)
-  size_t    size;      // requested size
+// One entry per distinct call stack. Values are already scaled by the inverse sampling probability.
+typedef struct mi_prof_stack_s {
+  uint64_t  hash;
+  uint64_t  alloc_objs, alloc_bytes;   // everything sampled at this stack
+  uint64_t  inuse_objs, inuse_bytes;   // the part that has not been freed
   uint8_t   nframes;
   uintptr_t frames[MI_PROF_MAX_FRAMES];
-} mi_prof_sample_t;
+} mi_prof_stack_t;
+
+// A sampled block that is still live.
+typedef struct mi_prof_live_s {
+  uintptr_t addr;      // block address (0 = empty, MI_PROF_TOMBSTONE = removed)
+  uint32_t  stack;     // index into `stacks`
+  uint32_t  objs;      // what this sample added to its stack's in-use totals
+  uint64_t  bytes;
+} mi_prof_live_t;
+
+#define MI_PROF_TOMBSTONE  (~(uintptr_t)0)
 
 typedef struct mi_prof_state_s {
   mi_lock_t          lock;
-  _Atomic(size_t)    rate;        // bytes per sample (0 = disabled); read in _mi_malloc_generic
-  // samples (grow-only)
-  mi_prof_sample_t*  samples;
-  size_t             sample_count;
-  size_t             sample_cap;
-  // open-addressed hash: addr -> sample index+1 (0 = empty, tombstone = ~0)
-  uintptr_t*         ht_keys;
-  uint32_t*          ht_vals;
-  size_t             ht_cap;      // power of two
-  size_t             ht_used;
+  // stacks (grow-only; indices are stable) and an index over them: hash -> stack index+1
+  mi_prof_stack_t*   stacks;
+  size_t             stack_count;
+  size_t             stack_cap;
+  mi_memid_t         stacks_memid;
+  uint32_t*          stack_ht;
+  size_t             stack_ht_cap;   // power of two, kept at most half full
+  mi_memid_t         stack_ht_memid;
+  // open-addressed hash: live sampled block -> stack
+  mi_prof_live_t*    live;
+  size_t             live_cap;       // power of two
+  size_t             live_count;     // live entries
+  size_t             live_used;      // live entries + tombstones
+  mi_memid_t         live_memid;
 } mi_prof_state_t;
 
 static mi_prof_state_t mi_prof;
 
-// ---------------------------------------------------------------------------
-// Hash table (addr -> sample index)
-// ---------------------------------------------------------------------------
+// bytes per sample (0 = disabled); read inline by `_mi_prof_rate` on the generic allocation path
+mi_decl_cache_align _Atomic(size_t) _mi_prof_sample_rate;   // = 0
 
-static inline size_t mi_prof_hash(uintptr_t key, size_t cap) {
-  uint64_t k = (uint64_t)key;  // 64-bit even on 32-bit targets, where `>> 33` on a uintptr_t is undefined
-  k ^= k >> 33; k *= 0xff51afd7ed558ccdull; k ^= k >> 33;
-  return (size_t)(k & (cap - 1));
+// Meta-data comes straight from the OS so the profiler never recurses into mimalloc.
+static void* mi_prof_os_zalloc(size_t size, mi_memid_t* memid) {
+  return _mi_os_zalloc(_mi_subproc_main(), size, memid);
+}
+static void mi_prof_os_free(void* p, size_t size, mi_memid_t memid) {
+  if (p != NULL) _mi_os_free(_mi_subproc_main(), p, size, memid);
 }
 
-static void mi_prof_ht_grow(size_t want);
+// ---------------------------------------------------------------------------
+// Live table (block address -> stack)
+// ---------------------------------------------------------------------------
 
-static void mi_prof_ht_put(uintptr_t key, uint32_t val) {
-  if (mi_prof.ht_used * 4 >= mi_prof.ht_cap * 3) mi_prof_ht_grow(mi_prof.ht_cap * 2);
-  size_t i = mi_prof_hash(key, mi_prof.ht_cap);
-  while (mi_prof.ht_keys[i] != 0 && mi_prof.ht_keys[i] != key) {
-    i = (i + 1) & (mi_prof.ht_cap - 1);
-  }
-  if (mi_prof.ht_keys[i] == 0) mi_prof.ht_used++;
-  mi_prof.ht_keys[i] = key;
-  mi_prof.ht_vals[i] = val;
+static inline size_t mi_prof_hash(uintptr_t k, size_t cap) {
+  uint64_t h = (uint64_t)k;
+  h ^= h >> 33; h *= 0xff51afd7ed558ccdull; h ^= h >> 33;
+  return (size_t)(h & (cap - 1));
 }
 
-static void mi_prof_ht_grow(size_t want) {
-  size_t old_cap = mi_prof.ht_cap;
-  uintptr_t* old_keys = mi_prof.ht_keys;
-  uint32_t*  old_vals = mi_prof.ht_vals;
-  size_t cap = (want < 1024 ? 1024 : want);
-  // use OS memory directly so we don't recurse into mimalloc
+// Rehash into a table sized for the live entries (which drops the tombstones); false on OOM.
+static bool mi_prof_live_rehash(void) {
+  size_t cap = 1024;
+  while (cap < 4 * (mi_prof.live_count + 1)) cap *= 2;
   mi_memid_t memid;
-  uintptr_t* nk = (uintptr_t*)_mi_os_zalloc(_mi_subproc_main(), cap * (sizeof(uintptr_t) + sizeof(uint32_t)), &memid);
-  if (nk == NULL) return;
-  mi_prof.ht_keys = nk;
-  mi_prof.ht_vals = (uint32_t*)(nk + cap);
-  mi_prof.ht_cap  = cap;
-  mi_prof.ht_used = 0;
-  for (size_t i = 0; i < old_cap; i++) {
-    if (old_keys[i] != 0 && old_keys[i] != (uintptr_t)~0ull) {
-      mi_prof_ht_put(old_keys[i], old_vals[i]);
-    }
+  mi_prof_live_t* nl = (mi_prof_live_t*)mi_prof_os_zalloc(cap * sizeof(mi_prof_live_t), &memid);
+  if (nl == NULL) return false;
+  for (size_t i = 0; i < mi_prof.live_cap; i++) {
+    const mi_prof_live_t* e = &mi_prof.live[i];
+    if (e->addr == 0 || e->addr == MI_PROF_TOMBSTONE) continue;
+    size_t h = mi_prof_hash(e->addr, cap);
+    while (nl[h].addr != 0) h = (h + 1) & (cap - 1);
+    nl[h] = *e;
   }
-  // leak old table (process-lifetime; freed at exit by OS)
-  MI_UNUSED(old_keys); MI_UNUSED(old_vals);
+  mi_prof_os_free(mi_prof.live, mi_prof.live_cap * sizeof(mi_prof_live_t), mi_prof.live_memid);
+  mi_prof.live = nl; mi_prof.live_cap = cap; mi_prof.live_memid = memid;
+  mi_prof.live_used = mi_prof.live_count;
+  return true;
 }
 
-static bool mi_prof_ht_remove(uintptr_t key, uint32_t* out_val) {
-  if (mi_prof.ht_cap == 0) return false;
-  size_t i = mi_prof_hash(key, mi_prof.ht_cap);
-  while (mi_prof.ht_keys[i] != 0) {
-    if (mi_prof.ht_keys[i] == key) {
-      if (out_val) *out_val = mi_prof.ht_vals[i];
-      mi_prof.ht_keys[i] = (uintptr_t)~0ull;  // tombstone
-      return true;
-    }
-    i = (i + 1) & (mi_prof.ht_cap - 1);
+static bool mi_prof_live_put(uintptr_t addr, uint32_t stack, uint32_t objs, uint64_t bytes) {
+  if (mi_prof.live_cap == 0 || (mi_prof.live_used + 1) * 4 > mi_prof.live_cap * 3) {
+    if (!mi_prof_live_rehash()) return false;
   }
-  return false;
+  const size_t mask = mi_prof.live_cap - 1;
+  size_t i = mi_prof_hash(addr, mi_prof.live_cap);
+  size_t tomb = SIZE_MAX;
+  while (mi_prof.live[i].addr != 0 && mi_prof.live[i].addr != addr) {
+    if (tomb == SIZE_MAX && mi_prof.live[i].addr == MI_PROF_TOMBSTONE) tomb = i;
+    i = (i + 1) & mask;
+  }
+  if (mi_prof.live[i].addr == addr) {
+    // a free of this block was missed (its page was destroyed or reset): the old sample is gone
+    mi_prof_stack_t* const os = &mi_prof.stacks[mi_prof.live[i].stack];
+    os->inuse_objs -= mi_prof.live[i].objs; os->inuse_bytes -= mi_prof.live[i].bytes;
+  }
+  else {
+    if (tomb != SIZE_MAX) { i = tomb; } else { mi_prof.live_used++; }
+    mi_prof.live_count++;
+  }
+  mi_prof.live[i].addr = addr; mi_prof.live[i].stack = stack; mi_prof.live[i].objs = objs; mi_prof.live[i].bytes = bytes;
+  return true;
+}
+
+static void mi_prof_live_remove(uintptr_t addr) {
+  if (mi_prof.live_cap == 0) return;
+  const size_t mask = mi_prof.live_cap - 1;
+  size_t i = mi_prof_hash(addr, mi_prof.live_cap);
+  while (mi_prof.live[i].addr != 0) {
+    if (mi_prof.live[i].addr == addr) {
+      mi_prof_stack_t* const s = &mi_prof.stacks[mi_prof.live[i].stack];
+      s->inuse_objs -= mi_prof.live[i].objs; s->inuse_bytes -= mi_prof.live[i].bytes;
+      mi_prof.live[i].addr = MI_PROF_TOMBSTONE;
+      mi_prof.live_count--;
+      return;
+    }
+    i = (i + 1) & mask;
+  }
 }
 
 // ---------------------------------------------------------------------------
-// Sample storage
+// Stacks
 // ---------------------------------------------------------------------------
 
-static mi_prof_sample_t* mi_prof_samples_push(void) {
-  if (mi_prof.sample_count == mi_prof.sample_cap) {
-    size_t ncap = (mi_prof.sample_cap == 0 ? 1024 : mi_prof.sample_cap * 2);
+static uint64_t mi_prof_stack_hash(const uintptr_t* frames, uint8_t n) {
+  uint64_t h = 0x9E3779B97F4A7C15ull ^ n;
+  for (uint8_t i = 0; i < n; i++) { h ^= (uint64_t)frames[i]; h *= 0xff51afd7ed558ccdull; h ^= h >> 32; }
+  return h;
+}
+
+static bool mi_prof_stack_ht_grow(void) {
+  const size_t cap = (mi_prof.stack_ht_cap == 0 ? 1024 : 2 * mi_prof.stack_ht_cap);
+  mi_memid_t memid;
+  uint32_t* nt = (uint32_t*)mi_prof_os_zalloc(cap * sizeof(uint32_t), &memid);
+  if (nt == NULL) return false;
+  for (size_t i = 0; i < mi_prof.stack_count; i++) {
+    size_t h = (size_t)mi_prof.stacks[i].hash & (cap - 1);
+    while (nt[h] != 0) h = (h + 1) & (cap - 1);
+    nt[h] = (uint32_t)(i + 1);
+  }
+  mi_prof_os_free(mi_prof.stack_ht, mi_prof.stack_ht_cap * sizeof(uint32_t), mi_prof.stack_ht_memid);
+  mi_prof.stack_ht = nt; mi_prof.stack_ht_cap = cap; mi_prof.stack_ht_memid = memid;
+  return true;
+}
+
+// Find or add the stack; NULL on OOM.
+static mi_prof_stack_t* mi_prof_stack_intern(const uintptr_t* frames, uint8_t n) {
+  if (2 * (mi_prof.stack_count + 1) > mi_prof.stack_ht_cap) {
+    if (!mi_prof_stack_ht_grow()) return NULL;
+  }
+  const uint64_t hash = mi_prof_stack_hash(frames, n);
+  const size_t mask = mi_prof.stack_ht_cap - 1;
+  size_t h = (size_t)hash & mask;
+  for (; mi_prof.stack_ht[h] != 0; h = (h + 1) & mask) {
+    mi_prof_stack_t* const s = &mi_prof.stacks[mi_prof.stack_ht[h] - 1];
+    if (s->hash != hash || s->nframes != n) continue;
+    uint8_t i = 0;
+    while (i < n && s->frames[i] == frames[i]) i++;
+    if (i == n) return s;
+  }
+  if (mi_prof.stack_count == mi_prof.stack_cap) {
+    const size_t ncap = (mi_prof.stack_cap == 0 ? 1024 : 2 * mi_prof.stack_cap);
     mi_memid_t memid;
-    mi_prof_sample_t* ns = (mi_prof_sample_t*)_mi_os_zalloc(_mi_subproc_main(), ncap * sizeof(mi_prof_sample_t), &memid);
+    mi_prof_stack_t* ns = (mi_prof_stack_t*)mi_prof_os_zalloc(ncap * sizeof(mi_prof_stack_t), &memid);
     if (ns == NULL) return NULL;
-    if (mi_prof.samples != NULL) {
-      _mi_memcpy(ns, mi_prof.samples, mi_prof.sample_count * sizeof(mi_prof_sample_t));
-    }
-    mi_prof.samples = ns;
-    mi_prof.sample_cap = ncap;
+    if (mi_prof.stacks != NULL) _mi_memcpy(ns, mi_prof.stacks, mi_prof.stack_count * sizeof(mi_prof_stack_t));
+    mi_prof_os_free(mi_prof.stacks, mi_prof.stack_cap * sizeof(mi_prof_stack_t), mi_prof.stacks_memid);
+    mi_prof.stacks = ns; mi_prof.stack_cap = ncap; mi_prof.stacks_memid = memid;
   }
-  return &mi_prof.samples[mi_prof.sample_count++];
+  mi_prof_stack_t* const s = &mi_prof.stacks[mi_prof.stack_count++];
+  s->hash = hash; s->nframes = n;
+  for (uint8_t i = 0; i < n; i++) s->frames[i] = frames[i];
+  mi_prof.stack_ht[h] = (uint32_t)mi_prof.stack_count;
+  return s;
 }
 
 // ---------------------------------------------------------------------------
@@ -211,11 +294,10 @@ static uint8_t mi_prof_backtrace(uintptr_t* frames) {
 
 static intptr_t mi_prof_next_countdown(mi_theap_t* theap) {
   MI_UNUSED(theap);
-  if (mi_prof.rate == 0) return 0;
   // Fixed rate. (Go/jemalloc use a geometric draw to avoid bias with periodic
   // allocation patterns; can be added later. Fixed rate is unbiased for
   // typical workloads and keeps the math simple.)
-  return (intptr_t)mi_prof.rate;
+  return (intptr_t)_mi_prof_rate();
 }
 
 // ---------------------------------------------------------------------------
@@ -224,7 +306,8 @@ static intptr_t mi_prof_next_countdown(mi_theap_t* theap) {
 
 void _mi_prof_sample(mi_theap_t* theap, mi_page_t* page, void* p, size_t req_size) {
   theap->prof_countdown = mi_prof_next_countdown(theap);
-  if (p == NULL || mi_prof.rate == 0) return;
+  const size_t rate = _mi_prof_rate();
+  if (p == NULL || rate == 0) return;
   // Taking the backtrace can allocate (glibc's `backtrace` dlopen's libgcc_s on first use, and that dlopen
   // calls calloc before it is re-entrant); with a rate of 1 that allocation would sample again, without end.
   mi_tld_t* const tld = theap->tld;
@@ -235,24 +318,44 @@ void _mi_prof_sample(mi_theap_t* theap, mi_page_t* page, void* p, size_t req_siz
   uint8_t n = mi_prof_backtrace(frames);
   tld->prof_sampling = false;
 
+  // A sample triggers after `rate` bytes of countdown, decremented by the block size per allocation, so a
+  // sample of size s stands for ~max(rate, s) bytes:
+  //   s >= rate -> every such allocation triggers (1 sample = 1 allocation = s bytes)
+  //   s <  rate -> ~rate/s allocations per sample (1 sample = rate bytes)
+  const uint64_t bytes = (rate > req_size ? (uint64_t)rate : (uint64_t)req_size);
+  uint64_t objs = (req_size > 0 ? (bytes + req_size/2) / req_size : 1);
+  if (objs == 0) objs = 1;
+  if (objs > UINT32_MAX) objs = UINT32_MAX;
+
+  bool tracked = false;
   mi_lock(&mi_prof.lock) {
-    mi_prof_sample_t* s = mi_prof_samples_push();
-    if (s == NULL) return;
-    s->addr = (uintptr_t)p;
-    s->size = req_size;
-    s->nframes = n;
-    for (uint8_t i = 0; i < n; i++) s->frames[i] = frames[i];
-    mi_prof_ht_put((uintptr_t)p, (uint32_t)(mi_prof.sample_count - 1) + 1);
+    mi_prof_stack_t* const s = mi_prof_stack_intern(frames, n);
+    if (s != NULL) {
+      s->alloc_objs += objs; s->alloc_bytes += bytes;
+      if (mi_prof_live_put((uintptr_t)p, (uint32_t)(s - mi_prof.stacks), (uint32_t)objs, bytes)) {
+        s->inuse_objs += objs; s->inuse_bytes += bytes;
+        tracked = true;
+      }
+    }
   }
   // mark the page so frees on it route through the generic path
-  mi_atomic_or_relaxed(&page->xthread_id, (mi_threadid_t)MI_PAGE_HAS_PROF_SAMPLES);
+  if (tracked) mi_atomic_or_relaxed(&page->xthread_id, (mi_threadid_t)MI_PAGE_HAS_PROF_SAMPLES);
 }
 
 void _mi_prof_free(const void* p) {
-  uint32_t idx1;
   mi_lock(&mi_prof.lock) {
-    if (mi_prof_ht_remove((uintptr_t)p, &idx1)) {
-      mi_prof.samples[idx1 - 1].addr = 0;  // mark not-inuse; keep for alloc totals
+    mi_prof_live_remove((uintptr_t)p);
+  }
+}
+
+// `mi_heap_destroy` releases a page with its blocks still allocated: they are never freed one by one, so drop
+// their samples here (or they would show as in use for the rest of the process).
+void _mi_prof_page_destroy(mi_page_t* page) {
+  const size_t bsize = mi_page_block_size(page);
+  uint8_t* const start = mi_page_start(page);
+  mi_lock(&mi_prof.lock) {
+    for (size_t i = 0; i < page->capacity && mi_prof.live_count > 0; i++) {
+      mi_prof_live_remove((uintptr_t)(start + i*bsize));
     }
   }
 }
@@ -261,45 +364,47 @@ void _mi_prof_free(const void* p) {
 // Enable / theap init
 // ---------------------------------------------------------------------------
 
-static void mi_prof_set_theap(mi_theap_t* theap, bool on) {
-  theap->prof_force_slow = on;
-  theap->prof_countdown  = (on ? mi_prof_next_countdown(theap) : 0);
-  // poison/restore pages_free_direct
+// While a theap is profiled its page queues write their first pages here instead of in `pages_free_direct`
+// (through `pages_free_direct_update`), which so stays poisoned. Shared and never read for its contents.
+static mi_page_t* mi_prof_direct_scratch[MI_PAGES_DIRECT];
+
+// Turn profiling on for a theap (possibly of another thread: these are aligned word stores; at worst a few
+// allocations slip by unsampled before that thread sees them, see `mi_malloc_generic_prof`).
+static void mi_prof_theap_enable(mi_theap_t* theap) {
+  theap->prof_force_slow = true;
+  theap->prof_countdown  = mi_prof_next_countdown(theap);
+  theap->pages_free_direct_update = mi_prof_direct_scratch;
+  theap->generic_count = MI_GENERIC_COUNT_ADMIN;
   for (size_t i = 0; i < MI_PAGES_DIRECT; i++) {
     theap->pages_free_direct[i] = _mi_page_empty_get();
   }
-  // (when turning off, the slots refill lazily via mi_theap_queue_first_update)
+}
+
+// Back to normal; by the thread that owns the theap (from `mi_malloc_generic_prof`, once the rate is 0).
+void _mi_prof_theap_disable(mi_theap_t* theap) {
+  theap->prof_force_slow = false;
+  theap->prof_countdown  = 0;
+  theap->generic_count   = 0;
+  theap->pages_free_direct_update = theap->pages_free_direct;
+  _mi_theap_direct_pages_reset(theap);
 }
 
 void _mi_prof_theap_init(mi_theap_t* theap) {
-  if (mi_atomic_load_relaxed(&mi_prof.rate) > 0) mi_prof_set_theap(theap, true);
-}
-
-// Called from _mi_malloc_generic when the global rate is on but this theap
-// hasn't been enabled yet (e.g., another thread called mi_prof_enable).
-void _mi_prof_theap_lazy_enable(mi_theap_t* theap) {
-  if (theap->prof_countdown == 0 && mi_atomic_load_relaxed(&mi_prof.rate) > 0) {
-    mi_prof_set_theap(theap, true);
-  }
-}
-
-// Read by _mi_malloc_generic's hot-path gate.
-size_t _mi_prof_rate(void) {
-  return mi_atomic_load_relaxed(&mi_prof.rate);
+  if (_mi_prof_rate() > 0) mi_prof_theap_enable(theap);
 }
 
 // Walk every theap in the process (all subprocs -> heaps -> theaps) and toggle.
 // Writes to other threads' theap fields are aligned word stores; the worst case
 // is a few fast-path allocs slip through before the target thread observes the
 // poisoned slot, after which queue_first_update keeps it poisoned.
-static void mi_prof_set_all_theaps(bool on) {
+static void mi_prof_enable_all_theaps(void) {
   mi_subproc_t* sp = _mi_subproc_main();
   for (; sp != NULL; sp = sp->next) {
     mi_lock(&sp->heaps_lock) {
       for (mi_heap_t* h = sp->heaps; h != NULL; h = h->next) {
         mi_lock(&h->theaps_lock) {
           for (mi_theap_t* t = h->theaps; t != NULL; t = t->hnext) {
-            mi_prof_set_theap(t, on);
+            mi_prof_theap_enable(t);
           }
         }
       }
@@ -307,37 +412,49 @@ static void mi_prof_set_all_theaps(bool on) {
   }
 }
 
+static void mi_prof_start(size_t rate) {
+  mi_atomic_store_release(&_mi_prof_sample_rate, rate);
+  mi_prof_enable_all_theaps();
+}
+
 void _mi_prof_init(void) {
+  mi_lock_init(&mi_prof.lock);
   long rate = mi_option_get(mi_option_prof_sample_rate);
   if (rate <= 0) return;
-  mi_lock_init(&mi_prof.lock);
-  mi_atomic_store_release(&mi_prof.rate, (size_t)rate);
-  mi_prof_ht_grow(1024);
-  mi_prof_set_all_theaps(true);
+  mi_prof_start((size_t)rate);
 }
 
 void mi_prof_reset(void) mi_attr_noexcept {
-  if (mi_prof.ht_cap == 0) return;  // never initialized
   mi_lock(&mi_prof.lock) {
-    mi_prof.sample_count = 0;
-    _mi_memzero(mi_prof.ht_keys, mi_prof.ht_cap * sizeof(uintptr_t));
-    mi_prof.ht_used = 0;
     // note: pages with MI_PAGE_HAS_PROF_SAMPLES keep the flag (frees still
-    // route to slow path) but the hash lookup misses harmlessly. The flag
+    // route to slow path) but the lookup misses harmlessly. The flag
     // clears naturally on page re-init.
+    mi_prof_os_free(mi_prof.live, mi_prof.live_cap * sizeof(mi_prof_live_t), mi_prof.live_memid);
+    mi_prof.live = NULL; mi_prof.live_cap = 0; mi_prof.live_count = 0; mi_prof.live_used = 0;
+    mi_prof_os_free(mi_prof.stack_ht, mi_prof.stack_ht_cap * sizeof(uint32_t), mi_prof.stack_ht_memid);
+    mi_prof.stack_ht = NULL; mi_prof.stack_ht_cap = 0;
+    mi_prof_os_free(mi_prof.stacks, mi_prof.stack_cap * sizeof(mi_prof_stack_t), mi_prof.stacks_memid);
+    mi_prof.stacks = NULL; mi_prof.stack_cap = 0; mi_prof.stack_count = 0;
   }
 }
 
 void mi_prof_enable(size_t sample_rate_bytes) mi_attr_noexcept {
   if (sample_rate_bytes == 0) {
-    mi_atomic_store_release(&mi_prof.rate, 0);
-    mi_prof_set_all_theaps(false);
+    mi_atomic_store_release(&_mi_prof_sample_rate, 0);   // each theap notices at its next allocation
     return;
   }
-  if (mi_atomic_load_relaxed(&mi_prof.rate) == 0) mi_lock_init(&mi_prof.lock);
-  mi_atomic_store_release(&mi_prof.rate, sample_rate_bytes);
-  if (mi_prof.ht_cap == 0) mi_prof_ht_grow(1024);
-  mi_prof_set_all_theaps(true);
+  mi_prof_start(sample_rate_bytes);
+}
+
+size_t mi_prof_sample_rate(void) mi_attr_noexcept {
+  return _mi_prof_rate();
+}
+
+void mi_prof_get_counts(size_t* stacks, size_t* live_samples) mi_attr_noexcept {
+  size_t ns = 0, nl = 0;
+  mi_lock(&mi_prof.lock) { ns = mi_prof.stack_count; nl = mi_prof.live_count; }
+  if (stacks != NULL) *stacks = ns;
+  if (live_samples != NULL) *live_samples = nl;
 }
 
 // ---------------------------------------------------------------------------
@@ -607,8 +724,8 @@ static int mi_prof_dump_pb(mi_pb_t* wp) {
   bool oom = false;
 
   mi_lock(&mi_prof.lock) {
-    for (size_t i = 0; i < mi_prof.sample_count && !oom; i++) {
-      mi_prof_sample_t* s = &mi_prof.samples[i];
+    for (size_t i = 0; i < mi_prof.stack_count && !oom; i++) {
+      mi_prof_stack_t* s = &mi_prof.stacks[i];
       for (uint8_t f = 0; f < s->nframes; f++) {
         uintptr_t a = s->frames[f]; if (a==0) continue;
         size_t h = mi_prof_loc_find(locs, loc_cap, a);
@@ -625,22 +742,15 @@ static int mi_prof_dump_pb(mi_pb_t* wp) {
     }
     if (oom) { w.err = true; }
 
-    // emit samples (field 2): location_id[] (packed), value[] (packed)
-    for (size_t i = 0; i < mi_prof.sample_count && !oom; i++) {
-      mi_prof_sample_t* s = &mi_prof.samples[i];
-      // scale: a sample triggers after `rate` bytes of countdown, decremented by
-      // block_size per alloc. So a sample of size s represents ~max(rate, s) bytes:
-      //   s >= rate -> every such alloc triggers (1 sample = 1 alloc = s bytes)
-      //   s <  rate -> ~rate/s allocs per sample (1 sample = rate bytes)
-      uint64_t scale_bytes = (mi_prof.rate > (size_t)s->size ? (uint64_t)mi_prof.rate : (uint64_t)s->size);
-      uint64_t scale_objs  = (s->size > 0 ? (scale_bytes + s->size/2) / s->size : 1);
-      if (scale_objs == 0) scale_objs = 1;
-      uint64_t inuse = (s->addr != 0 ? 1 : 0);
-      uint64_t v[4] = { scale_objs, scale_bytes, inuse*scale_objs, inuse*scale_bytes };
+    // emit one sample (field 2) per stack: location_id[] (packed), value[] (packed)
+    for (size_t i = 0; i < mi_prof.stack_count && !oom; i++) {
+      mi_prof_stack_t* s = &mi_prof.stacks[i];
+      uint64_t v[4] = { s->alloc_objs, s->alloc_bytes, s->inuse_objs, s->inuse_bytes };
 
-      // packed location ids
+      // packed location ids (a zero frame got no location; there is none after the walk stops, this is for safety)
       size_t loc_len = 0;
       for (uint8_t f = 0; f < s->nframes; f++) {
+        if (s->frames[f] == 0) continue;
         size_t h = mi_prof_loc_find(locs, loc_cap, s->frames[f]); loc_len += pb_varint_len(locs[h].id);
       }
       // packed values
@@ -649,7 +759,10 @@ static int mi_prof_dump_pb(mi_pb_t* wp) {
                   + pb_varint_len((2<<3)|2)+pb_varint_len(val_len)+val_len;
       pb_tag(&w, 2, 2); pb_varint(&w, body);
       pb_tag(&w, 1, 2); pb_varint(&w, loc_len);
-      for (uint8_t f = 0; f < s->nframes; f++) { size_t h = mi_prof_loc_find(locs, loc_cap, s->frames[f]); pb_varint(&w, locs[h].id); }
+      for (uint8_t f = 0; f < s->nframes; f++) {
+        if (s->frames[f] == 0) continue;
+        size_t h = mi_prof_loc_find(locs, loc_cap, s->frames[f]); pb_varint(&w, locs[h].id);
+      }
       pb_tag(&w, 2, 2); pb_varint(&w, val_len);
       for (int k=0;k<4;k++) pb_varint(&w, v[k]);
     }
@@ -673,7 +786,7 @@ static int mi_prof_dump_pb(mi_pb_t* wp) {
 
   // period_type (field 11), period (field 12), default_sample_type (field 14)
   pb_value_type(&w, 11, STR_SPACE, STR_BYTES);
-  pb_tag(&w, 12, 0); pb_varint(&w, (uint64_t)mi_prof.rate);
+  pb_tag(&w, 12, 0); pb_varint(&w, (uint64_t)_mi_prof_rate());
   pb_tag(&w, 14, 0); pb_varint(&w, STR_INUSE_SPACE);  // string-table index of the default sample type name
 
   pb_flush(&w);
@@ -707,14 +820,20 @@ int mi_prof_dump_to_file(const char* path) mi_attr_noexcept {
   return rc;
 }
 
-void _mi_prof_on_exit(void) {
-  if (mi_prof.rate == 0 || mi_prof.sample_count == 0) return;
+// Write the profile to $MIMALLOC_PROF_PATH (or ./mimalloc-prof.<pid>.pb) if profiling is on and sampled anything.
+// `mi_process_done` calls this; an embedder that skips it (MI_NO_PROCESS_DETACH) calls it from its own exit path.
+void mi_prof_dump_at_exit(void) mi_attr_noexcept {
+  if (_mi_prof_rate() == 0 || mi_prof.stack_count == 0) return;
   char path[512];
   if (!_mi_getenv("MIMALLOC_PROF_PATH", path, sizeof(path))) {
-    _mi_snprintf(path, sizeof(path), "mimalloc-prof.%lu.pb", (unsigned long)_mi_prim_thread_id());
+    _mi_snprintf(path, sizeof(path), "mimalloc-prof.%lu.pb", mi_prof_getpid());
   }
   if (mi_prof_dump_to_file(path) == 0) {
-    _mi_message("heap profile written to %s (%zu samples; view with: go tool pprof %s)\n",
-                path, mi_prof.sample_count, path);
+    _mi_message("heap profile written to %s (%zu stacks; view with: go tool pprof %s)\n",
+                path, mi_prof.stack_count, path);
   }
+}
+
+void _mi_prof_on_exit(void) {
+  mi_prof_dump_at_exit();
 }

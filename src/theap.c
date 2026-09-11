@@ -528,7 +528,7 @@ static void mi_theap_options_init(mi_theap_t* theap) {
   theap->allow_page_reclaim = (mi_option_get(mi_option_page_reclaim_on_free) >= 0);
   theap->allow_page_abandon = (mi_option_get(mi_option_page_full_retain) >= 0);
   theap->page_full_retain = mi_option_get_clamp(mi_option_page_full_retain, -1, 32);
-  _mi_prof_theap_init(theap);   // fork: sampling state
+  theap->pages_free_direct_update = theap->pages_free_direct;
   theap->is_detached = (theap->tld->thread_id == MI_THREADID_DETACHED);
 }
 
@@ -602,6 +602,9 @@ void _mi_theap_init(mi_theap_t* theap, mi_heap_t* heap, mi_tld_t* tld)
     theap->hnext = head;
     if (head!=NULL) { head->hprev = theap; }
     heap->theaps = theap;
+    // fork: heap profiling. Under the lock `mi_prof_enable` walks the theaps with, so a new theap either
+    // reads the rate that was set or is found by that walk.
+    _mi_prof_theap_init(theap);
   }
 }
 
@@ -830,6 +833,7 @@ bool mi_theap_reload(mi_theap_t* theap, mi_arena_id_t arena_id) {
   for (size_t i = 0; i < MI_PAGES_DIRECT; i++) {
     theap->pages_free_direct[i] = _mi_page_empty_get();
   }
+  theap->pages_free_direct_update = theap->pages_free_direct;
 
   // push on the thread local theaps list
   theap->tnext = theap->tld->theaps;

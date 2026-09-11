@@ -556,6 +556,8 @@ typedef struct mi_padding_s {
 #define MI_PAGES_DIRECT   (MI_SMALL_WSIZE_MAX + MI_PADDING_WSIZE + 1)
 
 
+#define MI_GENERIC_COUNT_ADMIN  (1000)   // do administrative tasks every N generic mallocs (page.c)
+
 // A thread-local heap ("theap") owns a set of thread-local pages.
 struct mi_theap_s {
   mi_tld_t*             tld;                                 // thread-local data
@@ -570,7 +572,7 @@ struct mi_theap_s {
   size_t                page_retired_min;                    // smallest retired index (retired pages are fully free, but still in the page queues)
   size_t                page_retired_max;                    // largest retired index into the `pages` array.
   size_t                pages_full_size;                     // optimization: total size of blocks in the pages of the full queue (issue #1220)
-  long                  generic_count;                       // how often is `_mi_malloc_generic` called?
+  long                  generic_count;                       // how often is `_mi_malloc_generic` called? (up to `MI_GENERIC_COUNT_ADMIN`)
   long                  generic_collect_count;               // how often is `_mi_malloc_generic` called without collecting?
 
   mi_theap_t*           tnext;                               // list of theaps in this thread
@@ -582,8 +584,10 @@ struct mi_theap_s {
   bool                  allow_page_reclaim;                  // `true` if this theap can reclaim abandoned pages
   bool                  allow_page_abandon;                  // `true` if this theap can abandon pages to reduce memory footprint
   bool                  is_detached;                         // `true` if `tld->thread_id == MI_THREADID_DETACHED`
-  bool                  prof_force_slow;                     // if profiling is enabled: keep `pages_free_direct` poisoned so every malloc routes through `_mi_malloc_generic`
-  intptr_t              prof_countdown;                      // bytes until next profiling sample (only consulted in `_mi_malloc_generic`; 0 if profiling is off)
+  bool                  prof_force_slow;                     // heap profiling is on for this theap: `pages_free_direct` stays poisoned and `generic_count` stays saturated, so every malloc reaches `mi_malloc_generic_prof` (page.c)
+  intptr_t              prof_countdown;                      // bytes until next profiling sample (only consulted in `mi_malloc_generic_prof`; 0 if profiling is off)
+  long                  prof_generic_count;                  // stands in for `generic_count` (which is saturated) while profiling
+  mi_page_t**           pages_free_direct_update;            // where `mi_theap_queue_first_update` writes: `pages_free_direct`, or a scratch array while profiling keeps the direct pages poisoned
   #if MI_GUARDED
   size_t                guarded_size_min;                    // minimal size for guarded objects
   size_t                guarded_size_max;                    // maximal size for guarded objects

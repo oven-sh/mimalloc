@@ -44,6 +44,32 @@ static NOINLINE size_t many_call_sites(void) {
   return n;
 }
 
+// Blocks that go away with `mi_heap_destroy` are never freed one by one; their samples must not stay "in use".
+static NOINLINE int heap_destroy_drops_samples(void) {
+  mi_prof_reset();
+  mi_prof_enable(1);
+  mi_heap_t* heap = mi_heap_new();
+  mi_heap_malloc(heap, 48);   // the heap's own meta-data (its theap, the thread-local slot) is allocated by now
+  size_t live0 = 0; mi_prof_get_counts(NULL, &live0);
+  for (int i = 0; i < 2000; i++) { memset(mi_heap_malloc(heap, 48 + (size_t)(i % 7) * 100), 3, 8); }
+  size_t live1 = 0; mi_prof_get_counts(NULL, &live1);
+  if (live1 < live0 + 2000) { fprintf(stderr, "expected 2000 live samples, got %zu\n", live1 - live0); return 1; }
+  mi_heap_destroy(heap);
+  size_t live2 = 0; mi_prof_get_counts(NULL, &live2);
+  if (live2 > live0) { fprintf(stderr, "%zu samples still live after mi_heap_destroy\n", live2 - live0); return 1; }
+  return 0;
+}
+
+// Profiling for a long time must not grow the profiler's own tables: one call site, allocate and free.
+static NOINLINE int churn_is_bounded(void) {
+  mi_prof_reset();
+  mi_prof_enable(1);
+  for (int i = 0; i < 2000000; i++) { mi_free(tidy_alloc(64)); }
+  size_t stacks = 0, live = 0; mi_prof_get_counts(&stacks, &live);
+  if (stacks > 64 || live > 64) { fprintf(stderr, "churn left %zu stacks, %zu live samples\n", stacks, live); return 1; }
+  return 0;
+}
+
 int main(int argc, char** argv) {
   const char* out = (argc > 1 ? argv[1] : "heap-prof.pb");
   mi_prof_enable(64*1024);  // 64 KiB sample rate for a small test
@@ -58,5 +84,9 @@ int main(int argc, char** argv) {
   if (size == 0) { fprintf(stderr, "dump of %zu call sites produced nothing\n", n); return 1; }
   for (size_t i = 0; i < n; i++) mi_free(sites[i]);
   printf("dumped %zu call sites in %zu bytes\n", n, size);
+
+  if (heap_destroy_drops_samples() != 0) return 1;
+  if (churn_is_bounded() != 0) return 1;
+  mi_prof_enable(0);
   return 0;
 }

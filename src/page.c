@@ -2007,62 +2007,35 @@ void mi_register_deferred_free(mi_deferred_free_fun* fn, void* arg) mi_attr_noex
   Admin
 ----------------------------------------------------------- */
 
-static mi_theap_t* mi_malloc_generic_admin(mi_theap_t* theap) 
-{
-  if mi_unlikely(!mi_theap_is_initialized(theap)) {
-    if (theap==&_mi_theap_empty_wrong) {
-      // we were unable to allocate a theap for a first-class heap
-      return NULL;
-    }
-    // otherwise we initialize the thread and its default theap
-    theap = _mi_thread_init();
-    if mi_unlikely(!mi_theap_is_initialized(theap)) { return NULL; }    
-  }
-  mi_assert_internal(mi_theap_is_initialized(theap));
+// do administrative tasks every N generic mallocs
+static void mi_malloc_generic_admin_tasks(mi_theap_t* theap, long generic_count) {
+  theap->generic_collect_count += generic_count;
 
-  // do administrative tasks every N generic mallocs
-  if mi_unlikely(theap->generic_count >= 1000) {
-    theap->generic_collect_count += theap->generic_count;
-    theap->generic_count = 0;
-    
-    // do a full theap collect every once in a while (10000 by default)
-    const long generic_collect = mi_option_get_clamp(mi_option_generic_collect, 1, 1000000L);
-    if (theap->generic_collect_count >= generic_collect) {
-      theap->generic_collect_count = 0;
-      mi_theap_collect(theap, false /* force? */);
-    }
-    else {
-      // otherwise we do a mini-collect
-      _mi_deferred_free(theap, false);         // call potential deferred free routines      
-      _mi_theap_collect_retired(theap, false); // free retired pages      
-    }
+  // do a full theap collect every once in a while (10000 by default)
+  const long generic_collect = mi_option_get_clamp(mi_option_generic_collect, 1, 1000000L);
+  if (theap->generic_collect_count >= generic_collect) {
+    theap->generic_collect_count = 0;
+    mi_theap_collect(theap, false /* force? */);
   }
-  return theap;
+  else {
+    // otherwise we do a mini-collect
+    _mi_deferred_free(theap, false);         // call potential deferred free routines      
+    _mi_theap_collect_retired(theap, false); // free retired pages      
+  }
 }
 
 /* -----------------------------------------------------------
   Generic allocation
 ----------------------------------------------------------- */
 
-// Heap profiling (fork): while profiling is on, the direct pages are poisoned so every allocation comes through the generic
-// path, and this is checked at each of its exits; zero overhead on the real fast path. Gated on the global rate so a thread
-// picks up profiling that another thread enabled.
-static inline void mi_prof_note_generic_alloc(mi_theap_t* theap, mi_page_t* page, void* p) {
-  if mi_unlikely(p != NULL && _mi_prof_rate() != 0) {
-    if (theap->prof_countdown == 0) { _mi_prof_theap_lazy_enable(theap); }
-    const size_t bsize = mi_page_block_size(page);
-    if ((theap->prof_countdown -= (intptr_t)bsize) <= 0) {
-      _mi_prof_sample(theap, page, p, bsize);
-    }
-  }
-}
+// Heap profiling (fork), see prof.c. While profiling is on for a theap its direct pages are poisoned and its
+// `generic_count` is kept saturated, so every allocation comes to `mi_malloc_generic_fallback` and takes the
+// (otherwise once in `MI_GENERIC_COUNT_ADMIN`) administrative branch there, which is where profiling is looked at:
+// nothing on the paths a theap that is not profiled takes.
+static mi_decl_noinline void* mi_malloc_generic_prof(mi_theap_t* theap, size_t size, bool zero, size_t huge_alignment, mi_page_t** ppage);
 
-static mi_decl_noinline void* mi_malloc_generic_fallback(mi_theap_t* theap, size_t size, bool zero, size_t huge_alignment, mi_page_t** ppage) 
-{  
-  // initialize if necessary
-  theap = mi_malloc_generic_admin(theap);
-  if (theap==NULL) return NULL;
-  
+static mi_decl_forceinline void* mi_malloc_generic_find_page(mi_theap_t* theap, size_t size, bool zero, size_t huge_alignment, mi_page_t** ppage)
+{
   // find (or allocate) a page of the right size
   mi_page_t* page = mi_find_page(theap, size, huge_alignment);
   if mi_unlikely(page == NULL) { // first time out of memory, try to collect and retry the allocation once more
@@ -2086,11 +2059,62 @@ static mi_decl_noinline void* mi_malloc_generic_fallback(mi_theap_t* theap, size
   void* const p = _mi_page_malloc_zero(theap,page,size,zero);
   mi_assert_internal(p != NULL);
 
-  mi_prof_note_generic_alloc(theap, page, p);
-
   // move full pages to the full queue
   if (mi_page_block_size(page) > MI_SMALL_MAX_OBJ_SIZE && mi_page_is_full(page)) {
     mi_page_to_full(page, mi_page_queue_of(page));
+  }
+  return p;
+}
+
+static mi_decl_noinline void* mi_malloc_generic_fallback(mi_theap_t* theap, size_t size, bool zero, size_t huge_alignment, mi_page_t** ppage) 
+{  
+  // initialize if necessary
+  if mi_unlikely(!mi_theap_is_initialized(theap)) {
+    if (theap==&_mi_theap_empty_wrong) {
+      // we were unable to allocate a theap for a first-class heap
+      return NULL;
+    }
+    // otherwise we initialize the thread and its default theap
+    theap = _mi_thread_init();
+    if mi_unlikely(!mi_theap_is_initialized(theap)) { return NULL; }    
+  }
+  mi_assert_internal(mi_theap_is_initialized(theap));
+
+  // do administrative tasks every N generic mallocs
+  if mi_unlikely(theap->generic_count >= MI_GENERIC_COUNT_ADMIN) {
+    if (theap->prof_force_slow) {
+      return mi_malloc_generic_prof(theap, size, zero, huge_alignment, ppage);
+    }
+    const long generic_count = theap->generic_count;
+    theap->generic_count = 0;
+    mi_malloc_generic_admin_tasks(theap, generic_count);
+  }
+  return mi_malloc_generic_find_page(theap, size, zero, huge_alignment, ppage);
+}
+
+// Every allocation of a theap that is being profiled (see the note above `mi_malloc_generic_fallback`).
+static mi_decl_noinline void* mi_malloc_generic_prof(mi_theap_t* theap, size_t size, bool zero, size_t huge_alignment, mi_page_t** ppage)
+{
+  mi_assert_internal(mi_theap_is_initialized(theap));
+  if (_mi_prof_rate() == 0) {
+    // profiling was turned off (by any thread): this theap goes back to normal
+    _mi_prof_theap_disable(theap);
+    return _mi_malloc_generic(theap, size, (zero ? 1 : 0) | huge_alignment, ppage);
+  }
+  theap->generic_count = MI_GENERIC_COUNT_ADMIN;   // stay saturated; `prof_generic_count` counts in its place
+  if (++theap->prof_generic_count >= MI_GENERIC_COUNT_ADMIN) {
+    theap->prof_generic_count = 0;
+    mi_malloc_generic_admin_tasks(theap, MI_GENERIC_COUNT_ADMIN);
+  }
+  mi_page_t* page = NULL;
+  void* const p = mi_malloc_generic_find_page(theap, size, zero, huge_alignment, &page);
+  if (ppage != NULL) { *ppage = page; }
+  if (p != NULL && page != NULL) {
+    const size_t bsize = mi_page_block_size(page);
+    if (size <= MI_SMALL_SIZE_MAX) { theap->pages_free_direct[_mi_wsize_from_size(size)] = _mi_page_empty_get(); }  // (had `mi_prof_enable` raced with a queue update on this thread)
+    if ((theap->prof_countdown -= (intptr_t)bsize) <= 0) {
+      _mi_prof_sample(theap, page, p, bsize);
+    }
   }
   return p;
 }
@@ -2112,7 +2136,7 @@ void* _mi_malloc_generic(mi_theap_t* theap, size_t size, size_t zero_huge_alignm
   mi_page_t* page = NULL;
 
   // fast path objects that fit in a small page
-  if mi_likely(mi_theap_is_initialized(theap) && ++theap->generic_count < 1000 && huge_alignment==0) {
+  if mi_likely(mi_theap_is_initialized(theap) && ++theap->generic_count < MI_GENERIC_COUNT_ADMIN && huge_alignment==0) {
     const size_t req_size = size - MI_PADDING_SIZE;  // correct for padding_size in case of an overflow on `size`
     if (req_size < MI_SMALL_MAX_OBJ_SIZE) {
       mi_page_queue_t* pq = mi_page_queue(theap, size);
@@ -2122,9 +2146,7 @@ void* _mi_malloc_generic(mi_theap_t* theap, size_t size, size_t zero_huge_alignm
       if (page!=NULL) {        
         if (ppage!=NULL) { *ppage = page; }
         mi_assert_internal(mi_page_immediate_available(page));
-        void* const p = _mi_page_malloc_zero(theap,page,size,zero);
-        mi_prof_note_generic_alloc(theap, page, p);
-        return p;
+        return _mi_page_malloc_zero(theap,page,size,zero);
       }
     }
   }

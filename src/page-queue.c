@@ -213,16 +213,11 @@ static inline void mi_theap_queue_first_update(mi_theap_t* theap, const mi_page_
 
   mi_page_t* page = pq->first;
   if (pq->first == NULL) page = _mi_page_empty_get();
-  if mi_unlikely(theap->prof_force_slow) {
-    // profiling: route all allocs through _mi_malloc_generic; lazy-disable here
-    // (cold path) if the global rate has since gone to 0.
-    if (_mi_prof_rate() == 0) { theap->prof_force_slow = false; theap->prof_countdown = 0; }
-    else { page = _mi_page_empty_get(); }
-  }
 
   // find index in the right direct page array
+  // (fork: through a pointer, which heap profiling aims at a scratch array so the real one stays poisoned; see prof.c)
   const size_t idx = _mi_wsize_from_size(size);
-  mi_page_t** const pages_free = theap->pages_free_direct;
+  mi_page_t** const pages_free = theap->pages_free_direct_update;
   if (pages_free[idx] == page) return;  // already set
 
   // find start slot
@@ -246,6 +241,16 @@ static inline void mi_theap_queue_first_update(mi_theap_t* theap, const mi_page_
   mi_assert(start <= idx);
   for (size_t sz = start; sz <= idx; sz++) {
     pages_free[sz] = page;
+  }
+}
+
+// Point every direct page at the first page of its queue again (heap profiling had them poisoned).
+void _mi_theap_direct_pages_reset(mi_theap_t* theap) {
+  for (size_t i = 0; i < MI_PAGES_DIRECT; i++) { theap->pages_free_direct[i] = _mi_page_empty_get(); }
+  for (size_t bin = 0; bin < MI_BIN_HUGE; bin++) {
+    const mi_page_queue_t* const pq = &theap->pages[bin];
+    if (pq->block_size > MI_SMALL_SIZE_MAX) break;
+    if (pq->first != NULL) { mi_theap_queue_first_update(theap, pq); }
   }
 }
 

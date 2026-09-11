@@ -37,7 +37,8 @@ static size_t pb_varint(const uint8_t** p, const uint8_t* end) {
   return v;
 }
 
-typedef struct { size_t nsamples, nlocs, nmaps, nstrings; int64_t inuse_bytes, alloc_bytes; } pb_stats_t;
+// (the profile has one Sample per distinct call stack; `alloc_objs` is how many allocations they stand for)
+typedef struct { size_t nsamples, nlocs, nmaps, nstrings; int64_t inuse_bytes, alloc_bytes, alloc_objs; } pb_stats_t;
 
 static int pb_validate(const char* path, pb_stats_t* st) {
   memset(st, 0, sizeof(*st));
@@ -64,7 +65,7 @@ static int pb_validate(const char* path, pb_stats_t* st) {
               const uint8_t* vp = sp; const uint8_t* ve = sp + slen;
               int64_t v[4] = {0}; int vi = 0;
               while (vp < ve && vi < 4) v[vi++] = (int64_t)pb_varint(&vp, ve);
-              st->alloc_bytes += v[1]; st->inuse_bytes += v[3];
+              st->alloc_objs += v[0]; st->alloc_bytes += v[1]; st->inuse_bytes += v[3];
             }
             sp += slen;
           } else if (swt == 0) { pb_varint(&sp, sub_end); }
@@ -112,7 +113,7 @@ static void case_cross_thread_free(void) {
   pthread_join(t1, NULL); pthread_join(t2, NULL);
   mi_prof_dump_to_file("/tmp/prof-xfree.pb");
   pb_stats_t st; CHECK(pb_validate("/tmp/prof-xfree.pb", &st) == 0, "xfree: profile parses");
-  CHECK(st.nsamples > 100, "xfree: samples captured");
+  CHECK(st.alloc_objs > 100, "xfree: samples captured");
   // all allocs were freed cross-thread; inuse should be ~0 (small noise from other allocs ok)
   CHECK(st.inuse_bytes < st.alloc_bytes / 4, "xfree: cross-thread frees tracked (inuse << alloc)");
   mi_prof_enable(0);
@@ -223,7 +224,7 @@ static void case_mt_stress(void) {
   pthread_join(dumper, NULL);
   mi_prof_dump_to_file("/tmp/prof-mt.pb");
   pb_stats_t st; CHECK(pb_validate("/tmp/prof-mt.pb", &st) == 0, "mt: final profile parses");
-  CHECK(st.nsamples > 100, "mt: samples captured");
+  CHECK(st.alloc_objs > 100, "mt: samples captured");
   mi_prof_enable(0);
   OK("MT stress + concurrent dump");
 }
@@ -239,7 +240,7 @@ static void case_rate1_hammer(void) {
   for (int i = 0; i < 20000; i++) a[i] = mi_malloc(32);
   mi_prof_dump_to_file("/tmp/prof-rate1.pb");
   pb_stats_t st; CHECK(pb_validate("/tmp/prof-rate1.pb", &st) == 0, "rate1: parses");
-  CHECK(st.nsamples >= 10000, "rate1: many samples captured");
+  CHECK(st.alloc_objs >= 10000, "rate1: many samples captured");
   for (int i = 0; i < 20000; i++) mi_free(a[i]);
   mi_free(a);
   mi_prof_enable(0);
@@ -336,7 +337,7 @@ static void case_process_wide(void) {
   pb_stats_t st; CHECK(pb_validate("/tmp/prof-pw.pb", &st) == 0, "process-wide: parses");
   // worker allocated 5000*256 = 1.28MB at rate=128 -> ~10000 samples expected;
   // even if a few fast-path allocs slip through before lazy-enable, should be >>100
-  CHECK(st.nsamples > 1000, "process-wide: worker thread sampled after main enabled");
+  CHECK(st.alloc_objs > 1000, "process-wide: worker thread sampled after main enabled");
   OK("process-wide enable");
 }
 

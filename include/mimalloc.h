@@ -400,6 +400,9 @@ mi_decl_export void   mi_prof_reset(void) mi_attr_noexcept;
 mi_decl_export int    mi_prof_dump(int fd) mi_attr_noexcept;
 mi_decl_export size_t mi_prof_dump_buf(void* buf, size_t cap) mi_attr_noexcept;  // returns total size; buf=NULL to query
 mi_decl_export int    mi_prof_dump_to_file(const char* path) mi_attr_noexcept;
+mi_decl_export void   mi_prof_dump_at_exit(void) mi_attr_noexcept;               // to $MIMALLOC_PROF_PATH, if profiling is on; for embedders that skip `mi_process_done`
+mi_decl_export size_t mi_prof_sample_rate(void) mi_attr_noexcept;                // 0 if profiling is off
+mi_decl_export void   mi_prof_get_counts(size_t* stacks, size_t* live_samples) mi_attr_noexcept;
 mi_decl_export size_t mi_arena_min_alignment(void);
 mi_decl_export size_t mi_arena_min_size(void);
 

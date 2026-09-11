@@ -134,7 +134,7 @@ mi_decl_hidden mi_decl_cache_align const mi_theap_t _mi_theap_empty = {
   false,                  // allow reclaim
   true,                   // allow abandon
   true,                   // is_detached
-  false, 0,               // prof_force_slow, prof_countdown (fork)
+  false, 0, 0, NULL,      // prof_force_slow, prof_countdown, prof_generic_count, pages_free_direct_update (fork; set by `_mi_theap_init`)
   #if MI_GUARDED
   0, 0, 0, 1,             // rate is 0 and count is 1 so we never write to it (see `internal.h:mi_heap_malloc_use_guarded`)
   #endif

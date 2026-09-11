@@ -287,8 +287,13 @@ void          _mi_heap_snapshot_on_exit(void);
 // prof.c
 void          _mi_prof_sample(mi_theap_t* theap, mi_page_t* page, void* p, size_t req_size);
 void          _mi_prof_free(const void* p);
+void          _mi_prof_page_destroy(mi_page_t* page);
 void          _mi_prof_init(void);
 void          _mi_prof_theap_init(mi_theap_t* theap);
+void          _mi_prof_theap_disable(mi_theap_t* theap);
+void          _mi_theap_direct_pages_reset(mi_theap_t* theap);   // page-queue.c
+extern _Atomic(size_t) _mi_prof_sample_rate;
+static inline size_t _mi_prof_rate(void) { return mi_atomic_load_relaxed(&_mi_prof_sample_rate); }
 
 // scavenger.c
 void          _mi_scavenger_start(void);
@@ -298,8 +303,6 @@ void          _mi_scavenger_stop(void);
 void          _mi_scavenger_wake(mi_subproc_t* subproc);
 bool          _mi_scavenger_is_running(void);
 void          _mi_arenas_purge_now(mi_subproc_t* subproc);
-void          _mi_prof_theap_lazy_enable(mi_theap_t* theap);
-size_t        _mi_prof_rate(void);
 void          _mi_prof_on_exit(void);
 
 // "page-map.c"
