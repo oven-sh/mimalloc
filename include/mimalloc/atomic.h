@@ -161,6 +161,11 @@ static inline void mi_atomic_maxi64_relaxed(volatile int64_t* p, int64_t x) {
 
 // Deprecated: MSVC plain C compilation wrapper that uses Interlocked operations to model C11 atomics.
 // It is recommended to always compile as C++ when using MSVC.
+// In this fork it is required: the wrapper only models word sized atomics, and the park and scavenger
+// state (`types.h`: `park_state`, `scavenger_wake`, ...) are 32-bit atomics. Define MI_ALLOW_MSVC_C_ATOMICS to try anyway.
+#if !defined(MI_ALLOW_MSVC_C_ATOMICS)
+#error "compile mimalloc as C++ with MSVC, clang-cl, or clang targeting the MSVC ABI (cmake: -DMI_USE_CXX=ON)"
+#endif
 
 #include <intrin.h>
 #ifdef _WIN64

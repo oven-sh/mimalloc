@@ -32,6 +32,13 @@ jobs:
             tests: extra
           - c_or_cxx: cxx
             tests: extra                       
+          # this fork is always compiled as C++ on Windows (32-bit atomics that the MSVC C wrapper does not model)
+          - os: windows-latest
+            c_or_cxx: c
+            tests: basic
+          - os: windows-11-arm
+            c_or_cxx: c
+            tests: basic
         include:
           - os: ubuntu-latest
             tests: tsan

@@ -262,6 +262,14 @@ if(MI_USE_CXX STREQUAL "DEFAULT")
   endif()
 endif()
 
+# The plain C wrapper for the MSVC atomics (`include/mimalloc/atomic.h`) only models word sized atomics, and this
+# fork also uses 32-bit ones (the park and scavenger state). That wrapper is selected whenever `_MSC_VER` is defined
+# in a C compilation: cl, clang-cl, and also plain clang when it targets the MSVC ABI.
+if(NOT MI_USE_CXX AND WIN32 AND NOT (MINGW OR CYGWIN OR MSYS))
+  message(WARNING "Cannot compile as C code with an MSVC compatible compiler (the C atomics wrapper is word-size only); compiling as C++ instead (MI_USE_CXX=ON)")
+  set(MI_USE_CXX "ON")
+endif()
+
 # enable C++ ?
 if(MI_USE_CXX)
   enable_language(CXX)
