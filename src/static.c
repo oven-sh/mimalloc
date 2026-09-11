@@ -6,9 +6,6 @@ terms of the MIT license. A copy of the license can be found in the file
 -----------------------------------------------------------------------------*/
 #ifndef _DEFAULT_SOURCE
 #define _DEFAULT_SOURCE
-#if defined(__linux__) && !defined(_GNU_SOURCE)
-#define _GNU_SOURCE   // prof.c: dl_iterate_phdr / struct dl_phdr_info
-#endif
 #endif
 #if defined(__sun)
 // same remarks as os.c for the static's context.
@@ -30,21 +27,22 @@ terms of the MIT license. A copy of the license can be found in the file
 #include "bitmap.c"
 #include "heap.c"
 #include "heap-snapshot.c"
-#include "prof.c"
 #include "init.c"
 #include "libc.c"
 #include "options.c"
 #include "os.c"
+#include "prim/prim.c"      // includes platform specific prim/<platform>/prim.c
+#include "prim/prim-tls.c"
+#if MI_OSX_ZONE
+#include "prim/osx/alloc-override-zone.c"
+#endif
 #include "page.c"           // includes page-queue.c
 #include "page-map.c"
 #include "random.c"
+#include "sample-guarded.c"
+#include "sample-profile.c"
 #include "scavenger.c"
 #include "stats.c"
 #include "subproc.c"
 #include "theap.c"
 #include "threadlocal.c"
-#include "prim/prim.c"
-#include "prim/prim-tls.c"
-#if MI_OSX_ZONE
-#include "prim/osx/alloc-override-zone.c"
-#endif

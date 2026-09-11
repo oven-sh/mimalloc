@@ -21,6 +21,7 @@ int main(void) { printf("test-park-handoff: skipped on Windows (uses pthreads/fo
 
 #include "mimalloc.h"
 #include <pthread.h>
+#include <sched.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -37,7 +38,7 @@ static void check(const char* name, bool ok) {
   if (!ok) failures++;
 }
 
-#if defined(MI_GUARDED)
+#if (defined(MI_GUARDED) && MI_GUARDED>0)
 #define LIVE   (2000)     // every sampled allocation gets a guard page (its own mapping): stay under vm.max_map_count
 #else
 #define LIVE   (20000)
@@ -220,7 +221,14 @@ static void* park_then_cancel(void* arg) {
   churn(p);
   free(p);
   (void)mi_on_thread_idle_start();
+  #if defined(MI_TSAN)
+  // ThreadSanitizer stops modelling the synchronization of a thread that is cancelled inside one of its
+  // blocking interceptors (`usleep`: the interceptor scope is never closed, and the mutexes and atomics of
+  // the thread's destructors are then ignored), which reports everything the teardown does as a race.
+  for (;;) { pthread_testcancel(); sched_yield(); }
+  #else
   for (;;) { pthread_testcancel(); usleep(50); }   // cancelled mid-park, as at a blocking syscall
+  #endif
 }
 
 static void test_park_then_exit(void) {

@@ -1,29 +1,9 @@
 # Heap introspection
 
-mimalloc ships two complementary tools for "why is this process using so much
-memory":
-
-| | `mi_heap_snapshot` + `mi-heapview` | `mi_prof_*` (pprof) |
-|---|---|---|
-| What | Full census of heap structure (arenas, pages, blocks, fragmentation) | Sampled allocation call stacks |
-| Answers | "What's in memory? How fragmented?" | "Which code allocated it?" |
-| Runtime cost | Zero until called | Zero when off; ~20% when on |
-| Output | binary → `mi-heapview` CLI | `profile.proto` → `go tool pprof` |
-
-## Sampling profiler (pprof-compatible)
-
-```sh
-MIMALLOC_PROF_SAMPLE_RATE=524288 MIMALLOC_PROF_PATH=/tmp/heap.pb ./your-program
-go tool pprof -inuse_space ./your-program /tmp/heap.pb
-```
-
-Or programmatically: `mi_prof_enable(512*1024)` then `mi_prof_dump_to_file(path)`.
-
-Sample types: `alloc_objects`, `alloc_space`, `inuse_objects`, `inuse_space`.
-Freed allocations are tracked (inuse counts are accurate). When the sample rate
-is 0, the malloc/free fast paths have **zero added instructions** — profiling
-hooks live entirely in the slow path, gated by poisoning `pages_free_direct`
-and a third page-flag bit.
+`mi_heap_snapshot` + `mi-heapview` give a full census of the heap structure (arenas, pages,
+blocks, fragmentation): "what is in memory, and how fragmented is it?". It costs nothing until
+it is called. To find out *which code* allocated the memory, use the sampled profiling hooks in
+`include/mimalloc-profile.h` (`mi_profiler_t` with `on_alloc`/`on_free`).
 
 ## Heap snapshot
 

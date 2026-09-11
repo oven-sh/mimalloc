@@ -110,7 +110,7 @@ int main(void) {
   };
   #if MI_INTPTR_BITS > 32
   CHECK_BODY("malloc-free-invalid-low") {
-    mi_free((void*)(MI_ZU(0x0000000003990080))); // issue #1087
+    mi_cfree((void*)(MI_ZU(0x0000000003990080))); // issue #1087
   };
   #endif
   CHECK_BODY("calloc-overflow") {
@@ -240,7 +240,7 @@ int main(void) {
     void* p[8];
     const int max_align_shift =
       #if SIZE_MAX > UINT32_MAX
-      28
+      28  /* up to 64 MiB alignment */
       #else
       20
       #endif
@@ -330,6 +330,24 @@ int main(void) {
     }
     result = ok;
   };
+  CHECK_BODY("zalloc-csize-large") {
+    // mi_theap_zalloc_csize must zero its large branch too: it used to
+    // delegate sizes above MI_SMALL_SIZE_MAX to the plain malloc path.
+    mi_theap_t* theap = mi_theap_get_default();
+    size_t size = MI_SMALL_SIZE_MAX + 64;
+    bool ok = true;
+    for (int round = 0; round < 16 && ok; round++) {
+      uint8_t* junk = (uint8_t*)mi_theap_malloc(theap, size);
+      memset(junk, 0xAB, size);
+      mi_free(junk);
+      uint8_t* z = (uint8_t*)mi_theap_zalloc_csize(theap, size);
+      for (size_t i = 0; i < size; i++) {
+        if (z[i] != 0) { ok = false; break; }
+      }
+      mi_free(z);
+    }
+    result = ok;
+  };
   CHECK_BODY("zalloc-aligned-small1") {
     size_t zalloc_size = MI_SMALL_SIZE_MAX / 2;
     uint8_t* p = (uint8_t*)mi_zalloc_aligned(zalloc_size, MI_MAX_ALIGN_SIZE * 2);
@@ -359,6 +377,7 @@ int main(void) {
     ptr = mi_rezalloc_aligned(ptr, n, alignment);
     assert(mem_has_vals((uint8_t*)ptr,n/2,123));
     result = mem_is_zero((uint8_t*)ptr + n/2, n/2);    
+    mi_free(ptr);
   }
 
   // ---------------------------------------------------
@@ -396,6 +415,7 @@ int main(void) {
         shared_ptr = mi_realloc(shared_ptr, i * 64);
       }
     }
+    mi_free(shared_ptr);
   }
 
   // ---------------------------------------------------
@@ -420,7 +440,23 @@ int main(void) {
     }
   }
   
+  CHECK_BODY("free_small3") {
+    for(size_t n = 1; n < MI_SMALL_SIZE_MAX/sizeof(int); n *=2) {
+      const size_t size = n*sizeof(int);
+      int* p = (int*)mi_zalloc_small(size);
+      p[n-1] = 42;
+      mi_free_small(p);
+    }
+  }
 
+  CHECK_BODY("free_small4") {
+    for(size_t n = 1; n < MI_SMALL_SIZE_MAX/sizeof(int); n *=2) {
+      const size_t size = n*sizeof(int);
+      int* p = (int*)mi_zalloc_small(size);
+      p[n-1] = 42;
+      mi_free(p);
+    }
+  }
   // ---------------------------------------------------
   // Returned block sizes
   // ---------------------------------------------------
@@ -440,7 +476,7 @@ int main(void) {
     }
   }
 
-  #if (MI_INTPTR_SIZE > 4)
+  #if (MI_SIZE_SIZE > 4)
   CHECK_BODY("arena_reserve") {
     result = (0==mi_reserve_os_memory(16*MI_GiB,false,true));
   }

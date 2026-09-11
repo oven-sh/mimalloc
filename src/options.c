@@ -49,7 +49,7 @@ int mi_version(void) {
 
 // in KiB
 #ifndef MI_DEFAULT_ARENA_RESERVE
- #if (MI_INTPTR_SIZE>4)
+ #if (MI_SIZE_SIZE>4)
   #define MI_DEFAULT_ARENA_RESERVE 1024L*1024L
  #else
   #define MI_DEFAULT_ARENA_RESERVE 128L*1024L
@@ -77,10 +77,10 @@ int mi_version(void) {
 #endif
 
 #ifndef MI_DEFAULT_GUARDED_SAMPLE_RATE
-#if MI_GUARDED && !MI_DEBUG
-#define MI_DEFAULT_GUARDED_SAMPLE_RATE 4000
+#if MI_GUARDED && MI_DEBUG
+#define MI_DEFAULT_GUARDED_SAMPLE_RATE  0  /* MI_MiB */
 #else
-#define MI_DEFAULT_GUARDED_SAMPLE_RATE 0
+#define MI_DEFAULT_GUARDED_SAMPLE_RATE  0
 #endif
 #endif
 
@@ -104,8 +104,13 @@ int mi_version(void) {
 #if defined(__ANDROID__)
 #define MI_DEFAULT_ALLOW_THP  0
 #else
-#define MI_DEFAULT_ALLOW_THP  1
+// #define MI_DEFAULT_ALLOW_THP  1    // allow THP but purging may split up THP pages
+#define MI_DEFAULT_ALLOW_THP  2       // allow THP and set the minimal purge size to 2MiB to avoid breaking them up
 #endif
+#endif
+
+#ifndef MI_DEFAULT_COLLECT_MERGES_STATS
+#define MI_DEFAULT_COLLECT_MERGES_STATS  1
 #endif
 
 // Static options
@@ -146,7 +151,7 @@ static mi_option_desc_t mi_options[_mi_option_last] =
   { 10,  MI_OPTION_UNINIT, MI_OPTION(deprecated_max_segment_reclaim)},       // max. percentage of the abandoned segments to be reclaimed per try.
   { 0,   MI_OPTION_UNINIT, MI_OPTION(destroy_on_exit)},           // release all OS memory on process exit; careful with dangling pointer or after-exit frees!
   { MI_DEFAULT_ARENA_RESERVE, MI_OPTION_UNINIT, MI_OPTION(arena_reserve) }, // reserve memory N KiB at a time (=1GiB) (use `option_get_size`)
-  { 1,   MI_OPTION_UNINIT, MI_OPTION(arena_purge_mult) },         // purge delay multiplier for arena's
+  { 1,   MI_OPTION_UNINIT, MI_OPTION(arena_purge_mult) },         // purge delay multiplier for arena's (fork: 1, upstream uses 4 with a 1000ms purge_delay; the scavenger thread purges here so 100ms x 1 is the measured setting)
   { 1,   MI_OPTION_UNINIT, MI_OPTION_LEGACY(deprecated_purge_extend_delay, decommit_extend_delay) },
   { MI_DEFAULT_DISALLOW_ARENA_ALLOC,   MI_OPTION_UNINIT, MI_OPTION(disallow_arena_alloc) }, // 1 = do not use arena's for allocation (except if using specific arena id's)
   { 400, MI_OPTION_UNINIT, MI_OPTION(retry_on_oom) },             // windows only: retry on out-of-memory for N milli seconds (=400), set to 0 to disable retries.
@@ -171,12 +176,13 @@ static mi_option_desc_t mi_options[_mi_option_last] =
          MI_OPTION_UNINIT, MI_OPTION(page_cross_thread_max_reclaim) }, // don't reclaim (small) pages across threads if we already own N pages in that size class
   { MI_DEFAULT_ALLOW_THP,
          MI_OPTION_UNINIT, MI_OPTION(allow_thp) },                // allow transparent huge pages? (=1) (on Android =0 by default). Set to 0 to opt the memory mimalloc maps out of THP.
-  { 0,   MI_OPTION_UNINIT, MI_OPTION(minimal_purge_size) },       // set minimal purge size (in KiB) (=0). Using 0 resolves to either 64 (or 2048 if `mi_option_allow_thp==2`).
+  { 0,   MI_OPTION_UNINIT, MI_OPTION(minimal_purge_size) },       // set minimal purge size (in KiB) (=0). Using 0 resolves to either 64 (or 2048 if THP is enabled).
   { MI_DEFAULT_ARENA_MAX_OBJECT_SIZE,
          MI_OPTION_UNINIT, MI_OPTION(arena_max_object_size) },    // set maximal object size that can be allocated in an arena (in KiB) (=2GiB on 64-bit).
   { 0,   MI_OPTION_UNINIT, MI_OPTION(arena_is_numa_local) },      // associate local numa node with an initial arena allocation
+  { MI_DEFAULT_COLLECT_MERGES_STATS,
+         MI_OPTION_UNINIT, MI_OPTION(collect_merges_stats) },     // on each theap collect, stats are merged with the parent heap
   { 0,   MI_OPTION_UNINIT, MI_OPTION(snapshot_on_exit) },         // write a heap snapshot on process exit (=0). 1=on, 2=on+blocks.
-  { 0,   MI_OPTION_UNINIT, MI_OPTION(prof_sample_rate) },         // bytes per heap-profile sample (=0, off). Typical: 524288.
   { 1,   MI_OPTION_UNINIT, MI_OPTION(scavenger) },                // run a background scavenger thread that purges freed arena memory when due (=1)
   { 1,   MI_OPTION_UNINIT, MI_OPTION(purge_holes) },              // discard free blocks inside a still-used page (=1)
   { 0,   MI_OPTION_UNINIT, MI_OPTION(purge_holes_eager_zero) },   // zero a hole before discarding it (=0; for testing)
@@ -246,16 +252,34 @@ mi_decl_export void mi_options_print_out(mi_output_fun* out, void* arg) mi_attr_
     _mi_fprintf(out, arg, "option '%s': %ld %s\n", desc->name, desc->value, (mi_option_has_size_in_kib(option) ? "KiB" : ""));
   }
 
-  // show build configuration
-  _mi_fprintf(out, arg, "debug level : %d\n", MI_DEBUG );
-  _mi_fprintf(out, arg, "secure level: %d\n", MI_SECURE );
-  _mi_fprintf(out, arg, "mem tracking: %s\n", MI_TRACK_TOOL);
+  // show build configuration  
+  #if MI_PAGE_META_IS_ALIGNED && MI_PAGE_META_SMALL_IS_ALIGNED
+  _mi_fprintf(out, arg, "free mode   : (small) aligned, page size: %zu\n", sizeof(mi_page_t));
+  #elif MI_PAGE_META_IS_ALIGNED
+  _mi_fprintf(out, arg, "free mode   : aligned, page size: %zu\n", sizeof(mi_page_t));
+  #elif MI_PAGE_META_SMALL_IS_ALIGNED
+  _mi_fprintf(out, arg, "free mode   : small aligned + pagemap, page size: %zu\n", sizeof(mi_page_t));
+  #elif MI_FREE_IS_CHECKED
+  _mi_fprintf(out, arg, "free mode   : checked, page size: %zu\n", sizeof(mi_page_t));
+  #else 
+  _mi_fprintf(out, arg, "free mode   : pagemap, page size: %zu\n", sizeof(mi_page_t));
+  #endif
+  #if MI_ENCODE_FREELIST
+  _mi_fprintf(out, arg, "free lists  : encoded with %d key(s)\n", MI_PAGE_KEY_COUNT);
+  #endif
   #if MI_GUARDED
-  _mi_fprintf(out, arg, "guarded build: %s\n", mi_option_get(mi_option_guarded_sample_rate) != 0 ? "enabled" : "disabled");
+  _mi_fprintf(out, arg, "guarded mode: %s, rate=%ld\n",  MI_SAMPLE==2 ? "fine-grained" : "enabled", mi_option_get(mi_option_guarded_sample_rate));
+  #endif  
+  #if MI_PROFILE
+  _mi_fprintf(out, arg, "profiling   : %s\n", MI_SAMPLE==2 ? "fine-grained" : "enabled");
   #endif
   #if MI_TSAN
   _mi_fprintf(out, arg, "thread santizer enabled\n");
   #endif
+  _mi_fprintf(out, arg, "mem tracking: %s\n", MI_TRACK_TOOL);  
+  _mi_fprintf(out, arg, "debug level : %d\n", MI_DEBUG );
+  _mi_fprintf(out, arg, "secure level: %d\n", MI_SECURE );
+  _mi_fprintf(out, arg, "padding     : %s\n", (MI_PADDING==0 ? "none" : (MI_PADDING==1 ? "enabled" : "byte precise")));  
 }
 
 mi_decl_export void mi_options_print(void) mi_attr_noexcept {
@@ -440,25 +464,12 @@ static void mi_add_stderr_output(void) {
 static _Atomic(size_t) error_count;   // = 0;  // when >= max_error_count stop emitting errors
 static _Atomic(size_t) warning_count; // = 0;  // when >= max_warning_count stop emitting warnings
 
-// When overriding malloc, we may recurse into mi_vfprintf if an allocation
-// inside the C runtime causes another message.
-// In some cases (like on macOS) the loader already allocates which
-// calls into mimalloc; if we then access thread locals (like `recurse`)
-// this may crash as the access may call _tlv_bootstrap that tries to
-// (recursively) invoke malloc again to allocate space for the thread local
-// variables on demand. This is why we use a _mi_preloading test on such
-// platforms. However, C code generator may move the initial thread local address
-// load before the `if` and we therefore split it out in a separate function.
-static mi_decl_thread bool recurse = false;
-
 static mi_decl_noinline bool mi_recurse_enter_prim(void) {
-  if (recurse) return false;
-  recurse = true;
   return true;
 }
 
 static mi_decl_noinline void mi_recurse_exit_prim(void) {
-  recurse = false;
+  /* nothing */
 }
 
 static bool mi_recurse_enter(void) {
@@ -628,6 +639,11 @@ void _mi_error_message(int err, const char* fmt, ...) {
   }
 }
 
+mi_decl_noinline mi_block_t* _mi_block_next_is_corrupted(const mi_page_t* page, const mi_block_t* block, const mi_block_t* next) {
+  _mi_error_message(EFAULT, "corrupted free list entry of size %zub at %p: value 0x%zx\n", mi_page_block_size(page), block, (uintptr_t)next);
+  return NULL;
+}
+    
 // --------------------------------------------------------
 // Initialize options by checking the environment
 // --------------------------------------------------------

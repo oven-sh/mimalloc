@@ -75,20 +75,12 @@ static void* zone_valloc(malloc_zone_t* zone, size_t size) {
 }
 
 static void zone_free(malloc_zone_t* zone, void* p) {
-  mi_page_t* const page = _mi_checked_ptr_page(p);  
-  if mi_likely(page!=NULL) {
-    mi_assert_internal(_mi_thread_is_initialized());  
-    _mi_free_in_page(p,page);
-    // if mi_likely(_mi_thread_is_initialized()) {
-    //   _mi_free_in_page(p,page);
-    // }
-    // else {
-    //   // during thread shutdown `_pthread_tsd_cleanup` may call `zone_free` on a pointer that was allocated in another subproc.
-    //   _mi_free_subproc_safe_in_page(p,page); 
-    // }
-  }
-  else if (!is_mimalloc_zone(zone)) {  // can happen due to interpose
-    zone->free(zone,p);
+  // during C++ thread shutdown `_pthread_tsd_cleanup` may call `zone_free` 
+  // after mimalloc mi_thread_done, and also on a pointer that was allocated in another subproc.
+  if mi_unlikely(!mi_cfree(p)) {
+    if (!is_mimalloc_zone(zone)) {  // can happen due to interpose
+      zone->free(zone,p);
+    }
   }
 }
 
@@ -228,8 +220,8 @@ static kern_return_t mi_zone_enum_remote_page(task_t task, memory_reader_t reade
   const size_t ubsize = bsize - MI_PADDING_SIZE;
   // `lpage` is a local copy of a page that lives in the TARGET process, so the block start
   // must be rebuilt from the remote page address -- mi_page_start(&lpage) would offset from
-  // our own copy. (The start is stored as an offset from the page struct, in `MI_MAX_ALIGN_SIZE` units.)
-  const vm_address_t pstart = (vm_address_t)(rpage + ((size_t)lpage.page_ma_offset * MI_MAX_ALIGN_SIZE));
+  // our own copy. (The start is stored as a byte offset from the page struct.)
+  const vm_address_t pstart = (vm_address_t)(rpage + lpage.page_offset);
 
   if (e->type_mask & MALLOC_PTR_REGION_RANGE_TYPE) {
     mi_zone_enum_flush(e, MALLOC_PTR_IN_USE_RANGE_TYPE);
@@ -237,7 +229,7 @@ static kern_return_t mi_zone_enum_remote_page(task_t task, memory_reader_t reade
     mi_zone_enum_flush(e, MALLOC_PTR_REGION_RANGE_TYPE);
   }
   if (!(e->type_mask & MALLOC_PTR_IN_USE_RANGE_TYPE)) return KERN_SUCCESS;
-  if (lpage.used == 0) return KERN_SUCCESS;
+  if (mi_page_used(&lpage) == 0) return KERN_SUCCESS;
 
   mi_block_t* xtf = (mi_block_t*)((uintptr_t)lpage.xthread_free & ~(uintptr_t)1);
   if (lpage.free == NULL && lpage.local_free == NULL && xtf == NULL) {
@@ -270,8 +262,9 @@ static kern_return_t mi_zone_enum_remote_page(task_t task, memory_reader_t reade
   return KERN_SUCCESS;
 }
 
+// `rarena_start`: the start of the arena memory area (`arena->start`; the `mi_arena_t` itself comes after the aligned page meta slices)
 static kern_return_t mi_zone_enum_remote_bitmap(task_t task, memory_reader_t reader,
-                                                mi_zone_enum_t* e, vm_address_t rarena,
+                                                mi_zone_enum_t* e, vm_address_t rarena_start,
                                                 vm_address_t rpages_meta, vm_address_t rbitmap)
 {
   size_t chunk_count;
@@ -284,16 +277,29 @@ static kern_return_t mi_zone_enum_remote_bitmap(task_t task, memory_reader_t rea
       while (b != 0) {
         size_t bit = mi_ctz(b);
         size_t slice_index = c*MI_BCHUNK_BITS + f*MI_BFIELD_BITS + bit;
+        vm_address_t rpage = rarena_start + slice_index * MI_ARENA_SLICE_SIZE;
+        #if MI_PAGE_META_IS_ALIGNED
+        // mirror `mi_arena_page_at_slice`: the aligned page meta entry of the slice points to the actual page
+        // struct through `self` (also for small-block pages that keep it at the slice start).
+        // (`_mi_aligned_ptr_page0` is address arithmetic only, so it is fine on a remote address)
+        MI_UNUSED(rpages_meta);
+        const vm_address_t rmeta = (vm_address_t)_mi_aligned_ptr_page0((const void*)rpage);
+        vm_address_t rself = 0;
+        MI_ZR(&rself, rmeta + offsetof(mi_page_t, self), sizeof(rself));
+        rpage = rself;
+        #else
         // mirror `mi_arena_page_at_slice`: with separated metadata, small-block
         // pages still keep the page struct at the slice start (block_size==0 in
         // pages_meta marks that case).
-        vm_address_t rpage = rarena + slice_index * MI_ARENA_SLICE_SIZE;
         if (rpages_meta != 0) {
           vm_address_t rmeta = rpages_meta + slice_index * sizeof(mi_page_t);
           size_t bs; MI_ZR(&bs, rmeta + offsetof(mi_page_t, block_size), sizeof(bs));
           if (bs > 0) rpage = rmeta;
         }
-        if (mi_zone_enum_remote_page(task, reader, e, rpage) != KERN_SUCCESS) return KERN_FAILURE;
+        #endif
+        if (rpage != 0) {
+          if (mi_zone_enum_remote_page(task, reader, e, rpage) != KERN_SUCCESS) return KERN_FAILURE;
+        }
         b &= b - 1;
       }
     }
@@ -323,7 +329,7 @@ static kern_return_t intro_enumerator(task_t task, void* context,
       mi_arena_t* ra = lsubproc.arenas[i];
       if (ra == NULL) continue;
       mi_arena_t la; MI_ZR(&la, ra, sizeof(la));
-      mi_zone_enum_push(&e, MALLOC_ADMIN_REGION_RANGE_TYPE, ra, la.slice_count * MI_ARENA_SLICE_SIZE);
+      mi_zone_enum_push(&e, MALLOC_ADMIN_REGION_RANGE_TYPE, la.start, la.slice_count * MI_ARENA_SLICE_SIZE);
     }
     mi_zone_enum_flush(&e, MALLOC_ADMIN_REGION_RANGE_TYPE);
   }
@@ -343,7 +349,7 @@ static kern_return_t intro_enumerator(task_t task, void* context,
       mi_arena_t la; MI_ZR(&la, ra, sizeof(la));
       mi_arena_pages_t lap; MI_ZR(&lap, rap, sizeof(lap));
       kern_return_t kr = mi_zone_enum_remote_bitmap(task, reader, &e,
-                            (vm_address_t)ra, (vm_address_t)la.pages_meta, (vm_address_t)lap.pages);
+                            (vm_address_t)la.start, (vm_address_t)la.pages_meta, (vm_address_t)lap.pages);
       if (kr != KERN_SUCCESS) return kr;
     }
     // OS-allocated abandoned pages (not in any arena bitmap)

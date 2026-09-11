@@ -42,15 +42,19 @@ terms of the MIT license.
 // > mimalloc-test-stress [THREADS] [SCALE] [ITER]
 //
 // argument defaults
-#if defined(MI_TSAN)          // with thread-sanitizer reduce the threads to test within the CI limits (240s on 4 cores)
+#if defined(MI_TSAN) && MI_TEST_LIGHT         // with thread-sanitizer reduce the threads to test within the azure pipeline limits
 static int THREADS = NTHREADS/4;
 static int SCALE   = 10;
 static int ITER    = 100;
+#elif defined(MI_TSAN)          // with thread-sanitizer reduce the threads to test within the azure pipeline limits
+static int THREADS = NTHREADS/4;
+static int SCALE   = 25;
+static int ITER    = 500;
 #elif defined(MI_UBSAN)       // with undefined behavious sanitizer reduce parameters to stay within the azure pipeline limits
 static int THREADS = NTHREADS/4;
 static int SCALE   = 25;
 static int ITER    = 20;
-#elif defined(MI_GUARDED)     // with debug guard pages reduce parameters to stay within the azure pipeline limits
+#elif (defined(MI_GUARDED) && MI_GUARDED>0)     // with debug guard pages reduce parameters to stay within the azure pipeline limits
 static int THREADS = NTHREADS/4;
 static int SCALE   = 25;
 static int ITER    = 10;
@@ -324,7 +328,7 @@ static void test_stress(mi_subproc_id_t subproc) {
     if ((n + 1) % 10 == 0) {
       printf("- iterations left: %3d\n", ITER - (n + 1));
       #ifndef USE_STD_MALLOC
-      // mi_debug_show_arenas();
+      mi_debug_show_arenas();
       #endif
       //mi_collect(true);
       //mi_debug_show_arenas();
@@ -421,7 +425,7 @@ int main(int argc, char** argv) {
   #endif  
   #if !defined(NDEBUG) && !defined(USE_STD_MALLOC)
     mi_option_set(mi_option_arena_reserve, (long)(mi_arena_min_size()/1024) /* in KiB ! */);
-    mi_option_set(mi_option_purge_delay,1);
+    // mi_option_set(mi_option_purge_delay,1);
   #endif
   #if defined(NDEBUG) && !defined(USE_STD_MALLOC)
     // mi_option_set(mi_option_purge_delay,-1);
@@ -485,7 +489,7 @@ int main(int argc, char** argv) {
   //  mi_free(json);
   //}
   #endif
-  mi_collect(true);
+  // mi_collect(true);
   mi_stats_print(NULL);
 #endif
   //bench_end_program();

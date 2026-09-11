@@ -98,7 +98,6 @@ typedef enum mi_collect_e {
 
 static bool mi_theap_page_collect(mi_theap_t* theap, mi_page_queue_t* pq, mi_page_t* page, void* arg_collect, void* arg2 ) {
   MI_UNUSED(arg2);
-  MI_UNUSED(theap);
   mi_assert_expensive(mi_theap_page_is_valid(theap, pq, page, NULL, NULL));
   mi_collect_t collect = *((mi_collect_t*)arg_collect);
   // A collect has no allocation to serve, so it must not un-purge: the allocation path
@@ -106,7 +105,8 @@ static bool mi_theap_page_collect(mi_theap_t* theap, mi_page_queue_t* pq, mi_pag
   // `mi_on_thread_idle`, which collects before it sweeps, un-purges a run of every page whose free
   // blocks are all discarded and then re-discards it: two syscalls per page per park, forever.
   if (theap->tld != NULL && mi_atomic_load_relaxed(&theap->tld->park_reclaim) != 0) return false;
-  _mi_page_free_collect_no_unpurge(page, collect >= MI_FORCE);
+  _mi_page_free_collect_no_unpurge(page, collect >= MI_FORCE);  // update used count
+  _mi_page_update_stats_for(page,theap);   // (on `theap`, which is not the calling thread's when the scavenger collects for a parked thread)
   if (mi_page_all_free(page)) {
     // no more used blocks, possibly free the page.
     if (collect >= MI_FORCE || page->retire_expire == 0) {  // either forced/abandon, or not already retired
@@ -122,7 +122,7 @@ static bool mi_theap_page_collect(mi_theap_t* theap, mi_page_queue_t* pq, mi_pag
 }
 
 void _mi_theap_merge_stats(mi_theap_t* theap) {
-  mi_assert_internal(mi_theap_is_initialized(theap));
+  mi_assert_internal(mi_theap_is_initialized(theap));  
   mi_heap_t* const heap = _mi_theap_heap(theap);
   _mi_stats_merge_into(&heap->stats, &theap->stats);
 }
@@ -150,12 +150,14 @@ static void mi_theap_collect_ex(mi_theap_t* theap, mi_collect_t collect)
   // wait would become an unbounded subproc-wide madvise pass. The sweep's caller runs the arena
   // purge itself as a reclaim-gated phase (`_mi_arenas_purge_now`).
   //mi_atomic_storei64_release(&theap->tld->subproc->purge_expire, 1);
-  if (theap->tld == NULL || mi_atomic_load_relaxed(&theap->tld->park_state) != MI_PARK_SWEEPING) {
+  if (collect != MI_ABANDON && (theap->tld == NULL || mi_atomic_load_relaxed(&theap->tld->park_state) != MI_PARK_SWEEPING)) {
     _mi_arenas_collect(collect == MI_FORCE /* force purge? */, collect >= MI_FORCE /* visit all? */, theap->tld);
   }
 
   // merge statistics
-  _mi_theap_merge_stats(theap);
+  if (mi_option_is_enabled(mi_option_collect_merges_stats)) {
+    _mi_theap_merge_stats(theap);
+  }
 }
 
 void _mi_theap_collect_abandon(mi_theap_t* theap) {
@@ -486,49 +488,11 @@ mi_theap_t* mi_theap_set_default(mi_theap_t* theap) {
   return previous;
 }
 
-#if MI_GUARDED
-mi_decl_export void mi_theap_guarded_set_sample_rate(mi_theap_t* theap, size_t sample_rate, size_t seed) {
-  theap->guarded_sample_rate  = sample_rate;
-  theap->guarded_sample_count = sample_rate;  // count down samples
-  if (theap->guarded_sample_rate > 1) {
-    if (seed == 0) {
-      seed = _mi_theap_random_next(theap);
-    }
-    theap->guarded_sample_count = (seed % theap->guarded_sample_rate) + 1;  // start at random count between 1 and `sample_rate`
-  }
-}
-
-mi_decl_export void mi_theap_guarded_set_size_bound(mi_theap_t* theap, size_t min, size_t max) {
-  theap->guarded_size_min = min;
-  theap->guarded_size_max = (min > max ? min : max);
-}
-
-static void mi_theap_guarded_init(mi_theap_t* theap) {
-  mi_theap_guarded_set_sample_rate(theap,
-    (size_t)mi_option_get_clamp(mi_option_guarded_sample_rate, 0, LONG_MAX),
-    (size_t)mi_option_get(mi_option_guarded_sample_seed));
-  mi_theap_guarded_set_size_bound(theap,
-    (size_t)mi_option_get_clamp(mi_option_guarded_min, 0, LONG_MAX),
-    (size_t)mi_option_get_clamp(mi_option_guarded_max, 0, LONG_MAX) );
-}
-#else
-mi_decl_export void mi_theap_guarded_set_sample_rate(mi_theap_t* theap, size_t sample_rate, size_t seed) {
-  MI_UNUSED(theap); MI_UNUSED(sample_rate); MI_UNUSED(seed);
-}
-
-mi_decl_export void mi_theap_guarded_set_size_bound(mi_theap_t* theap, size_t min, size_t max) {
-  MI_UNUSED(theap); MI_UNUSED(min); MI_UNUSED(max);
-}
-static void mi_theap_guarded_init(mi_theap_t* theap) {
-  MI_UNUSED(theap);
-}
-#endif
 
 static void mi_theap_options_init(mi_theap_t* theap) {
   theap->allow_page_reclaim = (mi_option_get(mi_option_page_reclaim_on_free) >= 0);
   theap->allow_page_abandon = (mi_option_get(mi_option_page_full_retain) >= 0);
   theap->page_full_retain = mi_option_get_clamp(mi_option_page_full_retain, -1, 32);
-  _mi_prof_theap_init(theap);   // fork: sampling state
   theap->is_detached = (theap->tld->thread_id == MI_THREADID_DETACHED);
 }
 
@@ -586,8 +550,8 @@ void _mi_theap_init(mi_theap_t* theap, mi_heap_t* heap, mi_tld_t* tld)
   else {
     _mi_random_split(&head_random, &theap->random); // &theap->random is used as nonce so it is ok if threads capture the same head->random
   }
-  theap->cookie = _mi_theap_random_next(theap) | 1;
-  mi_theap_guarded_init(theap); // needs theap->random
+  // theap->cookie = _mi_theap_random_next(theap) | 1;
+  _mi_theap_guarded_init(theap); // needs theap->random
   if (!theap->is_detached) {
     mi_subproc_stat_increase(_mi_theap_subproc(theap),theaps,1);  // on subproc to match theap_free_mem
   }
@@ -851,7 +815,7 @@ void _mi_heap_area_init(mi_heap_area_t* area, mi_page_t* page) {
   area->reserved = page->reserved * bsize;
   area->committed = page->capacity * bsize;
   area->blocks = mi_page_start(page);
-  area->used = page->used;   // number of blocks in use (#553)
+  area->used = mi_page_used(page);   // number of blocks in use (#553)
   area->block_size = ubsize;
   area->full_block_size = bsize;
   area->reserved1 = page;
@@ -877,7 +841,7 @@ bool _mi_theap_area_visit_blocks(const mi_heap_area_t* area, mi_page_t* page, mi
 
   _mi_page_free_collect_no_unpurge(page,true);   // collect both thread_delayed and local_free; visiting must not un-purge a hole
   mi_assert_internal(page->local_free == NULL);
-  if (page->used == 0) return true;
+  if (mi_page_used(page) == 0) return true;
 
   size_t psize;
   uint8_t* const pstart = mi_page_area(page, &psize);
@@ -887,13 +851,13 @@ bool _mi_theap_area_visit_blocks(const mi_heap_area_t* area, mi_page_t* page, mi
 
   // optimize page with one block
   if (page->capacity == 1) {
-    mi_assert_internal(page->used == 1 && page->free == NULL);
+    mi_assert_internal(mi_page_used(page) == 1 && page->free == NULL);
     return visitor(heap, area, pstart, ubsize, arg);
   }
   mi_assert(bsize <= UINT32_MAX);
 
   // optimize full pages
-  if (page->used == page->capacity) {
+  if (mi_page_used(page) == page->capacity) {
     uint8_t* block = pstart;
     for (size_t i = 0; i < page->capacity; i++) {
       if (!visitor(heap, area, block, ubsize, arg)) return false;
@@ -953,7 +917,7 @@ bool _mi_theap_area_visit_blocks(const mi_heap_area_t* area, mi_page_t* page, mi
       free_map[bitidx] |= ((uintptr_t)1 << bit);
     }
   }
-  mi_assert_internal(page->capacity == (free_count + purged_count + page->used));
+  mi_assert_internal(page->capacity == (free_count + purged_count + mi_page_used(page)));
 
   // walk through all blocks skipping the free ones
   #if MI_DEBUG>1
@@ -985,7 +949,7 @@ bool _mi_theap_area_visit_blocks(const mi_heap_area_t* area, mi_page_t* page, mi
       block += bsize * MI_INTPTR_BITS;
     }
   }
-  mi_assert_internal(page->used == used_count);
+  mi_assert_internal(mi_page_used(page) == used_count);
   return true;
 }
 

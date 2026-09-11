@@ -18,6 +18,14 @@ terms of the MIT license. A copy of the license can be found in the file
 #include <stdbool.h>  // bool
 #include <limits.h>   // LONG_MAX
 
+#if defined(__cplusplus)
+#define mi_decl_externc         extern "C"
+#define mi_init_struct_zero     { }
+#else
+#define mi_decl_externc
+#define mi_init_struct_zero     { 0 }
+#endif
+
 // ------------------------------------------------------
 // Size of a pointer.
 // We assume that `sizeof(void*)==sizeof(intptr_t)`
@@ -127,10 +135,10 @@ typedef int32_t  mi_ssize_t;
 #define MI_MAX_VABITS     (32)
 #endif
 
-// the MI_MIN_VABITS determine how many bits of the address are always mapped in the page_map
+// the MI_MIN_VABITS determine how many bits of the address space are always committed in the page_map
 #if MI_MAX_VABITS <= 32
 #define MI_MIN_VABITS     (32)
-#elif MI_MAX_VABITS <= 43
+#elif MI_MAX_VABITS <= 42
 #define MI_MIN_VABITS     MI_MAX_VABITS
 #else
 #define MI_MIN_VABITS     (43)    /* 8 TiB */
@@ -138,7 +146,7 @@ typedef int32_t  mi_ssize_t;
 
 // use a flat page-map or a 2-level one
 #ifndef MI_PAGE_MAP_FLAT
-#if MI_MAX_VABITS <= 40 && !defined(__APPLE__) && MI_SECURE==0 // && !MI_PAGE_META_IS_SEPARATED
+#if MI_MAX_VABITS <= 40 && !defined(__APPLE__) && !MI_SECURE && !MI_FREE_IS_CHECKED && MI_FREE_USE_PAGEMAP 
 #define MI_PAGE_MAP_FLAT  1
 #else
 #define MI_PAGE_MAP_FLAT  0

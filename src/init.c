@@ -19,24 +19,35 @@ static void mi_tld_register(mi_tld_t* tld);   // fork: tld registry for the scav
 
 // Empty page used to initialize the small free pages array
 static const mi_page_t mi_page_empty = {
+  #if MI_PAGE_META_IS_ALIGNED
+  MI_ATOMIC_VAR_INIT(NULL),  // self
+  #endif
   MI_ATOMIC_VAR_INIT(0),  // xthread_id
   NULL,                   // free
-  0,                      // used
+  {0},                    // xused
+  #if MI_SIZE_SIZE < 8
+  0,                      // xlast_used
+  0,                      // xlast_alloc
+  #endif
+  NULL,                   // local_free
+  0,                      // block_size
+  0,                      // page_offset
   0,                      // capacity
+  0,                      // reserved capacity
+  0,                      // slice_pcommitted
   0,                      // retire_expire
   false,                  // is_zero
-  NULL,                   // local_free
   MI_ATOMIC_VAR_INIT(0),  // xthread_free
-  0,                      // block_size
-  0,                      // page_ma_offset
-  0,                      // slice_pcommitted
-  0,                      // reserved capacity
   NULL,                   // theap
   NULL,                   // heap
   NULL, NULL,             // next, prev
   MI_MEMID_STATIC,        // memid
   #if (MI_PADDING || MI_ENCODE_FREELIST)
+  #if MI_PAGE_KEY_COUNT==2
   { 0, 0 },               // keys
+  #else
+  { 0 },                  // key
+  #endif
   #endif
   { 0 },                  // purged (fork)
   0, 0,                   // unformed_purged_lo/hi (fork)
@@ -45,12 +56,20 @@ static const mi_page_t mi_page_empty = {
 
 #define MI_PAGE_EMPTY() ((mi_page_t*)&mi_page_empty)
 
-#if (MI_PADDING>0) && (MI_INTPTR_SIZE >= 8)
-#define MI_SMALL_PAGES_EMPTY  { MI_INIT128(MI_PAGE_EMPTY), MI_PAGE_EMPTY(), MI_PAGE_EMPTY() }
-#elif (MI_PADDING>0)
-#define MI_SMALL_PAGES_EMPTY  { MI_INIT128(MI_PAGE_EMPTY), MI_PAGE_EMPTY(), MI_PAGE_EMPTY(), MI_PAGE_EMPTY() }
+#if MI_SMALL_WSIZE_MAX == 128
+#define MI_INIT_PAGES_DIRECT(p)  MI_INIT128(p)
+#elif MI_SMALL_WSIZE_MAX == 256
+#define MI_INIT_PAGES_DIRECT(p)  MI_INIT128(p), MI_INIT128(p)
 #else
-#define MI_SMALL_PAGES_EMPTY  { MI_INIT128(MI_PAGE_EMPTY), MI_PAGE_EMPTY() }
+#error define initializer for direct pages
+#endif
+
+#if (MI_PADDING>0) && (MI_SIZE_SIZE >= 8)
+#define MI_SMALL_PAGES_EMPTY  { MI_INIT_PAGES_DIRECT(MI_PAGE_EMPTY), MI_PAGE_EMPTY(), MI_PAGE_EMPTY() }
+#elif (MI_PADDING>0)
+#define MI_SMALL_PAGES_EMPTY  { MI_INIT_PAGES_DIRECT(MI_PAGE_EMPTY), MI_PAGE_EMPTY(), MI_PAGE_EMPTY(), MI_PAGE_EMPTY() }
+#else
+#define MI_SMALL_PAGES_EMPTY  { MI_INIT_PAGES_DIRECT(MI_PAGE_EMPTY), MI_PAGE_EMPTY() }
 #endif
 
 
@@ -112,17 +131,24 @@ static mi_decl_cache_align mi_tld_t mi_tld_detached = {
   MI_ATOMIC_VAR_INIT(0),  // park_swept
   NULL,                   // subproc_next
   0, 0,                   // holes_sweep_seq / _last
-  false, false, 0, 0,     // holes_sweeping / _full / _skipped / _visited
-  false                   // prof_sampling
+  false, false, 0, 0      // holes_sweeping / _full / _skipped / _visited
 };
 
 mi_decl_hidden mi_decl_cache_align const mi_theap_t _mi_theap_empty = {
+  MI_SMALL_PAGES_EMPTY,   // direct small pages  
   &mi_tld_detached,       // tld
   MI_ATOMIC_VAR_INIT(NULL), // heap
   MI_ATOMIC_VAR_INIT(NULL), // subproc
   MI_ATOMIC_VAR_INIT(1),  // refcount
+  0,                      // full page retain
+  false,                  // allow reclaim
+  true,                   // allow abandon
+  true,                   // is_detached 
+  ~MI_ZU(0),              // sample countdown: "-1" (with a sample rate of 0, so we won't write to the empty theap with MI_SAMPLE==2)  
+  0, 0,                   // sample rate, requested
+  0, 0,                   // profile rate, countdown
+  0, 0, 0, 0,             // guarded rate, countdown, min, max
   0,                      // heartbeat
-  0,                      // cookie
   { {0}, {0}, 0, true },  // random
   0,                      // page count
   MI_BIN_FULL, 0,         // page retired min/max
@@ -130,15 +156,6 @@ mi_decl_hidden mi_decl_cache_align const mi_theap_t _mi_theap_empty = {
   0, 0,                   // generic count
   NULL, NULL,             // tnext, tprev
   NULL, NULL,             // hnext, hprev
-  0,                      // full page retain
-  false,                  // allow reclaim
-  true,                   // allow abandon
-  true,                   // is_detached
-  false, 0,               // prof_force_slow, prof_countdown (fork)
-  #if MI_GUARDED
-  0, 0, 0, 1,             // rate is 0 and count is 1 so we never write to it (see `internal.h:mi_heap_malloc_use_guarded`)
-  #endif
-  MI_SMALL_PAGES_EMPTY,
   MI_PAGE_QUEUES_EMPTY,
   MI_MEMID_STATIC,
   MI_STATS_NULL,          // stats
@@ -202,6 +219,8 @@ static void mi_heap_main_init_once(void) {
   _mi_theap_init(&mi_process_theap_meta,&mi_process_heap_main,&mi_tld_detached);
   mi_process_theap_meta.allow_page_abandon = false;  // for security, don't share with other threads
   mi_process_theap_meta.page_full_retain = 2;
+  mi_process_theap_meta.sample_rate = 0; // no sampling for meta data
+  mi_process_theap_meta.sample_countdown = 0;
   subproc_main->theap_meta = &mi_process_theap_meta;
 
   // mi_heap_theap_set(&mi_process_heap_main,&mi_process_theap_main); // set in `mi_thread_init(_theap_default)`
@@ -627,7 +646,6 @@ static void mi_process_init_once(void) {
 
   // mi_stats_reset();  // only call stat reset *after* thread init (or the theap tld == NULL)
   mi_track_init();
-  _mi_prof_init();
   if (mi_option_is_enabled(mi_option_reserve_huge_os_pages)) {
     size_t pages = mi_option_get_clamp(mi_option_reserve_huge_os_pages, 0, 128*1024);
     int reserve_at  = (int)mi_option_get_clamp(mi_option_reserve_huge_os_pages_at, -1, INT_MAX);
@@ -666,8 +684,7 @@ void mi_process_init(void) mi_attr_noexcept {
 // Called when the process is done
 static void mi_process_done_once(void) {
   _mi_scavenger_stop();          // fork: stop the background scavenger before any teardown
-  _mi_heap_snapshot_on_exit();   // fork: heap snapshot / profile at exit, before anything is torn down
-  _mi_prof_on_exit();
+  _mi_heap_snapshot_on_exit();   // fork: heap snapshot at exit, before anything is torn down
   // only shutdown if we were initialized
   if (!_mi_process_is_initialized) return;
   // ensure we are called once
@@ -691,7 +708,7 @@ static void mi_process_done_once(void) {
   #endif
 
   // done with tracking tools
-  mi_track_done()
+  mi_track_done();
 
   // Forcefully release all retained memory; this can be dangerous in general if overriding regular malloc/free
   // since after process_done there might still be other code running that calls `free` (like at_exit routines,
@@ -706,10 +723,11 @@ static void mi_process_done_once(void) {
     _mi_thread_locals_done();
     if (subproc_main->heap_main != NULL) {
       if (mi_option_is_enabled(mi_option_show_stats) || mi_option_is_enabled(mi_option_verbose)) {
+        mi_theap_collect(subproc_main->theap_meta, false /* force */); // update stats of all pages in theap_meta
         _mi_theap_merge_stats(subproc_main->theap_meta);
         _mi_theap_merge_stats(_mi_theap_default());  // _mi_thread_locals_done can free
         mi_heap_stats_merge_to_subproc(subproc_main->heap_main);
-        mi_subproc_stats_print_out(mi_subproc_main(), NULL, NULL);
+        mi_subproc_stats_print_out(mi_subproc_main(), NULL, NULL); // note: can try to access (the now freed) thread_locals in mi_heap_theap_peek
       }
     }
   }
@@ -717,7 +735,7 @@ static void mi_process_done_once(void) {
   _mi_tls_slots_done();
   _mi_subproc_main_done();
   _mi_allocator_done();
-  _mi_verbose_message("process done\n"); // : 0x%zx\n", mi_process_tld_main.thread_id);
+  _mi_verbose_message("process done %zu\n", sizeof(mi_page_t)); // : 0x%zx\n", mi_process_tld_main.thread_id);
   os_preloading = true; // don't call the C runtime anymore
 }
 

@@ -174,7 +174,7 @@
       <SDLCheck>true</SDLCheck>
       <ConformanceMode>Default</ConformanceMode>
       <AdditionalIncludeDirectories>../../include</AdditionalIncludeDirectories>
-      <PreprocessorDefinitions>MI_DEBUG=3;%(PreprocessorDefinitions);</PreprocessorDefinitions>
+      <PreprocessorDefinitions>MI_OPT_FREE=1;MI_DEBUG=3;%(PreprocessorDefinitions);</PreprocessorDefinitions>
       <CompileAs>CompileAsCpp</CompileAs>
       <SupportJustMyCode>false</SupportJustMyCode>
       <LanguageStandard>stdcpp20</LanguageStandard>
@@ -194,7 +194,7 @@
       <SDLCheck>true</SDLCheck>
       <ConformanceMode>Default</ConformanceMode>
       <AdditionalIncludeDirectories>../../include</AdditionalIncludeDirectories>
-      <PreprocessorDefinitions>MI_DEBUG=3;%(PreprocessorDefinitions);</PreprocessorDefinitions>
+      <PreprocessorDefinitions>MI_OPT_FREE=1;MI_DEBUG=3;%(PreprocessorDefinitions);</PreprocessorDefinitions>
       <CompileAs>CompileAsCpp</CompileAs>
       <SupportJustMyCode>false</SupportJustMyCode>
       <LanguageStandard>stdcpp20</LanguageStandard>
@@ -222,7 +222,7 @@
       <SDLCheck>true</SDLCheck>
       <ConformanceMode>Default</ConformanceMode>
       <AdditionalIncludeDirectories>../../include</AdditionalIncludeDirectories>
-      <PreprocessorDefinitions>MI_DEBUG=3;%(PreprocessorDefinitions);</PreprocessorDefinitions>
+      <PreprocessorDefinitions>MI_OPT_FREE=1;MI_DEBUG=3;%(PreprocessorDefinitions);</PreprocessorDefinitions>
       <CompileAs>CompileAsCpp</CompileAs>
       <SupportJustMyCode>false</SupportJustMyCode>
       <LanguageStandard>stdcpp20</LanguageStandard>
@@ -250,7 +250,7 @@
       <SDLCheck>true</SDLCheck>
       <ConformanceMode>Default</ConformanceMode>
       <AdditionalIncludeDirectories>../../include</AdditionalIncludeDirectories>
-      <PreprocessorDefinitions>MI_DEBUG=3;MI_GUARDED=0;%(PreprocessorDefinitions);</PreprocessorDefinitions>
+      <PreprocessorDefinitions>MI_OPT_FREE=1;MI_DEBUG=3;MI_GUARDED=0;%(PreprocessorDefinitions);</PreprocessorDefinitions>
       <CompileAs>CompileAsCpp</CompileAs>
       <SupportJustMyCode>false</SupportJustMyCode>
       <LanguageStandard>stdcpp20</LanguageStandard>
@@ -278,7 +278,7 @@
       <FunctionLevelLinking>true</FunctionLevelLinking>
       <ConformanceMode>Default</ConformanceMode>
       <AdditionalIncludeDirectories>../../include</AdditionalIncludeDirectories>
-      <PreprocessorDefinitions>%(PreprocessorDefinitions);NDEBUG</PreprocessorDefinitions>
+      <PreprocessorDefinitions>MI_OPT_FREE=1;%(PreprocessorDefinitions);NDEBUG</PreprocessorDefinitions>
       <AssemblerOutput>AssemblyAndSourceCode</AssemblerOutput>
       <AssemblerListingLocation>$(IntDir)</AssemblerListingLocation>
       <WholeProgramOptimization>false</WholeProgramOptimization>
@@ -307,7 +307,7 @@
       <FunctionLevelLinking>true</FunctionLevelLinking>
       <ConformanceMode>Default</ConformanceMode>
       <AdditionalIncludeDirectories>../../include</AdditionalIncludeDirectories>
-      <PreprocessorDefinitions>%(PreprocessorDefinitions);NDEBUG</PreprocessorDefinitions>
+      <PreprocessorDefinitions>MI_OPT_FREE=1;%(PreprocessorDefinitions);NDEBUG</PreprocessorDefinitions>
       <AssemblerOutput>AssemblyAndSourceCode</AssemblerOutput>
       <AssemblerListingLocation>$(IntDir)</AssemblerListingLocation>
       <WholeProgramOptimization>false</WholeProgramOptimization>
@@ -343,7 +343,7 @@
       <FunctionLevelLinking>true</FunctionLevelLinking>
       <ConformanceMode>Default</ConformanceMode>
       <AdditionalIncludeDirectories>../../include</AdditionalIncludeDirectories>
-      <PreprocessorDefinitions>%(PreprocessorDefinitions);NDEBUG</PreprocessorDefinitions>
+      <PreprocessorDefinitions>MI_OPT_FREE=1;%(PreprocessorDefinitions);NDEBUG</PreprocessorDefinitions>
       <AssemblerOutput>AssemblyAndSourceCode</AssemblerOutput>
       <AssemblerListingLocation>$(IntDir)</AssemblerListingLocation>
       <WholeProgramOptimization>false</WholeProgramOptimization>
@@ -380,7 +380,7 @@
       <FunctionLevelLinking>true</FunctionLevelLinking>
       <ConformanceMode>Default</ConformanceMode>
       <AdditionalIncludeDirectories>../../include</AdditionalIncludeDirectories>
-      <PreprocessorDefinitions>%(PreprocessorDefinitions);NDEBUG</PreprocessorDefinitions>
+      <PreprocessorDefinitions>MI_OPT_FREE=1;%(PreprocessorDefinitions);NDEBUG</PreprocessorDefinitions>
       <AssemblerOutput>AssemblyAndSourceCode</AssemblerOutput>
       <AssemblerListingLocation>$(IntDir)</AssemblerListingLocation>
       <WholeProgramOptimization>false</WholeProgramOptimization>
@@ -451,6 +451,8 @@
     </ClCompile>
     <ClCompile Include="..\..\src\heap.c" />
     <ClCompile Include="..\..\src\prim\prim-tls.c" />
+    <ClCompile Include="..\..\src\sample-guarded.c" />
+    <ClCompile Include="..\..\src\sample-profile.c" />
     <ClCompile Include="..\..\src\subproc.c" />
     <ClCompile Include="..\..\src\theap.c" />
     <ClCompile Include="..\..\src\init.c" />
@@ -488,6 +490,7 @@
     <ClInclude Include="$(ProjectDir)..\..\include\mimalloc.h" />
     <ClInclude Include="$(ProjectDir)..\..\include\mimalloc-override.h" />
     <ClInclude Include="..\..\include\mimalloc-new-delete.h" />
+    <ClInclude Include="..\..\include\mimalloc-profile.h" />
     <ClInclude Include="..\..\include\mimalloc-stats.h" />
     <ClInclude Include="..\..\include\mimalloc\atomic.h" />
     <ClInclude Include="..\..\include\mimalloc\bits.h" />

@@ -17,6 +17,7 @@ terms of the MIT license. A copy of the license can be found in the file
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include <errno.h>
 
 #include "mimalloc.h"
 #include "mimalloc-stats.h"
@@ -1013,8 +1014,8 @@ static bool test_holes_report(int mode) {
     }
     // the ground truth assumes every OTHER block in the page is free, so the page must be
     // exclusively ours (`used` also counts uncollected thread frees; this test is single-threaded)
-    if (page->used != nmine) {
-      fprintf(stderr, "\n  page %p is not exclusively ours: used=%zu but we hold %zu\n", (void*)page, (size_t)page->used, nmine);
+    if (mi_page_used(page) != nmine) {
+      fprintf(stderr, "\n  page %p is not exclusively ours: used=%zu but we hold %zu\n", (void*)page, mi_page_used(page), nmine);
       free(live);
       ok = false; goto done;
     }
@@ -1327,8 +1328,8 @@ static bool test_sweep_skip(void) {
       live[idx / 64] |= ((uint64_t)1 << (idx % 64));
       nmine++;
     }
-    if (page->used != nmine) {   // the oracle below assumes every other block in the page is free
-      fprintf(stderr, "\n  page %p is not exclusively ours: used=%zu but we hold %zu\n", (void*)page, (size_t)page->used, nmine);
+    if (mi_page_used(page) != nmine) {   // the oracle below assumes every other block in the page is free
+      fprintf(stderr, "\n  page %p is not exclusively ours: used=%zu but we hold %zu\n", (void*)page, mi_page_used(page), nmine);
       ok = false; goto done;
     }
     if (nmine < 2) continue;     // freeing the victim must not free the page
@@ -1505,6 +1506,82 @@ done:
 }
 
 // ---------------------------------------------------------------------------
+// a double free of a purged block is reported as a double free
+//
+// A purged block is free, on no free list, and its memory reads back as zeros. The padding canary
+// (which is how a double free is recognized in a debug or secure build) is part of that memory, so
+// a zero canary would read as a buffer overflow, and the check itself would fault the discarded OS
+// page back in. `mi_free` checks the purged bitmap first.
+// ---------------------------------------------------------------------------
+
+#if (MI_PADDING || MI_SECURE>=3)
+static volatile int dfree_eagain;
+static volatile int dfree_other;
+static void dfree_error(int err, void* arg) {
+  (void)arg;
+  if (err == EAGAIN) { dfree_eagain++; } else { dfree_other++; }
+}
+#endif
+
+static bool test_double_free_of_purged_block(void) {
+  #if !(MI_PADDING || MI_SECURE>=3)
+  return true;   // double frees are not checked in this build
+  #else
+  if (!purging_enabled) return true;
+  const size_t os = _mi_os_page_size();
+  const size_t n = 256;
+  void** ptrs = (void**)calloc(n, sizeof(void*));
+  void** freed = (void**)calloc(n, sizeof(void*));
+  void* victim = NULL;
+  bool ok = true;
+  if (ptrs == NULL || freed == NULL) { free(ptrs); free(freed); return false; }
+  for (size_t i = 0; i < n; i++) {
+    ptrs[i] = mi_malloc(os);
+    if (ptrs[i] == NULL) { ok = false; goto done; }
+  }
+  for (size_t i = 0; i < n; i++) {
+    if ((i % 64) != 0) { freed[i] = ptrs[i]; mi_free(ptrs[i]); ptrs[i] = NULL; }   // 63 of every 64 blocks: whole OS pages
+  }
+  mi_on_thread_idle();
+
+  // find a freed block that is purged now, and whose last bytes (where the padding canary is) are discarded
+  for (size_t i = 0; i < n && victim == NULL; i++) {
+    if (freed[i] == NULL) continue;
+    mi_page_t* const page = _mi_safe_ptr_page(freed[i]);   // (NULL if the page was freed as a whole in the meantime)
+    if (page == NULL || mi_page_is_abandoned(page) || !mi_page_block_is_purged(page, freed[i])) continue;   // (the purged bitmap is only checked on a free by the owning thread)
+    const uintptr_t last = (uintptr_t)freed[i] + mi_page_block_size(page) - 1;
+    if (mi_page_os_page_purged(page, (size_t)(last - mi_page_purge_base(page)) / os)) { victim = freed[i]; }
+  }
+  if (victim == NULL) { fprintf(stderr, "\n  no block was purged, so this proves nothing\n"); ok = false; goto done; }
+
+  {
+    mi_page_t* const page = _mi_ptr_page(victim);
+    const size_t used = mi_page_used(page);
+    const hole_stats_t s1 = hole_stats();
+    dfree_eagain = 0; dfree_other = 0;
+    mi_register_error(&dfree_error, NULL);
+    mi_free(victim);   // double free
+    mi_register_error(NULL, NULL);
+    const hole_stats_t s2 = hole_stats();
+    if (dfree_eagain != 1 || dfree_other != 0) {
+      fprintf(stderr, "\n  the double free of a purged block raised %d double-free errors and %d other errors (expected 1 and 0)\n", dfree_eagain, dfree_other);
+      ok = false; goto done;
+    }
+    if (mi_page_used(page) != used || !mi_page_block_is_purged(page, victim) || s2.reuses != s1.reuses || s2.bytes_now != s1.bytes_now) {
+      fprintf(stderr, "\n  the double free of a purged block changed the page (used %zu -> %zu, reuses %lld -> %lld)\n",
+              used, mi_page_used(page), (long long)s1.reuses, (long long)s2.reuses);
+      ok = false; goto done;
+    }
+  }
+
+done:
+  for (size_t i = 0; i < n; i++) { if (ptrs[i] != NULL) mi_free(ptrs[i]); }
+  free(ptrs); free(freed);
+  return ok;
+  #endif
+}
+
+// ---------------------------------------------------------------------------
 // the skip cannot lose memory forever
 //
 // `(capacity,used)` cannot see a page that CHURNED: as many frees as allocs between two sweeps
@@ -1550,7 +1627,7 @@ static bool test_sweep_full_every(void) {
     if (ptrs[i] != NULL && _mi_ptr_page(ptrs[i]) == page) { mi_free(ptrs[i]); ptrs[i] = NULL; break; }
   }
   s0 = hole_stats();
-  page->swept_state = (((uint64_t)page->capacity) << 32) | (uint64_t)page->used;   // must match mi_page_sweep_state() in page.c
+  page->swept_state = (((uint64_t)page->capacity) << 32) | (uint64_t)mi_page_used(page);   // must match mi_page_sweep_state() in page.c
 
   // with no periodic full sweep the page is now wedged: no amount of parking finds the hole
   for (int r = 0; r < BOUND_EVERY * 2; r++) { mi_on_thread_idle(); }
@@ -1678,6 +1755,7 @@ int main(void) {
   CHECK("unformed-tail-freed", test_unformed_tail_freed());
   CHECK("sweep-skips-unchanged-pages", test_sweep_skip());
   CHECK("sweep-does-not-unpurge-on-collect", test_sweep_no_unpurge_on_collect());
+  CHECK("double-free-of-a-purged-block", test_double_free_of_purged_block());
   CHECK("sweep-full-every-bounds-a-missed-hole", test_sweep_full_every());
 
   // everything above is freed by now, so every hole must have been handed back
