@@ -22,6 +22,7 @@ int main(void) { printf("test-park-handoff: skipped on Windows (uses pthreads/fo
 #include "mimalloc.h"
 #include <pthread.h>
 #include <sched.h>
+#include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -439,6 +440,25 @@ static void test_park_inside_window_gets_swept(void) {
 // straight out of the churned pages' free lists without meeting a corrupt entry (which aborts) and
 // without two allocations aliasing. Refilling exactly the freed slots forces exactly that path.
 // ---------------------------------------------------------------------------
+#if defined(__APPLE__) || defined(__GLIBC__)
+#include <execinfo.h>
+#define FORK_CHILD_HAS_BACKTRACE 1
+#endif
+
+// in the forked child: say where a fault happened (there is no core dump to look at on a CI machine)
+static void fork_child_fault(int sig, siginfo_t* info, void* ctx) {
+  (void)ctx;
+  char buf[128];
+  const int n = snprintf(buf, sizeof(buf), "\n  forked child: signal %d at address %p (in a mimalloc heap: %d)\n", sig, info->si_addr, (int)mi_is_in_heap_region(info->si_addr));
+  if (n > 0) { (void)!write(2, buf, (size_t)n); }
+  #if FORK_CHILD_HAS_BACKTRACE
+  void* frames[48];
+  const int count = backtrace(frames, 48);
+  backtrace_symbols_fd(frames, count, 2);
+  #endif
+  _exit(64 + sig);
+}
+
 static void test_fork_while_parked(void) {
   enum { ROUNDS = 16 };
   bool all_ok = true;
@@ -451,6 +471,12 @@ static void test_fork_while_parked(void) {
     const pid_t pid = fork();
     if (pid == 0) {
       // child: allocate out of the inherited free lists and check for aliasing
+      struct sigaction sa;
+      memset(&sa, 0, sizeof(sa));
+      sa.sa_sigaction = &fork_child_fault;
+      sa.sa_flags = SA_SIGINFO;
+      sigaction(SIGSEGV, &sa, NULL);
+      sigaction(SIGBUS, &sa, NULL);
       const size_t ke = keep_every();
       int bad = 0;
       for (int i = 0; i < LIVE; i++) {
@@ -477,7 +503,7 @@ static void test_fork_while_parked(void) {
       if (waitpid(pid, &status, 0) < 0 || !WIFEXITED(status) || WEXITSTATUS(status) != 0) {
         all_ok = false;
         if (WIFSIGNALED(status)) { fprintf(stderr, "\n  round %d: the child was killed by signal %d\n", r, WTERMSIG(status)); }
-        else if (WIFEXITED(status)) { fprintf(stderr, "\n  round %d: the child failed with %d (1: out of memory, 2: a survivor changed, 3: two allocations alias)\n", r, WEXITSTATUS(status)); }
+        else if (WIFEXITED(status)) { fprintf(stderr, "\n  round %d: the child failed with %d (1: out of memory, 2: a survivor changed, 3: two allocations alias, 64+n: signal n)\n", r, WEXITSTATUS(status)); }
         else { fprintf(stderr, "\n  round %d: waitpid failed or the child stopped (status 0x%x)\n", r, (unsigned)status); }
       }
       if (first_corrupt_survivor(p) >= 0) {   // and the parent stays intact
