@@ -474,8 +474,16 @@ static void test_fork_while_parked(void) {
     else {
       int status = 0;
       // a corrupt free-list entry aborts the child (a signal), which is a failure too
-      if (waitpid(pid, &status, 0) < 0 || !WIFEXITED(status) || WEXITSTATUS(status) != 0) { all_ok = false; }
-      if (first_corrupt_survivor(p) >= 0) { all_ok = false; }   // and the parent stays intact
+      if (waitpid(pid, &status, 0) < 0 || !WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+        all_ok = false;
+        if (WIFSIGNALED(status)) { fprintf(stderr, "\n  round %d: the child was killed by signal %d\n", r, WTERMSIG(status)); }
+        else if (WIFEXITED(status)) { fprintf(stderr, "\n  round %d: the child failed with %d (1: out of memory, 2: a survivor changed, 3: two allocations alias)\n", r, WEXITSTATUS(status)); }
+        else { fprintf(stderr, "\n  round %d: waitpid failed or the child stopped (status 0x%x)\n", r, (unsigned)status); }
+      }
+      if (first_corrupt_survivor(p) >= 0) {   // and the parent stays intact
+        all_ok = false;
+        fprintf(stderr, "\n  round %d: survivor %ld changed in the parent\n", r, first_corrupt_survivor(p));
+      }
     }
     for (int i = 0; i < LIVE; i++) { if (p[i] != NULL) mi_free(p[i]); }
     free(p);

@@ -430,6 +430,7 @@ void _mi_process_fork_child(void) {
       mi_atomic_store_relaxed(&t->park_state, (uint32_t)MI_PARK_RUNNING);
       mi_atomic_store_relaxed(&t->park_reclaim, (uint32_t)0);
       mi_atomic_store_relaxed(&t->park_swept, (uint32_t)0);
+      t->holes_sweeping = false;   // a sweep that was running at the fork (by the scavenger, or by a thread that is gone) does not continue here
     }
     for (mi_heap_t* h = sp->heaps; h != NULL; h = h->next) {
       mi_lock_init(&h->theaps_lock);
