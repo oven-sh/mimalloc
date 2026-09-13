@@ -408,6 +408,7 @@ size_t        _mi_theap_update_sample_rate(mi_theap_t* theap);
 
 mi_decl_restrict void* _mi_theap_malloc_profiled(mi_theap_t* theap, size_t size, uint64_t requested_since_last_sample, bool zero, mi_page_t** ppage) mi_attr_noexcept;
 void          _mi_page_profile_on_free(mi_page_t* page, mi_block_t* block, void* p);
+void          _mi_page_profile_free_all(const mi_heap_area_t* area, mi_page_t* page);
 size_t        _mi_theap_set_profile_sample_rate(mi_theap_t* theap, size_t sample_rate);
 
 

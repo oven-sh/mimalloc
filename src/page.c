@@ -1834,6 +1834,7 @@ static bool mi_page_extend_free(mi_theap_t* theap, mi_page_t* page) {
   //uint8_t* page_start =
   mi_page_area(page, &page_size);
   mi_theap_stat_counter_increase(theap, pages_extended, 1);
+  mi_page_update_sample_countdown(page);  // the blocks of the previous extension are handed out: count them
   
   // calculate the extend count
   const size_t bsize = mi_page_block_size(page);
@@ -2368,6 +2369,17 @@ void* _mi_malloc_generic(mi_theap_t* theap, size_t size, size_t zero_huge_alignm
         page = mi_page_queue_find_free(theap,pq);
         // mi_assert_internal(mi_page_block_size(page) <= MI_SMALL_MAX_OBJ_SIZE);
         if (page!=NULL) {        
+          #if MI_SAMPLE==1
+          // The blocks that the fast path took from a page are counted against the sample countdown when its free
+          // list is refilled, which is what `mi_page_queue_find_free` just did. If that used up the countdown, the
+          // allocation in progress (of the size class of those blocks) is the sample. If we leave it to the next 
+          // allocation that comes through here, that is one above `MI_SMALL_SIZE_MAX` (these always do) far more 
+          // often than a small one: with one such allocation for every 40 blocks of 64 bytes, less than 2% of the 
+          // sampled bytes went to the blocks of 64 bytes (`test-profile.c:test_profiler_small_attribution`).
+          if mi_unlikely(theap->sample_rate!=0 && mi_theap_should_sample(theap,req_size)) {
+            return _mi_theap_malloc_sampled(theap,req_size,zero,ppage);
+          }
+          #endif
           if (ppage!=NULL) { *ppage = page; }
           mi_assert_internal(mi_page_immediate_available(page)); // we should never recurse in _mi_page_malloc_zero
           return _mi_page_malloc_zero(theap,page,size,zero);

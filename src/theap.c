@@ -552,6 +552,21 @@ void _mi_theap_init(mi_theap_t* theap, mi_heap_t* heap, mi_tld_t* tld)
   }
   // theap->cookie = _mi_theap_random_next(theap) | 1;
   _mi_theap_guarded_init(theap); // needs theap->random
+  #if MI_PROFILE
+  // A profiler that is running samples this theap from its first allocation on, and not only after
+  // `page.c:mi_malloc_generic_admin` has looked at it (every 1000 generic allocations): a thread that 
+  // makes a few large allocations and ends would never be sampled.
+  if (!theap->is_detached) {
+    mi_profiler_t* const prof = mi_atomic_load_ptr_acquire(mi_profiler_t,&heap->profiler);
+    if (prof!=NULL && mi_profiler_is_enabled(prof) && prof->on_alloc!=NULL) {
+      _mi_theap_set_profile_sample_rate(theap, (prof->initial_sample_rate==0 ? 1 : prof->initial_sample_rate));
+      // and start with a full period: the countdowns are 0 here, and with that the first allocation would be
+      // a sample that reports a whole period of bytes that nobody requested.
+      theap->profile_sample_countdown = theap->profile_sample_rate;
+      theap->sample_countdown = theap->sample_rate;
+    }
+  }
+  #endif
   if (!theap->is_detached) {
     mi_subproc_stat_increase(_mi_theap_subproc(theap),theaps,1);  // on subproc to match theap_free_mem
   }

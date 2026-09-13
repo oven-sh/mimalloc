@@ -116,6 +116,34 @@ static mi_profiler_t* mi_theap_get_enabled_profiler(const mi_theap_t* theap) {
 }
 
 //----------------------------------------------------------------------------
+// Layout of a profiled block: 
+//   [MI_BLOCK_TAG_PROFILED] [check] [mi_profiler_sample_data_t ... user data ...] [ ... block as the program sees it ... ]
+// `mi_free` recognizes it by the tag and by getting an interior pointer. `mi_heap_destroy` walks
+// the blocks of a page and has no pointer to go by: the first word of a regular block in use is
+// program data and can hold the value of the tag. The `check` word is the address of the block 
+// xor a random key, so a regular block is not mistaken for a profiled one.
+//-----------------------------------------------------------------------------
+
+static _Atomic(uintptr_t) mi_profile_check_key;  // = 0
+
+static uintptr_t mi_profile_block_check(mi_theap_t* theap, const mi_block_t* block) {
+  uintptr_t key = mi_atomic_load_relaxed(&mi_profile_check_key);
+  if mi_unlikely(key==0) {
+    if (theap==NULL) return 0;   // no block was profiled yet
+    uintptr_t expected = 0;
+    key = _mi_theap_random_next(theap) | 1;
+    if (!mi_atomic_cas_strong_acq_rel(&mi_profile_check_key, &expected, key)) { key = expected; }
+  }
+  return ((uintptr_t)block ^ key);
+}
+
+#define MI_PROFILE_SAMPLE_DATA_OFFSET  (sizeof(mi_block_t) + sizeof(uintptr_t))
+
+static inline size_t mi_profile_user_offset(size_t sample_user_data_size) {
+  return _mi_align_up(MI_PROFILE_SAMPLE_DATA_OFFSET + sizeof(mi_profiler_sample_data_t) + sample_user_data_size, MI_MAX_ALIGN_SIZE);
+}
+
+//----------------------------------------------------------------------------
 // Profile an allocation 
 //-----------------------------------------------------------------------------
 
@@ -142,11 +170,10 @@ mi_decl_noinline mi_decl_restrict void* _mi_theap_malloc_profiled(mi_theap_t* th
   }
   else {
     // overallocate a larger block to store the profiler data
-    // [MI_BLOCK_TAG_PROFILE] [usable size] [ ... profile data ... ] [... user data ...]
-    const size_t sample_data_offset    = sizeof(mi_block_t);
+    // [MI_BLOCK_TAG_PROFILED] [check] [ ... profile data ... ] [... user data ...]
+    const size_t sample_data_offset    = MI_PROFILE_SAMPLE_DATA_OFFSET;
     const size_t sample_user_data_size = _mi_align_up(prof->sample_data_size > MI_PROFILE_SAMPLE_DATA_MAX_SIZE ? MI_PROFILE_SAMPLE_DATA_MAX_SIZE : prof->sample_data_size, sizeof(void*)); 
-    const size_t sample_data_size      = sizeof(mi_profiler_sample_data_t) + sample_user_data_size;  // one void* too many just in case
-    const size_t user_offset           = _mi_align_up(sample_data_offset + sample_data_size, MI_MAX_ALIGN_SIZE);
+    const size_t user_offset           = mi_profile_user_offset(sample_user_data_size);
     const size_t oversize              = user_offset + size;
     mi_page_t* page = NULL;
     mi_block_t* const block = (mi_block_t*)_mi_malloc_generic_no_sample(theap,oversize,zero,&page); 
@@ -163,6 +190,7 @@ mi_decl_noinline mi_decl_restrict void* _mi_theap_malloc_profiled(mi_theap_t* th
     // Set up the profiled block as an interior pointer so the interior "slow" path is taken on mi_free (where we catch it to call on_free)
     mi_page_set_has_interior_pointers(page, true);
     block->next = MI_BLOCK_TAG_PROFILED;  
+    *((uintptr_t*)(block + 1)) = mi_profile_block_check(theap,block);
     p = (uint8_t*)block + user_offset;
     mi_profiler_sample_data_t* const sample_data = (mi_profiler_sample_data_t*)((uint8_t*)block + sample_data_offset);
     sample_data->user_data_size = sample_user_data_size;
@@ -174,6 +202,11 @@ mi_decl_noinline mi_decl_restrict void* _mi_theap_malloc_profiled(mi_theap_t* th
   }
   if (new_sample_rate!=0 && new_sample_rate != (size_t)theap->profile_sample_rate) { 
     _mi_theap_set_profile_sample_rate(theap,new_sample_rate);
+    // We are at a sample, where a period starts: start it with the new rate in full. (`_mi_theap_malloc_sampled`
+    // takes the period to be `sample_rate` long when it computes `bytes_since_last_sample`. A raised rate left the 
+    // countdown at the previous rate, and each sample reported the difference on top of the bytes that were requested.)
+    theap->profile_sample_countdown = theap->profile_sample_rate;
+    theap->sample_countdown = theap->sample_rate;
   }
   mi_theap_stat_counter_increase(theap,profile_samples,1);  
   return p;
@@ -181,6 +214,9 @@ mi_decl_noinline mi_decl_restrict void* _mi_theap_malloc_profiled(mi_theap_t* th
 
 void _mi_page_profile_on_free(mi_page_t* page, mi_block_t* block, void* p) {
   mi_assert_internal(mi_block_ptr_is_sampled(block,p));
+  // The free list only overwrites the tag. Clear the check word too, or the block could come back as a regular 
+  // block that starts with the value of the tag and still has the check behind it (see `_mi_page_profile_free_all`).
+  *((uintptr_t*)(block + 1)) = 0;
 
   // get the heap and profiler
   mi_heap_t* const heap = mi_page_heap(page);
@@ -189,8 +225,34 @@ void _mi_page_profile_on_free(mi_page_t* page, mi_block_t* block, void* p) {
   if (prof==NULL || !mi_profiler_is_enabled(prof) || prof->on_free==NULL) return;
   
   // call the on_free callback
-  mi_profiler_sample_data_t* const sample_data = (mi_profiler_sample_data_t*)((uint8_t*)block + sizeof(mi_block_t));
+  mi_profiler_sample_data_t* const sample_data = (mi_profiler_sample_data_t*)((uint8_t*)block + MI_PROFILE_SAMPLE_DATA_OFFSET);
   (*prof->on_free)(prof, sample_data, p, heap);
+}
+
+// `mi_heap_destroy` frees the pages of a heap without a `mi_free` of each block: 
+// call `on_free` for the profiled blocks that are still in use in `page`.
+static bool mi_page_profile_free_visitor(const mi_heap_t* heap, const mi_heap_area_t* area, void* vblock, size_t block_size, void* arg) {
+  MI_UNUSED(heap); MI_UNUSED(area);
+  mi_page_t* const page = (mi_page_t*)arg;
+  mi_block_t* const block = (mi_block_t*)vblock;
+  if (block==NULL || block_size < MI_PROFILE_SAMPLE_DATA_OFFSET + sizeof(mi_profiler_sample_data_t)) return true;
+  if (block->next != MI_BLOCK_TAG_PROFILED) return true;
+  const uintptr_t check = mi_profile_block_check(NULL,block);
+  if (check==0 || *((const uintptr_t*)(block + 1)) != check) return true;
+  const mi_profiler_sample_data_t* const sample_data = (const mi_profiler_sample_data_t*)((uint8_t*)block + MI_PROFILE_SAMPLE_DATA_OFFSET);
+  const size_t user_offset = mi_profile_user_offset(sample_data->user_data_size);
+  if (user_offset >= block_size) return true;
+  _mi_page_profile_on_free(page, block, (uint8_t*)block + user_offset);  // clears the check word
+  return true;
+}
+
+void _mi_page_profile_free_all(const mi_heap_area_t* area, mi_page_t* page) {
+  if mi_likely(!mi_page_has_interior_pointers(page)) return;
+  mi_heap_t* const heap = mi_page_heap(page);
+  if (heap==NULL) return;
+  mi_profiler_t* const prof = mi_heap_profiler(heap);
+  if (prof==NULL || !mi_profiler_is_enabled(prof) || prof->on_free==NULL || prof->sample_data_size==0) return;
+  _mi_theap_area_visit_blocks(area, page, &mi_page_profile_free_visitor, page);
 }
 
 
