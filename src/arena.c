@@ -1544,7 +1544,15 @@ void _mi_arenas_free(mi_subproc_t* subproc, void* p, size_t size, mi_memid_t mem
 
 // Purge the arenas; if `force_purge` is true, amenable parts are purged even if not yet expired
 void _mi_arenas_collect(bool force_purge, bool visit_all, mi_tld_t* tld) {
-  _mi_arenas_try_purge(force_purge, visit_all, tld->subproc, tld->thread_seq);
+  // A forced purge is `mi_collect(true)`, and whoever asks for that reads the footprint next. Only one thread purges at
+  // a time, and the pass that holds the guard does not stand in for ours: the scavenger's is never forced, so it leaves
+  // every arena whose delay has not passed, and it does not go back for what was freed behind it. So take our turn
+  // after it. The holder takes no lock and waits for no one; it is in there for its madvise calls.
+  size_t spin = 0;
+  while (!_mi_arenas_try_purge(force_purge, visit_all, tld->subproc, tld->thread_seq) && force_purge) {
+    if (spin < 256) { mi_atomic_pause(); spin++; }
+    else { _mi_prim_thread_yield(); }
+  }
 }
 
 
@@ -2545,24 +2553,33 @@ void _mi_arenas_purge_now(mi_subproc_t* subproc) {
   }
 }
 
-void _mi_arenas_try_purge(bool force, bool visit_all, mi_subproc_t* subproc, size_t tseq)
+// allow only one thread to purge at a time (todo: allow concurrent purging?)
+static mi_atomic_guard_t mi_arenas_purge_guard;
+
+// The thread that held the guard across fork() is not in the child, so nothing there would ever release it.
+void _mi_arenas_forked_child(void) {
+  mi_atomic_store_release(&mi_arenas_purge_guard, (uintptr_t)0);
+}
+
+// Returns false if another thread was purging and this pass was dropped because of it.
+bool _mi_arenas_try_purge(bool force, bool visit_all, mi_subproc_t* subproc, size_t tseq)
 {
   // try purge can be called often so try to only run when needed
   const long delay = mi_arena_purge_delay();
-  if (_mi_preloading() || delay <= 0) return;  // nothing will be scheduled
+  if (_mi_preloading() || delay <= 0) return true;  // nothing will be scheduled
 
   // check if any arena needs purging?
   const mi_msecs_t now = _mi_clock_now();
   const mi_msecs_t arenas_expire = mi_atomic_loadi64_acquire(&subproc->purge_expire);
-  if (!visit_all && !force && (arenas_expire == 0 || arenas_expire > now)) return;
+  if (!visit_all && !force && (arenas_expire == 0 || arenas_expire > now)) return true;
 
   const size_t max_arena = mi_arenas_get_count(subproc);
-  if (max_arena == 0) return;
+  if (max_arena == 0) return true;
 
-  // allow only one thread to purge at a time (todo: allow concurrent purging?)
-  static mi_atomic_guard_t purge_guard;
-  mi_atomic_guard(&purge_guard)
+  bool entered = false;
+  mi_atomic_guard(&mi_arenas_purge_guard)
   {
+    entered = true;
     // increase global expire: at most one purge per delay cycle
     if (arenas_expire > now) { mi_atomic_storei64_release(&subproc->purge_expire, now + (delay/10)); }
     const size_t arena_start = tseq % max_arena;
@@ -2598,6 +2615,7 @@ void _mi_arenas_try_purge(bool force, bool visit_all, mi_subproc_t* subproc, siz
       mi_atomic_casi64_strong_acq_rel(&subproc->purge_expire, &expected, next_expire);
     }
   }
+  return entered;
 }
 
 
