@@ -2556,10 +2556,11 @@ void _mi_arenas_purge_now(mi_subproc_t* subproc) {
 // allow only one thread to purge at a time (todo: allow concurrent purging?)
 static mi_atomic_guard_t mi_arenas_purge_guard;
 
-// The thread that held the guard across fork() is not in the child, so nothing there would ever release it.
-// Returns true if there was one: its pass had reset the `purge_expire` of a sub-process, and it is not there to put back
-// what was still pending (see `_mi_arenas_try_purge`).
-bool _mi_arenas_forked_child(void) {
+// Release the guard for a thread that is gone: the one that held it across fork() is not in the child, and at process exit
+// on Windows every other thread is terminated before the detach callback runs. Nothing else would ever release it, and a
+// forced purge waits for it. Returns true if it was held: that pass had reset the `purge_expire` of a sub-process, and
+// it is not there to put back what was still pending (see `_mi_arenas_try_purge`).
+bool _mi_arenas_purge_guard_reset(void) {
   return (mi_atomic_exchange_acq_rel(&mi_arenas_purge_guard, (uintptr_t)0) != 0);
 }
 
