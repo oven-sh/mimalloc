@@ -58,7 +58,7 @@ jobs:
     steps:
       # Checkout: https://github.com/actions/checkout
       - name: Checkout repository
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       # Choose MI_USE_CXX setting
       - name: Set default cmake options
@@ -80,7 +80,7 @@ jobs:
           ctest --test-dir out/release-${{ matrix.c_or_cxx }} --verbose --timeout 240 -C Release
 
       - name: Release, Asm
-        if: matrix.tests == 'basic' && runner.os == 'Linux'
+        if: matrix.tests == 'basic' && runner.os == 'Linux' && matrix.c_or_cxx == 'c'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: ${{ matrix.os }}-${{ matrix.c_or_cxx }}-asm
@@ -319,7 +319,7 @@ jobs:
       # VM: FreeBSD (arm64 and x64)
       - name: FreeBSD arm64, Setup
         if: matrix.tests == 'freebsd-arm64'
-        uses: vmactions/freebsd-vm@83b151f58c6047089f4c80eb5ba2039d158ce093 # v1.5.3
+        uses: vmactions/freebsd-vm@f0552d3b69211736abd97f02ff3d4674c56b73b1 # v1.5.5
         with:
           arch: arm64
           custom-shell-name: freebsd-arm64
@@ -358,7 +358,7 @@ jobs:
 
       - name: FreeBSD x64, Setup
         if: matrix.tests == 'freebsd-x64'
-        uses: vmactions/freebsd-vm@83b151f58c6047089f4c80eb5ba2039d158ce093 # v1.5.3
+        uses: vmactions/freebsd-vm@f0552d3b69211736abd97f02ff3d4674c56b73b1 # v1.5.5
         with:
           arch: x86_64
           usesh: true
