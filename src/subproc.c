@@ -410,6 +410,7 @@ void _mi_process_fork_child(void) {
   if (mi_atomic_exchange_acq_rel(&mi_fork_depth, 0) == 0) return;
   _mi_process_is_forked_child = true;
   _mi_scavenger_forked_child();   // the scavenger thread did not survive the fork; clear the state that says it did
+  _mi_arenas_forked_child();      // nor did a thread that was purging; release the guard it held
   mi_lock_init(&mi_subprocs_lock);
   for (mi_subproc_t* sp = mi_subprocs; sp != NULL; sp = sp->next) {
     mi_lock_init(&sp->arena_reserve_lock);
