@@ -1147,7 +1147,7 @@ if (MI_BUILD_TESTS)
   enable_testing()
 
   # static link tests
-  set(mi_static_tests api api-fill stress-heaps stress-subprocs stress profile heap-mt heap-teardown heap-delete-race heap-churn heap-release-mt heap-aba heap-burst-destroy abandoned-lazy fork-user-heap snapshot purge-zero park-handoff forced-purge purge-behind-pass free-before-init)
+  set(mi_static_tests api api-fill stress-heaps stress-subprocs stress profile heap-mt heap-teardown heap-delete-race heap-churn heap-release-mt heap-aba heap-burst-destroy abandoned-lazy fork-user-heap snapshot purge-zero purge-committed park-handoff forced-purge purge-behind-pass free-before-init)
   if(NOT (MI_DEBUG_TSAN OR (MI_TRACK STREQUAL "ASAN") OR MI_DEBUG_UBSAN))
     list(APPEND mi_static_tests thp-optout)  # counts madvise calls by interposing it, which a sanitizer runtime does first
   endif()
@@ -1202,6 +1202,9 @@ if (MI_BUILD_TESTS)
   add_test(NAME test-heap-release-mt-no-scavenger COMMAND ${CMAKE_COMMAND} -E env MIMALLOC_SCAVENGER=0 $<TARGET_FILE:mimalloc-test-heap-release-mt>)
   # and sweep every park, so the reclaim path is hit as hard as possible
   add_test(NAME test-park-handoff-eager COMMAND ${CMAKE_COMMAND} -E env MIMALLOC_PURGE_HOLES_MIN_INTERVAL=0 $<TARGET_FILE:mimalloc-test-park-handoff>)
+
+  # an allocation that does not ask for commit has to count its slices as the committing one does
+  add_test(NAME test-purge-committed-on-demand COMMAND ${CMAKE_COMMAND} -E env MIMALLOC_PAGE_COMMIT_ON_DEMAND=1 $<TARGET_FILE:mimalloc-test-purge-committed>)
 
   # The allocator must never touch one of its own `__thread` variables from inside an allocation:
   # where `__thread` is emulated (Android before API 29) the first access on a thread mallocs, and

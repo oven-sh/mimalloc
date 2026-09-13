@@ -241,6 +241,16 @@ static size_t mi_page_full_size(mi_page_t* page) {
   Arena Allocation
 ----------------------------------------------------------- */
 
+// On an OS with overcommit, `mi_arena_reserve` does not count an eagerly committed arena as
+// committed: the OS backs a slice the first time it is written. So a slice of such a range counts
+// as committed while its dirty bit is set: it is credited here when it is handed out for the first
+// time, and debited in `mi_arena_purge` when a zero-claim purge clears the dirty bit again.
+static void mi_arena_stat_touched(mi_arena_t* arena, size_t touched_slices) {
+  if (touched_slices > 0 && _mi_os_has_overcommit() && !arena->memid.is_pinned /* huge pages, issue #1236 */) {
+    mi_subproc_stat_increase(arena->subproc, committed, mi_size_of_slices(touched_slices));
+  }
+}
+
 static mi_decl_noinline void* mi_arena_try_alloc_at(
   mi_arena_t* arena, size_t slice_count, bool commit, size_t tseq, mi_memid_t* memid)
 {
@@ -300,11 +310,7 @@ static mi_decl_noinline void* mi_arena_try_alloc_at(
     else {
       // already fully committed.
       _mi_os_reuse(arena->subproc, p, mi_size_of_slices(slice_count));
-      // if the OS has overcommit, and this is the first time we access these pages, then
-      // count the commit now (as at arena reserve we didn't count those commits as these are on-demand)
-      if (_mi_os_has_overcommit() && touched_slices > 0 && !arena->memid.is_pinned /* huge pages, issue #1236 */) {
-        mi_subproc_stat_increase( arena->subproc, committed, mi_size_of_slices(touched_slices));
-      }
+      mi_arena_stat_touched(arena, touched_slices);
     }
 
     mi_assert_internal(mi_bitmap_is_setN(arena->slices_committed, slice_index, slice_count));
@@ -321,7 +327,11 @@ static mi_decl_noinline void* mi_arena_try_alloc_at(
   else {
     // no need to commit, but check if it is already fully committed
     memid->initially_committed = mi_bitmap_is_setN(arena->slices_committed, slice_index, slice_count);
-    if (!memid->initially_committed) {
+    if (memid->initially_committed) {
+      // nothing commits this range on demand later: count the slices it touches now
+      mi_arena_stat_touched(arena, touched_slices);
+    }
+    else {
       // partly committed.. adjust stats
       size_t already_committed_count = 0;
       mi_bitmap_setN(arena->slices_committed, slice_index, slice_count, &already_committed_count);
@@ -2566,14 +2576,15 @@ static bool mi_arena_purge(mi_arena_t* arena, size_t slice_index, size_t slice_c
       // The OS guarantees this range reads back zero, so forget that it was ever dirty: the
       // next `mi_arenas_alloc` hands it out with `initially_zero`, `mi_zalloc` skips the
       // memset, and pages the caller never writes are never made resident again.
+      const size_t dirty_slices = mi_bitmap_popcountN(arena->slices_dirty, slice_index, slice_count);
       mi_bitmap_clearN(arena->slices_dirty, slice_index, slice_count);
-      // Do NOT touch the `committed` stat here. `committed` is keyed on the COMMIT bits, not the
-      // dirty bits: it is credited in `mi_arena_try_alloc_at` only for slices whose commit bit was
-      // clear (`slice_count - already_committed`, and the whole block is skipped when the range is
-      // already fully committed). A zero-claim purge deliberately KEEPS the commit bits set, so the
-      // next allocation credits nothing -- and debiting here would be an unmatched debit that walks
-      // `committed` down without bound (it is an int64; `mi_process_info` casts it to size_t, so it
-      // wraps). The real ratchet is the partial-commit branch below, which *clears* commit bits.
+      // A range that needs no recommit keeps its commit bits, so `_mi_os_purge_zero` debited
+      // nothing, and the next `mi_arena_try_alloc_at` credits `committed` again for every slice
+      // that was just un-dirtied (`mi_arena_stat_touched`). Debit those slices here, under the
+      // same condition, or `committed` grows by the size of every purge/reuse cycle, forever.
+      if (!needs_recommit && all_committed && dirty_slices > 0 && _mi_os_has_overcommit()) {
+        mi_subproc_stat_decrease(arena->subproc, committed, mi_size_of_slices(dirty_slices));
+      }
     }
   }
 
