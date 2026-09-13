@@ -242,11 +242,17 @@ static size_t mi_page_full_size(mi_page_t* page) {
 ----------------------------------------------------------- */
 
 // On an OS with overcommit, `mi_arena_reserve` does not count an eagerly committed arena as
-// committed: the OS backs a slice the first time it is written. So a slice of such a range counts
+// committed: the OS backs a slice the first time it is written. So a slice of such an arena counts
 // as committed while its dirty bit is set: it is credited here when it is handed out for the first
 // time, and debited in `mi_arena_purge` when a zero-claim purge clears the dirty bit again.
+// An arena that was not committed up front is counted on its commit bits alone (`_mi_os_commit_ex`):
+// a purge keeps those set, so a slice of it is counted once and stays counted.
+static bool mi_arena_stat_on_dirty(const mi_arena_t* arena) {
+  return (arena->memid.initially_committed && _mi_os_has_overcommit() && !arena->memid.is_pinned /* huge pages, issue #1236 */);
+}
+
 static void mi_arena_stat_touched(mi_arena_t* arena, size_t touched_slices) {
-  if (touched_slices > 0 && _mi_os_has_overcommit() && !arena->memid.is_pinned /* huge pages, issue #1236 */) {
+  if (touched_slices > 0 && mi_arena_stat_on_dirty(arena)) {
     mi_subproc_stat_increase(arena->subproc, committed, mi_size_of_slices(touched_slices));
   }
 }
@@ -265,12 +271,22 @@ static mi_decl_noinline void* mi_arena_try_alloc_at(
   memid->is_pinned = arena->memid.is_pinned;
 
   // set the dirty bits and track which slices become accessible
-  size_t touched_slices = slice_count;
+  const size_t already_committed = mi_bitmap_popcountN(arena->slices_committed, slice_index, slice_count);
+  size_t touched_slices = slice_count;   // slices whose dirty bit was clear
+  size_t touched_committed = 0;          // of those, the ones whose commit bit is set: counted by `mi_arena_stat_touched`
   if (arena->memid.initially_zero) {
+    if (already_committed < slice_count && mi_arena_stat_on_dirty(arena)) {
+      // committed in part (a purge decommitted some of it): the commit below counts the slices it commits,
+      // so count the clean slices among the committed ones here, before the dirty bits are set
+      for (size_t i = slice_index; i < slice_index + slice_count; i++) {
+        if (mi_bitmap_is_set(arena->slices_committed, i) && !mi_bitmap_is_set(arena->slices_dirty, i)) { touched_committed++; }
+      }
+    }
     size_t already_dirty = 0;
     memid->initially_zero = mi_bitmap_setN(arena->slices_dirty, slice_index, slice_count, &already_dirty);
     mi_assert_internal(already_dirty <= touched_slices);
     touched_slices -= already_dirty;
+    if (already_committed == slice_count) { touched_committed = touched_slices; }
   }
   else {
     // todo: properly count touched pages with a separate bitmap?
@@ -280,7 +296,6 @@ static mi_decl_noinline void* mi_arena_try_alloc_at(
   // set commit state
   if (commit) {
     // commit requested, but the range may not be committed as a whole: ensure it is committed now
-    const size_t already_committed = mi_bitmap_popcountN(arena->slices_committed, slice_index, slice_count);
     if (already_committed < slice_count) {
       // not all committed, try to commit now
       bool commit_zero = false;
@@ -296,6 +311,8 @@ static mi_decl_noinline void* mi_arena_try_alloc_at(
 
       // set the commit bits
       mi_bitmap_setN(arena->slices_committed, slice_index, slice_count, NULL);
+      // the commit counted what it committed; the slices that were committed already count now
+      mi_arena_stat_touched(arena, touched_committed);
 
       // committed
       #if MI_DEBUG > 1
@@ -310,7 +327,7 @@ static mi_decl_noinline void* mi_arena_try_alloc_at(
     else {
       // already fully committed.
       _mi_os_reuse(arena->subproc, p, mi_size_of_slices(slice_count));
-      mi_arena_stat_touched(arena, touched_slices);
+      mi_arena_stat_touched(arena, touched_committed);
     }
 
     mi_assert_internal(mi_bitmap_is_setN(arena->slices_committed, slice_index, slice_count));
@@ -329,14 +346,15 @@ static mi_decl_noinline void* mi_arena_try_alloc_at(
     memid->initially_committed = mi_bitmap_is_setN(arena->slices_committed, slice_index, slice_count);
     if (memid->initially_committed) {
       // nothing commits this range on demand later: count the slices it touches now
-      mi_arena_stat_touched(arena, touched_slices);
+      mi_arena_stat_touched(arena, touched_committed);
     }
     else {
-      // partly committed.. adjust stats
-      size_t already_committed_count = 0;
-      mi_bitmap_setN(arena->slices_committed, slice_index, slice_count, &already_committed_count);
+      // partly committed.. adjust stats: the range is committed on demand from here on, so the
+      // slices that were committed (and counted) are not counted any longer
       mi_bitmap_clearN(arena->slices_committed, slice_index, slice_count);
-      mi_subproc_stat_decrease(arena->subproc, committed, mi_size_of_slices(already_committed_count));
+      // a slice counted on its dirty bit was not counted while that bit was clear
+      const size_t counted = (mi_arena_stat_on_dirty(arena) ? already_committed - touched_committed : already_committed);
+      mi_subproc_stat_decrease(arena->subproc, committed, mi_size_of_slices(counted));
     }
   }
 
@@ -2582,7 +2600,7 @@ static bool mi_arena_purge(mi_arena_t* arena, size_t slice_index, size_t slice_c
       // nothing, and the next `mi_arena_try_alloc_at` credits `committed` again for every slice
       // that was just un-dirtied (`mi_arena_stat_touched`). Debit those slices here, under the
       // same condition, or `committed` grows by the size of every purge/reuse cycle, forever.
-      if (!needs_recommit && all_committed && dirty_slices > 0 && _mi_os_has_overcommit()) {
+      if (!needs_recommit && all_committed && dirty_slices > 0 && mi_arena_stat_on_dirty(arena)) {
         mi_subproc_stat_decrease(arena->subproc, committed, mi_size_of_slices(dirty_slices));
       }
     }

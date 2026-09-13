@@ -1205,6 +1205,8 @@ if (MI_BUILD_TESTS)
 
   # an allocation that does not ask for commit has to count its slices as the committing one does
   add_test(NAME test-purge-committed-on-demand COMMAND ${CMAKE_COMMAND} -E env MIMALLOC_PAGE_COMMIT_ON_DEMAND=1 $<TARGET_FILE:mimalloc-test-purge-committed>)
+  # and an arena that is not committed up front is counted on its commit bits alone
+  add_test(NAME test-purge-committed-no-eager-commit COMMAND ${CMAKE_COMMAND} -E env MIMALLOC_ARENA_EAGER_COMMIT=0 $<TARGET_FILE:mimalloc-test-purge-committed>)
 
   # The allocator must never touch one of its own `__thread` variables from inside an allocation:
   # where `__thread` is emulated (Android before API 29) the first access on a thread mallocs, and
