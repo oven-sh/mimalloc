@@ -432,7 +432,7 @@ typedef uintptr_t mi_thread_free_t;
 // in a release build; this way we can update the stats in the slow path (`_mi_page_update_stats`).
 typedef union mi_used_s { 
   size_t      used_alloc;         // used + alloc_count
-  // the following struct is unused but nice for debugging
+  // the same in parts, for a debugger and for `mi_xused_dec_used`
   struct {
     uint16_t used_count;
     uint16_t alloc_count;
@@ -446,6 +446,14 @@ typedef union mi_used_s {
 static inline size_t mi_xused_used_count(mi_used_t xused)    { return (xused.used_alloc & 0xFFFF); }
 static inline size_t mi_xused_alloc_count(mi_used_t xused)   { return ((xused.used_alloc>>16) & 0xFFFF); }
 static inline mi_used_t mi_xused_used_reset(mi_used_t xused) { xused.used_alloc =  xused.used_alloc & ~0xFFFF; return xused; }
+
+// Decrement the used count in place and return the new count (`mi_free`). Where its 16 bits can be addressed by themselves
+// that is one `decw` on memory whose flags feed the branch; on the whole word it is a load, a decrement, a store and a test.
+#if !MI_BIG_ENDIAN && ((defined(__BYTE_ORDER__) && defined(__ORDER_LITTLE_ENDIAN__) && (__BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__)) || defined(_WIN32))
+static inline size_t mi_xused_dec_used(mi_used_t* xused) { return --xused->debug_le.used_count; }
+#else
+static inline size_t mi_xused_dec_used(mi_used_t* xused) { xused->used_alloc--; return mi_xused_used_count(*xused); }
+#endif
 
 // A page contains blocks of one specific size (`block_size`).
 // Each page has three list of free blocks:

@@ -59,11 +59,6 @@ static mi_decl_forceinline void* mi_page_malloc_zero(mi_theap_t* theap, mi_page_
 
   // check the free list
   mi_block_t* const block = page->free;
-  mi_used_t xused = page->xused; 
-  xused.used_alloc += 0x10001;  // increment both (16-bit) used count and alloc count 
-  #if defined(__GNUC__) 
-  __asm("" : : : "memory" );     // always load the `used` field before the test
-  #endif  
   if (block == NULL) {
     return _mi_malloc_generic(theap, size, (zero ? 1 : 0), ppage);
   }
@@ -79,7 +74,7 @@ static mi_decl_forceinline void* mi_page_malloc_zero(mi_theap_t* theap, mi_page_
   #endif
 
   page->free = next;
-  page->xused = xused;
+  page->xused.used_alloc += 0x10001;  // increment both (16-bit) used count and alloc count: one add on memory
   mi_assert_internal(page->free == NULL || _mi_ptr_page(page->free) == page);
   mi_assert_internal(page->block_size < MI_MAX_ALIGN_SIZE || _mi_is_aligned(block, MI_MAX_ALIGN_SIZE));
 
