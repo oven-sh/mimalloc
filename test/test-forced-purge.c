@@ -49,8 +49,9 @@ int main(void) {
     return 0;
   }
   // The rounds count bytes. With transparent huge pages left whole (`MI_ALLOW_THP=FULL`) a pass purges aligned 2 MiB
-  // units only and leaves the edges of each freed run for later, so purge by the slice here.
-  mi_option_set(mi_option_minimal_purge_size, 64 /* KiB */);
+  // units only and leaves the edges of each freed run for later, so purge by the slice here (the size is rounded up to an
+  // OS page, which is never more than a slice).
+  mi_option_set(mi_option_minimal_purge_size, 4 /* KiB */);
   // the scavenger starts when a second thread initializes or a thread first parks
   void* warm = mi_malloc(64); mi_free(warm);
   if (mi_on_thread_idle_start()) { mi_on_thread_idle_end(); }
