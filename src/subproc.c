@@ -102,7 +102,7 @@ bool _mi_subproc_is_main(mi_subproc_t* subproc) {
 
 mi_subproc_t* _mi_subproc(void) {
   mi_theap_t* theap = _mi_theap_default();
-  if (theap == NULL || theap->tld == NULL) {  // see issue #1289
+  if (theap == NULL || theap->tld == NULL || theap->tld->subproc == NULL) {  // see issue #1289 and #1391
     return _mi_subproc_main();
   }
   else {
@@ -189,6 +189,13 @@ mi_subproc_id_t mi_subproc_new(void) {
   mi_assert_internal(parent->theap_meta->tld!=NULL);
   mi_assert_internal(parent->theap_meta->tld->thread_id == MI_THREADID_DETACHED);
   _mi_theap_init(theap_meta,heap_main,parent->theap_meta->tld /* detached tld */);
+  // as for the meta theap of the main sub-process (`init.c:mi_heap_main_init_once`): it is not shared with other threads.
+  // (abandoning one of its pages would also allocate the per-bin abandoned bitmap (`arena.c:mi_arena_pages_abandoned_ensure`)
+  //  from the meta theap itself, under the `theap_meta_lock` that the allocation that filled the page still holds)
+  theap_meta->allow_page_abandon = false;
+  theap_meta->page_full_retain = 2;
+  theap_meta->sample_rate = 0;        // no sampling for meta data
+  theap_meta->sample_countdown = 0;
   subproc->theap_meta = theap_meta;
 
   return _mi_subproc_to_id(subproc);
@@ -229,8 +236,8 @@ static void mi_subproc_unsafe_destroy(mi_subproc_t* subproc, bool acquire_subpro
     }
   }
 
-  subproc->theap_meta = NULL; // theap meta stats are merged during heap_destroy of the main heap
-
+  subproc->theap_meta = NULL;     // theap meta stats are merged during heap_destroy of the main heap
+  
   if (!_mi_subproc_is_main(subproc)) {
     // merge stats back into the main subproc  
     _mi_stats_merge_into(&mi_process_subproc_main.stats, &subproc->stats);
@@ -387,11 +394,13 @@ void _mi_process_fork_prepare(void) {
   mi_lock_acquire(&mi_subprocs_lock);
   _mi_thread_locals_fork_prepare();
   for (mi_subproc_t* sp = mi_subprocs; sp != NULL; sp = sp->next) { mi_subproc_fork_prepare(sp); }
+  _mi_arenas_purge_guard_acquire();   // last: a purge pass takes no lock, so the one in progress ends (see `arena.c`)
 }
 
 void _mi_process_fork_parent(void) {
   if (!_mi_process_is_initialized) return;
   if (mi_atomic_decrement_acq_rel(&mi_fork_depth) != 1) return;
+  _mi_arenas_purge_guard_release();
   // release in reverse: last sub-process first (the registry is a stack: newest first, so walk it into a reversed order)
   size_t n = 0;
   for (mi_subproc_t* sp = mi_subprocs; sp != NULL; sp = sp->next) { n++; }
@@ -410,11 +419,9 @@ void _mi_process_fork_child(void) {
   if (mi_atomic_exchange_acq_rel(&mi_fork_depth, 0) == 0) return;
   _mi_process_is_forked_child = true;
   _mi_scavenger_forked_child();   // the scavenger thread did not survive the fork; clear the state that says it did
-  const bool purge_cut_off = _mi_arenas_purge_guard_reset();   // nor did a thread that was purging; release the guard it held
+  _mi_arenas_purge_guard_release();   // taken by the prepare handler: no purge pass was in progress, so each `purge_expire` is as a finished pass left it
   mi_lock_init(&mi_subprocs_lock);
   for (mi_subproc_t* sp = mi_subprocs; sp != NULL; sp = sp->next) {
-    // the purge pass that was cut off may have been over this one: make a pass due, for the arenas whose expire is still set
-    if (purge_cut_off) { mi_atomic_storei64_relaxed(&sp->purge_expire, (mi_msecs_t)1); }
     mi_lock_init(&sp->arena_reserve_lock);
     mi_lock_init(&sp->heaps_lock);
     mi_lock_init(&sp->tlds_lock);
@@ -426,6 +433,7 @@ void _mi_process_fork_child(void) {
       mi_atomic_store_relaxed(&t->park_state, (uint32_t)MI_PARK_RUNNING);
       mi_atomic_store_relaxed(&t->park_reclaim, (uint32_t)0);
       mi_atomic_store_relaxed(&t->park_swept, (uint32_t)0);
+      t->holes_sweeping = false;   // a sweep that was running at the fork (by the scavenger, or by a thread that is gone) does not continue here
     }
     for (mi_heap_t* h = sp->heaps; h != NULL; h = h->next) {
       mi_lock_init(&h->theaps_lock);

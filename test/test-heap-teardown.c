@@ -26,6 +26,9 @@ terms of the MIT license.
    two-deletes    two heaps deleted at once while other threads free into both.
    parked         a thread that used the heap is parked (`mi_on_thread_idle_start`)
                   and swept by the scavenger while the heap is deleted.
+   foreign-frees  destroy (and delete) a heap after another thread freed blocks
+                  in its abandoned (full) pages: such a page keeps the last freed
+                  block on its thread-free list, and it still counts as used.
 
    > mimalloc-test-heap-teardown [ITER]
 */
@@ -40,7 +43,7 @@ terms of the MIT license.
 
 #if defined(MI_TSAN)
 static int ITER = 20;
-#elif defined(MI_UBSAN) || defined(MI_GUARDED)
+#elif defined(MI_UBSAN) || (defined(MI_GUARDED) && MI_GUARDED>0)
 static int ITER = 20;
 #elif !defined(NDEBUG)
 static int ITER = 50;
@@ -448,6 +451,55 @@ static void test_parked(void) {
 
 
 /* -----------------------------------------------------------
+   foreign-frees: a heap fills pages (which are abandoned once full), another
+   thread frees a block in many of them and exits, and then the heap is destroyed
+   (or deleted). A free into an abandoned page collects the thread-free list
+   except for its head, so the page is left with a block on that list that is
+   still counted as used. The destroy resets the used count of every page it
+   frees; folding that list in afterwards reads as a corrupted list ("more
+   blocks freed than in use"), which aborts a debug or secure build.
+----------------------------------------------------------- */
+
+#define FF_NPTRS 50000
+static void* ff_ptrs[FF_NPTRS];
+static volatile long ff_errors;
+
+static void ff_error(int err, void* arg) {
+  (void)err; (void)arg;
+  atomic_add_long(&ff_errors, 1);
+}
+
+static void ff_freer(intptr_t tid) {
+  (void)tid;
+  for (int i = 0; i < FF_NPTRS; i += 97) { mi_free(ff_ptrs[i]); ff_ptrs[i] = NULL; }
+}
+
+static void test_foreign_frees(void) {
+  mi_register_error(&ff_error, NULL);   // count errors instead of aborting on the first
+  const int iters = (ITER < 8 ? ITER : 8);
+  for (int n = 0; n < iters; n++) {
+    for (int destroy = 0; destroy <= 1; destroy++) {
+      mi_heap_t* heap = mi_heap_new();
+      EXPECT("heap_new", heap != NULL);
+      if (heap == NULL) break;
+      for (int i = 0; i < FF_NPTRS; i++) { ff_ptrs[i] = mi_heap_malloc(heap, 64); }
+      run_os_threads(1, &ff_freer);
+      if (destroy) {
+        mi_heap_destroy(heap);
+      }
+      else {
+        mi_heap_delete(heap);
+        for (int i = 0; i < FF_NPTRS; i++) { if (ff_ptrs[i] != NULL) { mi_free(ff_ptrs[i]); } }
+      }
+    }
+    progress(n * 4);
+  }
+  mi_register_error(NULL, NULL);
+  EXPECT("no error is reported", atomic_load_long(&ff_errors) == 0);
+}
+
+
+/* -----------------------------------------------------------
    Main
 ----------------------------------------------------------- */
 
@@ -467,6 +519,7 @@ int main(int argc, char** argv) {
   fprintf(stderr, "test: page-churn...  ");     test_page_churn();    fprintf(stderr, " %s.\n", failed ? "FAILED" : "ok");
   fprintf(stderr, "test: two-deletes...  ");    test_two_deletes();   fprintf(stderr, " %s.\n", failed ? "FAILED" : "ok");
   fprintf(stderr, "test: parked...  ");         test_parked();        fprintf(stderr, " %s.\n", failed ? "FAILED" : "ok");
+  fprintf(stderr, "test: foreign-frees...  ");  test_foreign_frees(); fprintf(stderr, " %s.\n", failed ? "FAILED" : "ok");
 
   mi_collect(true);
   mi_stats_print(NULL);

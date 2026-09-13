@@ -8,7 +8,7 @@ terms of the MIT license. A copy of the license can be found in the file
 #ifndef MIMALLOC_H
 #define MIMALLOC_H
 
-#define MI_MALLOC_VERSION 30500   // major + 2 digits minor + 2 digits patch
+#define MI_MALLOC_VERSION 30502   // major + 2 digits minor + 2 digits patch
 
 // ------------------------------------------------------
 // Compiler specific attributes
@@ -97,6 +97,7 @@ terms of the MIT license. A copy of the license can be found in the file
 
 #include <stddef.h>     // size_t, wchar_t
 #include <stdbool.h>    // bool
+#include <assert.h>     // inline assertions
 
 #ifdef __cplusplus
 extern "C" {
@@ -119,8 +120,8 @@ mi_decl_nodiscard mi_decl_export mi_decl_restrict char* mi_realpath(const char* 
 // ------------------------------------------------------
 // Extended allocation functions
 // ------------------------------------------------------
-#define MI_SMALL_WSIZE_MAX  (128)
-#define MI_SMALL_SIZE_MAX   (MI_SMALL_WSIZE_MAX*sizeof(void*))
+#define MI_SMALL_WSIZE_MAX  128
+#define MI_SMALL_SIZE_MAX   (MI_SMALL_WSIZE_MAX*sizeof(size_t))  // mimalloc considers `sizeof(size_t)` as the machine word size
 
 mi_decl_nodiscard mi_decl_export mi_decl_restrict void* mi_malloc_small(size_t size) mi_attr_noexcept mi_attr_malloc mi_attr_alloc_size(1);
 mi_decl_nodiscard mi_decl_export mi_decl_restrict void* mi_zalloc_small(size_t size) mi_attr_noexcept mi_attr_malloc mi_attr_alloc_size(1);
@@ -133,12 +134,16 @@ mi_decl_nodiscard mi_decl_export void* mi_reallocf(void* p, size_t newsize)     
 mi_decl_nodiscard mi_decl_export size_t mi_usable_size(const void* p) mi_attr_noexcept;
 mi_decl_nodiscard mi_decl_export size_t mi_good_size(size_t size)     mi_attr_noexcept;
 
-// `mi_free_size` can be more efficient (as at calls mi_free_small internally).
+// `mi_free_size` can be more efficient (as it calls mi_free_small internally).
 mi_decl_export void mi_free_size(void* p, size_t size) mi_attr_noexcept;
 
 // `mi_free_small` is for special applications like language runtimes.
-// it should only be used to free objects from `mi_(heap_)(m|z)alloc_small` and is potentially a tiny bit faster than `mi_free`
+// it should only be used to free objects from `mi_*alloc_small` and is potentially a tiny bit faster than `mi_free`
 mi_decl_export void mi_free_small(void* p) mi_attr_noexcept;  
+
+// As `mi_free_small` but `p` should not be a NULL pointer.
+mi_decl_export void mi_free_small_nonnull(void* p) mi_attr_noexcept;
+
 
 // -------------------------------------------------------------------------------------
 // Aligned allocation
@@ -392,16 +397,9 @@ mi_decl_export void   mi_arenas_print(void) mi_attr_noexcept;
 mi_decl_export int    mi_heap_snapshot(int fd, unsigned flags) mi_attr_noexcept;
 mi_decl_export int    mi_heap_snapshot_to_file(const char* path, unsigned flags) mi_attr_noexcept;
 
-// Sampling heap profiler (pprof-compatible). Zero overhead on the malloc/free
-// fast paths when disabled (sample_rate_bytes == 0). Output is a profile.proto
-// readable by `go tool pprof`.
-mi_decl_export void   mi_prof_enable(size_t sample_rate_bytes) mi_attr_noexcept;
-mi_decl_export void   mi_prof_reset(void) mi_attr_noexcept;
-mi_decl_export int    mi_prof_dump(int fd) mi_attr_noexcept;
-mi_decl_export size_t mi_prof_dump_buf(void* buf, size_t cap) mi_attr_noexcept;  // returns total size; buf=NULL to query
-mi_decl_export int    mi_prof_dump_to_file(const char* path) mi_attr_noexcept;
 mi_decl_export size_t mi_arena_min_alignment(void);
 mi_decl_export size_t mi_arena_min_size(void);
+mi_decl_export size_t mi_arena_max_object_size(void);
 
 typedef void* mi_arena_id_t;
 mi_decl_export void*  mi_arena_area(mi_arena_id_t arena_id, size_t* size);
@@ -463,20 +461,37 @@ mi_decl_nodiscard mi_decl_export                  void* mi_theap_rezalloc(mi_the
 // Fast constant size allocations.
 // ------------------------------------------------------
 
+// Machine word size allocation. `wsize` is the allocation size in machine words (`sizeof(size_t)`)
+mi_decl_nodiscard mi_decl_restrict void* mi_wzalloc_small(size_t wsize) mi_attr_noexcept;
+mi_decl_nodiscard mi_decl_restrict void* mi_wmalloc_small(size_t wsize) mi_attr_noexcept;
+mi_decl_nodiscard mi_decl_restrict void* mi_theap_wmalloc_small(mi_theap_t* theap, size_t wsize) mi_attr_noexcept;
+mi_decl_nodiscard mi_decl_restrict void* mi_theap_wzalloc_small(mi_theap_t* theap, size_t wsize) mi_attr_noexcept;
+
+// get the machine word size from a byte size.
+static inline size_t mi_wsize_from_size(size_t size) { 
+  return ((size + sizeof(size_t) - 1) / sizeof(size_t));  
+}
+
 static inline mi_decl_restrict void* mi_malloc_csize(size_t size) mi_attr_noexcept {
-  if (size <= MI_SMALL_SIZE_MAX) { return mi_malloc_small(size); } else { return mi_malloc(size); }
+  if (size <= MI_SMALL_SIZE_MAX) { return mi_wmalloc_small(mi_wsize_from_size(size)); } else { return mi_malloc(size); }
 }
 static inline mi_decl_restrict void* mi_zalloc_csize(size_t size) mi_attr_noexcept {
-  if (size <= MI_SMALL_SIZE_MAX) { return mi_zalloc_small(size); } else { return mi_zalloc(size); }
+  if (size <= MI_SMALL_SIZE_MAX) { return mi_wzalloc_small(mi_wsize_from_size(size)); } else { return mi_zalloc(size); }
 }
-static inline mi_decl_restrict void* mi_theap_malloc_csize(mi_theap_t* theap, size_t size) mi_attr_noexcept {
-  if (size <= MI_SMALL_SIZE_MAX) { return mi_theap_malloc_small(theap,size); } else { return mi_theap_malloc(theap,size); }
+static inline mi_decl_restrict void* mi_theap_malloc_csize(mi_theap_t* theap, size_t size) mi_attr_noexcept {  
+  assert(theap!=NULL);
+  if (size <= MI_SMALL_SIZE_MAX) { return mi_theap_wmalloc_small(theap,mi_wsize_from_size(size)); } else { return mi_theap_malloc(theap,size); }
 }
 static inline mi_decl_restrict void* mi_theap_zalloc_csize(mi_theap_t* theap, size_t size) mi_attr_noexcept {
-  if (size <= MI_SMALL_SIZE_MAX) { return mi_theap_zalloc_small(theap,size); } else { return mi_theap_zalloc(theap,size); }
+  assert(theap!=NULL);
+  if (size <= MI_SMALL_SIZE_MAX) { return mi_theap_wzalloc_small(theap,mi_wsize_from_size(size)); } else { return mi_theap_zalloc(theap,size); }
 }
 static inline void mi_free_csize(void* p, size_t size) mi_attr_noexcept {
   if (size <= MI_SMALL_SIZE_MAX) { mi_free_small(p); } else { mi_free(p); }
+}
+static inline void mi_free_csize_nonnull(void* p, size_t size) mi_attr_noexcept {
+  assert(p!=NULL);
+  if (size <= MI_SMALL_SIZE_MAX) { mi_free_small_nonnull(p); } else { mi_free(p); }
 }
 
 // ------------------------------------------------------
@@ -566,20 +581,21 @@ typedef enum mi_option_e {
   mi_option_guarded_sample_rate,        // 1 out of N allocations in the min/max range will be guarded (=1000)
   mi_option_guarded_sample_seed,        // can be set to allow for a (more) deterministic re-execution when a guard page is triggered (=0)
   mi_option_generic_collect,            // collect theaps every N (=10000) generic allocation calls
-  mi_option_page_reclaim_on_free,       // reclaim abandoned pages on a free (=0). -1 disallowr always, 0 allows if the page originated from the current theap, 1 allow always
+  mi_option_page_reclaim_on_free,       // reclaim abandoned pages on a free (=0). -1 disallow always, 0 allows if the page originated from the current theap, 1 allow always
   mi_option_page_full_retain,           // retain N full (small) pages per size class (=2)
   mi_option_page_max_candidates,        // max candidate pages to consider for allocation (=4)
   mi_option_max_vabits,                 // max user space virtual address bits to consider (=48)
   mi_option_pagemap_commit,             // commit the full pagemap (to always catch invalid pointer uses) (=0)
   mi_option_page_commit_on_demand,      // commit page memory on-demand
   mi_option_page_max_reclaim,           // don't reclaim pages of the same originating theap if we already own N pages (in that size class) (=-1 (unlimited))
-  mi_option_page_cross_thread_max_reclaim, // don't reclaim pages across threads if we already own N pages (in that size class) (=16)
+  mi_option_page_cross_thread_max_reclaim, // don't reclaim pages across threads if we already own N pages (in that size class) (=32)
   mi_option_allow_thp,                  // allow transparent huge pages? (=1) (on Android =0 by default). Set to 0 to opt the memory mimalloc maps out of THP.
   mi_option_minimal_purge_size,         // set minimal purge size (in KiB) (=0). By default set to either 64 or 2048 if THP is enabled.
   mi_option_arena_max_object_size,      // set maximal object size that can be allocated in an arena (in KiB) (=2GiB on 64-bit). 
-  mi_option_arena_is_numa_local,        // experimental
+  mi_option_arena_is_numa_local,        // experimental: associate local numa node with an initial arena allocation
+  mi_option_collect_merges_stats,       // on each theap collection, the theap stats are merged automatically with the parent heap
+  // options of this fork (keep these after the upstream options so those keep their upstream numbering)
   mi_option_snapshot_on_exit,           // write a heap snapshot on process exit (=0). 1=on, 2=on with per-block freemaps. Path from MIMALLOC_SNAPSHOT_PATH or "mimalloc-snapshot.<pid>.bin".
-  mi_option_prof_sample_rate,           // bytes per heap-profile sample (=0, off). Typical: 524288. Dumps profile.proto on exit to MIMALLOC_PROF_PATH.
   mi_option_scavenger,                  // run a background scavenger thread that purges freed arena memory when due (=1)
   mi_option_purge_holes,                // discard the memory of free blocks inside a still-used page (=1)
   mi_option_purge_holes_eager_zero,     // zero a hole before discarding it, so that an over-discard destroys data even on an OS that reclaims lazily (=0; for testing -- always on when MI_DEBUG>1)
@@ -614,7 +630,7 @@ mi_decl_export void mi_option_set_default(mi_option_t option, long value);
 // note: we use `mi_cfree` as "checked free" and it checks if the pointer is in our theap before free-ing.
 // -------------------------------------------------------------------------------------------------------
 
-mi_decl_export void  mi_cfree(void* p) mi_attr_noexcept;
+mi_decl_export bool  mi_cfree(void* p) mi_attr_noexcept;
 mi_decl_export void* mi__expand(void* p, size_t newsize) mi_attr_noexcept;
 mi_decl_nodiscard mi_decl_export size_t mi_malloc_size(const void* p)        mi_attr_noexcept;
 mi_decl_nodiscard mi_decl_export size_t mi_malloc_good_size(size_t size)     mi_attr_noexcept;

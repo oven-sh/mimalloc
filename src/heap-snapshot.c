@@ -223,7 +223,7 @@ static void mi_snap_emit_page(mi_snap_out_t* out, mi_page_t* page, int32_t arena
   mi_snap_u64(out, (uint64_t)mi_page_block_size(page));
   mi_snap_u32(out, (uint32_t)page->reserved);
   mi_snap_u32(out, (uint32_t)page->capacity);
-  mi_snap_u32(out, (uint32_t)page->used);
+  mi_snap_u32(out, (uint32_t)mi_page_used(page));
   mi_snap_u64(out, (uint64_t)mi_page_committed(page));
   mi_snap_u64(out, (uint64_t)tid);
   mi_snap_u64(out, (uint64_t)(page->heap != NULL ? page->heap->heap_seq : 0));
@@ -256,7 +256,7 @@ typedef struct mi_snap_ctx_s {
 static void mi_snap_emit_arena_header(mi_snap_out_t* out, mi_arena_t* arena, size_t idx) {
   mi_snap_u32(out, MI_SNAP_SEC_ARENA);
   mi_snap_u32(out, (uint32_t)idx);
-  mi_snap_u64(out, (uint64_t)(uintptr_t)arena);             // base address
+  mi_snap_u64(out, (uint64_t)(uintptr_t)mi_arena_slice_start(arena,0));   // base address (the arena info itself comes after the aligned page meta slices)
   mi_snap_u64(out, (uint64_t)mi_size_of_slices(arena->slice_count));
   mi_snap_u32(out, (uint32_t)arena->slice_count);
   mi_snap_u32(out, (uint32_t)arena->info_slices);

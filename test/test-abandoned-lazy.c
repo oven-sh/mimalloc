@@ -39,7 +39,7 @@ terms of the MIT license.
 
 #include "mimalloc.h"
 
-#if defined(MI_TSAN) || defined(MI_UBSAN) || defined(MI_GUARDED)
+#if defined(MI_TSAN) || defined(MI_UBSAN) || (defined(MI_GUARDED) && MI_GUARDED>0)
 static int ITER = 20;
 #else
 static int ITER = 100;

@@ -49,7 +49,7 @@ typedef struct mi_stat_counter_s {
   MI_STAT_COUNT(threads)                    /* number of threads */ \
   MI_STAT_COUNT(malloc_normal)              /* allocated bytes <= MI_LARGE_OBJ_SIZE_MAX */ \
   MI_STAT_COUNT(malloc_huge)                /* allocated bytes in huge pages */ \
-  MI_STAT_COUNT(malloc_requested)           /* malloc requested bytes */ \
+  MI_STAT_COUNTER(malloc_requested)         /* malloc requested bytes */ \
   \
   MI_STAT_COUNTER(mmap_calls) \
   MI_STAT_COUNTER(commit_calls) \
@@ -75,13 +75,19 @@ typedef struct mi_stat_counter_s {
   /* only on v3 */ \
   MI_STAT_COUNT(heaps) \
   MI_STAT_COUNT(theaps) \
+  MI_STAT_COUNT(pages_os_abandoned)        /* pages in the os abandoned list (bad) */ \
+  MI_STAT_COUNT(pages_os_allocated)        /* pages allocated outside arenas (bad) */ \
   MI_STAT_COUNTER(pages_reclaim_on_alloc) \
   MI_STAT_COUNTER(pages_reclaim_on_free) \
   MI_STAT_COUNTER(pages_reabandon_full) \
   MI_STAT_COUNTER(pages_unabandon_busy_wait) \
-  MI_STAT_COUNTER(heaps_delete_wait)
+  MI_STAT_COUNTER(heaps_delete_wait) \
+  MI_STAT_COUNTER(pages_stat_updates)      /* calls to successful page_stat_update */ \
+  MI_STAT_COUNTER(pages_stat_update_count) /* total free/allocs */ \
+  MI_STAT_COUNTER(profile_samples)         /* total sampled profiled allocations */ \
+
 // note: the hole-purging counters are NOT in here -- `mi_stats_t` is embedded in `mi_theap_t`,
-// whose size is already at `MI_META_MAX_SIZE` (8KB) and cannot grow. See `mi_purge_holes_stats_t`.
+// whose size is bounded by `MI_META_MAX_SIZE` (8KB). See `mi_purge_holes_stats_t`.
 
 // Size bins for chunks
 typedef enum mi_chunkbin_e {
@@ -166,6 +172,12 @@ mi_decl_export size_t  mi_stats_get_bin_size(size_t bin) mi_attr_noexcept;
 // per-heap -> per-page -> (optional) per-block live snapshot. mi_free the result.
 mi_decl_export char*   mi_heap_dump_json(bool include_blocks, bool hash_addresses) mi_attr_noexcept;
 mi_decl_export size_t  mi_heap_get_seq(mi_heap_t* heap) mi_attr_noexcept;
+
+// get theap stats (only thread safe on theaps belonging to the calling thread)
+mi_decl_export bool    mi_theap_stats_get(mi_theap_t* theap, mi_stats_t* stats) mi_attr_noexcept;
+
+// add the theap stats to the stats of the parent heap and clear the theap stats
+mi_decl_export void    mi_theap_stats_merge_to_heap(mi_theap_t* theap) mi_attr_noexcept;
 
 #ifdef __cplusplus
 }

@@ -35,7 +35,7 @@ terms of the MIT license.
 // argument defaults
 #if defined(MI_TSAN)
 static int ITER = 200;
-#elif defined(MI_UBSAN) || defined(MI_GUARDED)
+#elif defined(MI_UBSAN) || (defined(MI_GUARDED) && MI_GUARDED>0)
 static int ITER = 200;
 #else
 static int ITER = 1000;   // (a 3-core CI VM runs ~10 iterations/s; pass a count on the command line for more)

@@ -71,7 +71,7 @@ typedef size_t mi_bfield_t;
 #define MI_BCHUNK_FIELDS             (MI_BCHUNK_BITS / MI_BFIELD_BITS)  // 8 on both 64- and 32-bit
 
 
-// some compiler (msvc in C mode) cannot have expressions in the alignment attribute
+// some compilers (msvc in C mode) cannot have expressions in the alignment attribute
 #if MI_BCHUNK_SIZE==64
 #define mi_decl_bchunk_align  mi_decl_align(64)
 #elif MI_BCHUNK_SIZE==32
@@ -95,11 +95,11 @@ typedef mi_bchunk_t mi_bchunkmap_t;
 
 #define MI_BITMAP_MAX_CHUNK_COUNT     (MI_BCHUNKMAP_BITS)
 #define MI_BITMAP_MIN_CHUNK_COUNT     (1)
-#if MI_SIZE_BITS > 32
-#define MI_BITMAP_DEFAULT_CHUNK_COUNT     (64)  // 2 GiB on 64-bit -- this is for the page map
-#else
+// #if MI_SIZE_BITS > 32
+// #define MI_BITMAP_DEFAULT_CHUNK_COUNT    (128)  // 4 GiB on 64-bit -- this is for the page map
+// #else
 #define MI_BITMAP_DEFAULT_CHUNK_COUNT      (1)
-#endif
+// #endif
 #define MI_BITMAP_MAX_BIT_COUNT       (MI_BITMAP_MAX_CHUNK_COUNT * MI_BCHUNK_BITS)  // 16 GiB arena
 #define MI_BITMAP_MIN_BIT_COUNT       (MI_BITMAP_MIN_CHUNK_COUNT * MI_BCHUNK_BITS)  // 32 MiB arena
 #define MI_BITMAP_DEFAULT_BIT_COUNT   (MI_BITMAP_DEFAULT_CHUNK_COUNT * MI_BCHUNK_BITS)  // 2 GiB arena
