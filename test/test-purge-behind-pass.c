@@ -47,7 +47,13 @@ static void check(const char* name, bool ok) {
 #define MAX_FIRST   (32)
 #define MAX_SECOND  (8)
 #define BLOCK_SIZE  ((size_t)8 * 1024 * 1024)
+#if defined(MI_TSAN) || defined(MI_TEST_LIGHT)
+#define ROUNDS      (2)     // a sanitizer run is slow, and each test has a time limit there
+#define LIGHT       (1)
+#else
 #define ROUNDS      (3)
+#define LIGHT       (0)
+#endif
 #define BOUND_SECS  (10)    // a pass comes `purge_delay` (100ms) after a free
 
 // the counters of the subprocess itself: read without a lock, and without touching our theap
@@ -224,6 +230,6 @@ int main(void) {
   const int second_count = (sizeof(void*) >= 8 ? MAX_SECOND : MAX_SECOND / 4);
   test_free_behind_pass(first_count, second_count);
   test_fork_in_pass(first_count);
-  if (failures == 0) { test_free_into_visited_arena(first_count / 2); }
+  if (failures == 0) { test_free_into_visited_arena(first_count / (LIGHT ? 4 : 2)); }
   return failures;
 }
