@@ -205,12 +205,12 @@ static void mi_scavenger_run(void) {
     // Do the idle work of any thread that parked and handed us its theaps. This is the expensive
     // part (the hole punch is ~99% madvise) and it is why the owner gets to skip it.
     const mi_msecs_t park_due = _mi_theap_sweep_parked(subproc);
-    mi_msecs_t expire = mi_atomic_loadi64_acquire(&subproc->purge_expire);
+    const mi_msecs_t expire = mi_atomic_loadi64_acquire(&subproc->purge_expire);
     mi_msecs_t timeout_ms;
     if (expire == 0) {
       // Nothing scheduled: park until woken. The 30s bound is a pure safety
       // net so stop() is guaranteed to take effect and any per-arena expiry
-      // that did not propagate to subproc is still eventually purged.
+      // that did not propagate to subproc is still eventually purged (below).
       timeout_ms = 30000;
     }
     else {
@@ -220,20 +220,28 @@ static void mi_scavenger_run(void) {
         if (timeout_ms > 30000) timeout_ms = 30000;
       }
       else {
-        _mi_arenas_try_purge(false /* force */, true /* visit_all */, subproc, 0 /* tseq */);
-        // _mi_arenas_try_purge clears subproc->purge_expire to 0 once every
-        // arena is done. If it left the stale past value (some arena's own
-        // expire is still in the future), clear it so the next iteration parks
-        // on the 30s safety net instead of spinning. CAS so a concurrently
-        // scheduled future expire is never clobbered.
-        mi_atomic_casi64_strong_acq_rel(&subproc->purge_expire, &expire, (mi_msecs_t)0);
-        continue;
+        const bool dropped = !_mi_arenas_try_purge(false /* force */, true /* visit_all */, subproc, 0 /* tseq */);
+        // A pass resets subproc->purge_expire before it looks at the arenas, and
+        // leaves the earliest per-arena expire that is still pending (0 if none),
+        // or what a free set since, so the next wait is exact.
+        if (mi_atomic_loadi64_acquire(&subproc->purge_expire) != expire) continue;
+        // Not reset. Do not clear it from here: if it was set to this same value
+        // again since (`_mi_arenas_purge_now` stores the current time), that pass
+        // would be lost, and no free into an armed arena asks for another.
+        // Dropped: another thread is in a pass. What was set since that pass reset
+        // it, the pass leaves as it is, without a wake: come back for it.
+        // Not dropped: purging got switched off, so nothing is scheduled.
+        timeout_ms = (dropped ? 1 : 30000);
       }
     }
     // a park passed over for `purge_holes_min_interval` is swept when its window ends, not at the safety timeout
     if (park_due > 0 && park_due < timeout_ms) { timeout_ms = park_due; }
     if (mi_atomic_load_acquire(&_mi_scavenger_running) == 0) break;
     mi_scav_wait(&subproc->scavenger_wake, timeout_ms);
+    // The safety net: nothing was scheduled and nothing woke us. Look at the arenas all the same.
+    if (expire == 0 && mi_atomic_load_relaxed(&subproc->scavenger_wake) == 0) {
+      _mi_arenas_try_purge(false /* force */, true /* visit_all */, subproc, 0 /* tseq */);
+    }
   }
 }
 
