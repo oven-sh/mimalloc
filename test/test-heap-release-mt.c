@@ -11,6 +11,8 @@ terms of the MIT license.
      handed out). What was kept live is freed after the delete, when it belongs to the main heap: left
      in place it pins a page per block for the rest of the run (tens of GiB in a release build, and with
      a guard page behind every page, MI_SECURE=FULL, more mappings than `vm.max_map_count` allows).
+     After a delete by another thread the owner goes on with its next heap while that delete may still
+     run, and frees those blocks once it has returned.
      Some heaps are also published for a while so that short-lived threads allocate from
      them and exit with their blocks live (the abandon path, and the per-bin abandoned maps).
    - NFREE threads pop blocks from the ring and `mi_free` them: those frees land before, during and
@@ -83,9 +85,22 @@ static unsigned rnd(unsigned* s){ *s = *s*1103515245u+12345u; return *s>>8; }
 static _Atomic(mi_heap_t*) shared[NSHARED];
 static _Atomic int users[NSHARED];
 
+#define MIN_BLOCKS 50
+#define MAX_BLOCKS 450    // a heap gets MIN_BLOCKS up to (excluding) MAX_BLOCKS blocks
+
+static void free_all(void** blocks, int* count) {
+  for (int i = 0; i < *count; i++) mi_free(blocks[i]);
+  *count = 0;
+}
+
 static void* churn(void* arg) {
   const int self = (int)(uintptr_t)arg - 1;
   unsigned seed = (unsigned)(uintptr_t)arg * 7919u + 1;
+  void* kept[MAX_BLOCKS];   int nkept = 0;     // live in the heap when it is released
+  // The kept blocks of the heap that we left to a freer. The delete may still be running when we are back from the park,
+  // and until it returns our own frees into that heap are not safe (they are not atomic, that is what the park is for).
+  // So go on with the next heap in the meantime and free these once `deleted[self]` says the delete is over.
+  void* behind[MAX_BLOCKS]; int nbehind = 0;
   while (!atomic_load(&stop)) {
     mi_heap_t* h = mi_heap_new();
     int slot = -1;
@@ -96,8 +111,7 @@ static void* churn(void* arg) {
       if (!atomic_compare_exchange_strong(&shared[slot], &expect, h)) slot = -1;
     }
     int handed = 0;
-    void* kept[450]; int nkept = 0;
-    int n = 50 + rnd(&seed) % 400;
+    int n = MIN_BLOCKS + rnd(&seed) % (MAX_BLOCKS - MIN_BLOCKS);
     for (int i = 0; i < n; i++) {
       size_t sz = sizes[rnd(&seed) % NS];
       void* p = mi_heap_malloc(h, sz);
@@ -106,7 +120,7 @@ static void* churn(void* arg) {
       unsigned r = rnd(&seed) % 3;
       if (r == 0) { push(p); handed++; }
       else if (r == 1) mi_free(p);
-      else kept[nkept++] = p;   // live in the heap when it is released: delete moves it to main / destroy frees it
+      else kept[nkept++] = p;   // delete moves it to main / destroy frees it
     }
     if (slot >= 0) {
       // let exiting threads use it for a bit, then unpublish
@@ -115,9 +129,15 @@ static void* churn(void* arg) {
       while (atomic_load(&users[slot]) != 0) usleep(10); // in-flight allocators finish (contract: no alloc during delete)
       handed = 1; // exiting threads may hold blocks: must delete, not destroy
     }
+    bool released = false;
     if (atomic_load(&park_mode)) {
       const bool remote = ((rnd(&seed) & 1) != 0);
-      if (remote) { atomic_store(&deleted[self], 0); atomic_store(&to_delete[self], h); }   // a freer deletes it while we are parked
+      if (remote) {
+        // one remote delete at a time: `deleted[self]` is about to be reused
+        if (nbehind > 0) { while (!atomic_load(&deleted[self])) usleep(10); free_all(behind, &nbehind); }
+        atomic_store(&deleted[self], 0);
+        atomic_store(&to_delete[self], h);   // a freer deletes it while we are parked
+      }
       const bool parked = mi_on_thread_idle_start();
       if (parked) { atomic_fetch_add(&parks_handed_off, 1); }
       if (remote) {
@@ -133,19 +153,20 @@ static void* churn(void* arg) {
       if (remote) {
         mi_heap_t* const left = atomic_exchange(&to_delete[self], NULL);   // only non-NULL if we are stopping
         if (left != NULL) { mi_heap_delete(left); }
-        else { while (!atomic_load(&deleted[self])) usleep(10); }   // our own frees are not thread-safe: not before the delete is over
-        for (int i = 0; i < nkept; i++) mi_free(kept[i]);
-        atomic_fetch_add(&heaps_done, 1);
-        continue;
+        else { memcpy(behind, kept, (size_t)nkept * sizeof(void*)); nbehind = nkept; nkept = 0; }   // a freer took it
+        released = true;
       }
     }
-    if (handed == 0 && (rnd(&seed) & 1)) mi_heap_destroy(h);
-    else {
-      mi_heap_delete(h);
-      for (int i = 0; i < nkept; i++) mi_free(kept[i]);
+    if (!released) {
+      if (handed == 0 && (rnd(&seed) & 1)) { mi_heap_destroy(h); nkept = 0; }
+      else { mi_heap_delete(h); }
     }
+    // What stayed live now belongs to the main heap. Left there, each block pins its page for the rest of the run.
+    free_all(kept, &nkept);
+    if (nbehind > 0 && atomic_load(&deleted[self])) { free_all(behind, &nbehind); }
     atomic_fetch_add(&heaps_done, 1);
   }
+  if (nbehind > 0) { while (!atomic_load(&deleted[self])) usleep(10); free_all(behind, &nbehind); }
   return NULL;
 }
 
