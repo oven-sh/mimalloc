@@ -7,8 +7,11 @@ terms of the MIT license.
 /* Release heaps on many threads at once while other threads free into them.
 
    - NCHURN threads loop: `mi_heap_new`, allocate mixed sizes, hand a third of the blocks to a shared
-     ring, free a third, leak a third, then `mi_heap_delete` (or `mi_heap_destroy` when nothing was
-     handed out). Some heaps are also published for a while so that short-lived threads allocate from
+     ring, free a third, keep a third live, then `mi_heap_delete` (or `mi_heap_destroy` when nothing was
+     handed out). What was kept live is freed after the delete, when it belongs to the main heap: left
+     in place it pins a page per block for the rest of the run (tens of GiB in a release build, and with
+     a guard page behind every page, MI_SECURE=FULL, more mappings than `vm.max_map_count` allows).
+     Some heaps are also published for a while so that short-lived threads allocate from
      them and exit with their blocks live (the abandon path, and the per-bin abandoned maps).
    - NFREE threads pop blocks from the ring and `mi_free` them: those frees land before, during and
      after the delete of the owning heap, so pages are freed and re-abandoned by a foreign thread while
@@ -54,6 +57,7 @@ static _Atomic int stop;
 static _Atomic int park_mode;       // second half: park around the release, see the header
 static _Atomic unsigned long heaps_done, frees_done, exits_done, parks_done, parks_handed_off, remote_deletes;
 static _Atomic(mi_heap_t*) to_delete[NCHURN];   // park mode: heap i's owner is parked and waits for a freer to delete it
+static _Atomic int deleted[NCHURN];             // park mode: the freer that took `to_delete[i]` is done with the delete
 
 static const size_t sizes[] = {8,16,48,96,200,512,1024,2048,5000,8192,20000,40000,70000,200000};
 #define NS (sizeof(sizes)/sizeof(sizes[0]))
@@ -92,6 +96,7 @@ static void* churn(void* arg) {
       if (!atomic_compare_exchange_strong(&shared[slot], &expect, h)) slot = -1;
     }
     int handed = 0;
+    void* kept[450]; int nkept = 0;
     int n = 50 + rnd(&seed) % 400;
     for (int i = 0; i < n; i++) {
       size_t sz = sizes[rnd(&seed) % NS];
@@ -101,7 +106,7 @@ static void* churn(void* arg) {
       unsigned r = rnd(&seed) % 3;
       if (r == 0) { push(p); handed++; }
       else if (r == 1) mi_free(p);
-      // else leak into the heap; delete moves it to main / destroy frees it
+      else kept[nkept++] = p;   // live in the heap when it is released: delete moves it to main / destroy frees it
     }
     if (slot >= 0) {
       // let exiting threads use it for a bit, then unpublish
@@ -112,7 +117,7 @@ static void* churn(void* arg) {
     }
     if (atomic_load(&park_mode)) {
       const bool remote = ((rnd(&seed) & 1) != 0);
-      if (remote) { atomic_store(&to_delete[self], h); }   // a freer deletes it while we are parked
+      if (remote) { atomic_store(&deleted[self], 0); atomic_store(&to_delete[self], h); }   // a freer deletes it while we are parked
       const bool parked = mi_on_thread_idle_start();
       if (parked) { atomic_fetch_add(&parks_handed_off, 1); }
       if (remote) {
@@ -128,12 +133,17 @@ static void* churn(void* arg) {
       if (remote) {
         mi_heap_t* const left = atomic_exchange(&to_delete[self], NULL);   // only non-NULL if we are stopping
         if (left != NULL) { mi_heap_delete(left); }
+        else { while (!atomic_load(&deleted[self])) usleep(10); }   // our own frees are not thread-safe: not before the delete is over
+        for (int i = 0; i < nkept; i++) mi_free(kept[i]);
         atomic_fetch_add(&heaps_done, 1);
         continue;
       }
     }
     if (handed == 0 && (rnd(&seed) & 1)) mi_heap_destroy(h);
-    else mi_heap_delete(h);
+    else {
+      mi_heap_delete(h);
+      for (int i = 0; i < nkept; i++) mi_free(kept[i]);
+    }
     atomic_fetch_add(&heaps_done, 1);
   }
   return NULL;
@@ -144,7 +154,7 @@ static void delete_parked_heaps(void) {
   for (int i = 0; i < NCHURN; i++) {
     if (atomic_load(&to_delete[i]) == NULL) continue;
     mi_heap_t* const h = atomic_exchange(&to_delete[i], NULL);
-    if (h != NULL) { mi_heap_delete(h); atomic_fetch_add(&remote_deletes, 1); }
+    if (h != NULL) { mi_heap_delete(h); atomic_store(&deleted[i], 1); atomic_fetch_add(&remote_deletes, 1); }
   }
 }
 
