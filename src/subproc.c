@@ -394,11 +394,13 @@ void _mi_process_fork_prepare(void) {
   mi_lock_acquire(&mi_subprocs_lock);
   _mi_thread_locals_fork_prepare();
   for (mi_subproc_t* sp = mi_subprocs; sp != NULL; sp = sp->next) { mi_subproc_fork_prepare(sp); }
+  _mi_arenas_purge_guard_acquire();   // last: a purge pass takes no lock, so the one in progress ends (see `arena.c`)
 }
 
 void _mi_process_fork_parent(void) {
   if (!_mi_process_is_initialized) return;
   if (mi_atomic_decrement_acq_rel(&mi_fork_depth) != 1) return;
+  _mi_arenas_purge_guard_release();
   // release in reverse: last sub-process first (the registry is a stack: newest first, so walk it into a reversed order)
   size_t n = 0;
   for (mi_subproc_t* sp = mi_subprocs; sp != NULL; sp = sp->next) { n++; }
@@ -417,11 +419,9 @@ void _mi_process_fork_child(void) {
   if (mi_atomic_exchange_acq_rel(&mi_fork_depth, 0) == 0) return;
   _mi_process_is_forked_child = true;
   _mi_scavenger_forked_child();   // the scavenger thread did not survive the fork; clear the state that says it did
-  const bool purge_cut_off = _mi_arenas_purge_guard_reset();   // nor did a thread that was purging; release the guard it held
+  _mi_arenas_purge_guard_release();   // taken by the prepare handler: no purge pass was in progress, so each `purge_expire` is as a finished pass left it
   mi_lock_init(&mi_subprocs_lock);
   for (mi_subproc_t* sp = mi_subprocs; sp != NULL; sp = sp->next) {
-    // the purge pass that was cut off may have been over this one: make a pass due, for the arenas whose expire is still set
-    if (purge_cut_off) { mi_atomic_storei64_relaxed(&sp->purge_expire, (mi_msecs_t)1); }
     mi_lock_init(&sp->arena_reserve_lock);
     mi_lock_init(&sp->heaps_lock);
     mi_lock_init(&sp->tlds_lock);

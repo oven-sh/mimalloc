@@ -2735,12 +2735,24 @@ void _mi_arenas_purge_now(mi_subproc_t* subproc) {
 // allow only one thread to purge at a time (todo: allow concurrent purging?)
 static mi_atomic_guard_t mi_arenas_purge_guard;
 
-// Release the guard for a thread that is gone: the one that held it across fork() is not in the child, and at process exit
-// on Windows every other thread is terminated before the detach callback runs. Nothing else would ever release it, and a
-// forced purge waits for it. Returns true if it was held: that pass had reset the `purge_expire` of a sub-process, and
-// it is not there to put back what was still pending (see `_mi_arenas_try_purge`).
-bool _mi_arenas_purge_guard_reset(void) {
-  return (mi_atomic_exchange_acq_rel(&mi_arenas_purge_guard, (uintptr_t)0) != 0);
+// No purge pass runs across a fork(): the prepare handler takes the guard, the parent and the child release it. A pass
+// changes the protection of arena memory (a decommit is `mprotect(PROT_NONE)` in a debug or secure build) and the bits that
+// describe that memory in separate steps, and a fork in between gives the child the one without the other.
+// Taken last in the prepare handler, under its locks: a pass takes none of them and waits for no one, so it ends.
+void _mi_arenas_purge_guard_acquire(void) {
+  size_t spin = 0;
+  uintptr_t expected = 0;
+  while (!mi_atomic_cas_weak_acq_rel(&mi_arenas_purge_guard, &expected, (uintptr_t)1)) {
+    expected = 0;
+    if (spin < 256) { mi_atomic_pause(); spin++; }
+    else { _mi_prim_thread_yield(); }
+  }
+}
+
+// Also for a holder that is gone: at process exit on Windows every other thread is terminated before the detach callback
+// runs. Nothing else would ever release it then, and a forced purge waits for it.
+void _mi_arenas_purge_guard_release(void) {
+  mi_atomic_store_release(&mi_arenas_purge_guard, (uintptr_t)0);
 }
 
 // Make a purge pass over the arenas of `subproc` due at `expire`, unless one is due before that already. The scavenger

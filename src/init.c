@@ -691,7 +691,7 @@ static void mi_process_done_once(void) {
   #if defined(_WIN32)
   // This runs in the process detach callback, after the system terminated every other thread. One that was in a purge
   // pass then (the scavenger, as a rule) holds the purge guard for good, and the forced collect below would wait for it.
-  _mi_arenas_purge_guard_reset();
+  _mi_arenas_purge_guard_release();
   #endif
   _mi_heap_snapshot_on_exit();   // fork: heap snapshot at exit, before anything is torn down
   // only shutdown if we were initialized
