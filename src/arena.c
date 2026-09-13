@@ -1699,7 +1699,15 @@ void _mi_arenas_free(mi_subproc_t* subproc, void* p, size_t size, mi_memid_t mem
 
 // Purge the arenas; if `force_purge` is true, amenable parts are purged even if not yet expired
 void _mi_arenas_collect(bool force_purge, bool visit_all, mi_tld_t* tld) {
-  _mi_arenas_try_purge(force_purge, visit_all, tld->subproc, tld->thread_seq);
+  // A forced purge is `mi_collect(true)`, and whoever asks for that reads the footprint next. Only one thread purges at
+  // a time, and the pass that holds the guard does not stand in for ours: the scavenger's is never forced, so it leaves
+  // every arena whose delay has not passed, and what was freed behind it is for its next pass. So take our turn
+  // after it. The holder takes no lock and waits for no one; it is in there for its madvise calls.
+  size_t spin = 0;
+  while (!_mi_arenas_try_purge(force_purge, visit_all, tld->subproc, tld->thread_seq) && force_purge) {
+    if (spin < 256) { mi_atomic_pause(); spin++; }
+    else { _mi_prim_thread_yield(); }
+  }
 }
 
 
@@ -2724,30 +2732,59 @@ void _mi_arenas_purge_now(mi_subproc_t* subproc) {
   }
 }
 
-void _mi_arenas_try_purge(bool force, bool visit_all, mi_subproc_t* subproc, size_t tseq)
+// allow only one thread to purge at a time (todo: allow concurrent purging?)
+static mi_atomic_guard_t mi_arenas_purge_guard;
+
+// Release the guard for a thread that is gone: the one that held it across fork() is not in the child, and at process exit
+// on Windows every other thread is terminated before the detach callback runs. Nothing else would ever release it, and a
+// forced purge waits for it. Returns true if it was held: that pass had reset the `purge_expire` of a sub-process, and
+// it is not there to put back what was still pending (see `_mi_arenas_try_purge`).
+bool _mi_arenas_purge_guard_reset(void) {
+  return (mi_atomic_exchange_acq_rel(&mi_arenas_purge_guard, (uintptr_t)0) != 0);
+}
+
+// Make a purge pass over the arenas of `subproc` due at `expire`, unless one is due before that already. The scavenger
+// sleeps until the time it last read here (or for its safety timeout if that was 0), so wake it to read the new one.
+static void mi_subproc_schedule_purge(mi_subproc_t* subproc, mi_msecs_t expire) {
+  mi_assert_internal(expire != 0);
+  mi_msecs_t current = mi_atomic_loadi64_relaxed(&subproc->purge_expire);
+  while (current == 0 || current > expire) {
+    if (mi_atomic_casi64_strong_acq_rel(&subproc->purge_expire, &current, expire)) {
+      _mi_scavenger_wake(subproc);
+      return;
+    }
+  }
+}
+
+// Returns false if another thread was purging and this pass was dropped because of it.
+bool _mi_arenas_try_purge(bool force, bool visit_all, mi_subproc_t* subproc, size_t tseq)
 {
   // try purge can be called often so try to only run when needed
   const long delay = mi_arena_purge_delay();
-  if (_mi_preloading() || delay <= 0) return;  // nothing will be scheduled
+  if (_mi_preloading() || delay <= 0) return true;  // nothing will be scheduled
 
   // check if any arena needs purging?
   const mi_msecs_t now = _mi_clock_now();
   const mi_msecs_t arenas_expire = mi_atomic_loadi64_acquire(&subproc->purge_expire);
-  if (!visit_all && !force && (arenas_expire == 0 || arenas_expire > now)) return;
+  if (!visit_all && !force && (arenas_expire == 0 || arenas_expire > now)) return true;
 
   const size_t max_arena = mi_arenas_get_count(subproc);
-  if (max_arena == 0) return;
+  if (max_arena == 0) return true;
 
-  // allow only one thread to purge at a time (todo: allow concurrent purging?)
-  static mi_atomic_guard_t purge_guard;
-  mi_atomic_guard(&purge_guard)
+  bool entered = false;
+  mi_atomic_guard(&mi_arenas_purge_guard)
   {
-    // increase global expire: at most one purge per delay cycle
-    if (arenas_expire > now) { mi_atomic_storei64_release(&subproc->purge_expire, now + (delay/10)); }
+    entered = true;
+    // Reset the subproc expire before the pass and not after it, as `mi_arena_try_purge` does with the expire of an
+    // arena. The first free into an arena after the pass went into it finds the arena expire at 0 and sets it, and
+    // only then looks at the subproc expire: it must find 0 there to set that too and wake the scavenger. With our old
+    // value still in place it would arm the arena alone, and no later free into an armed arena looks further.
+    // What is still pending when we are done is put back below.
+    mi_msecs_t expected = arenas_expire;
+    while (!mi_atomic_casi64_strong_acq_rel(&subproc->purge_expire, &expected, (mi_msecs_t)0)) { /* retry with the updated `expected` */ }
     const size_t arena_start = tseq % max_arena;
     size_t max_purge_count = (visit_all ? max_arena : (max_arena/4)+1);
     bool all_visited = true;
-    bool any_purged = false;
     mi_msecs_t next_expire = 0;   // earliest still-pending per-arena expire
     for (size_t _i = 0; _i < max_arena; _i++) {
       size_t i = _i + arena_start;
@@ -2755,28 +2792,28 @@ void _mi_arenas_try_purge(bool force, bool visit_all, mi_subproc_t* subproc, siz
       mi_arena_t* arena = mi_arena_from_index(subproc,i);
       if (arena != NULL) {
         const int purged = mi_arena_try_purge(arena, now, force);
-        if (purged >= 0) {      // purged, or arena expire is not yet reached
-          any_purged = true;
-          if (purged >= 1) {    // purged
-            if (max_purge_count <= 1) {
-              all_visited = false;
-              break;
-            }
-            max_purge_count--;
-          }
-        }
-        const mi_msecs_t aexpire = mi_atomic_loadi64_relaxed(&arena->purge_expire);
+        // Its expire is set if it is not yet due, or if a free came in behind the pass over it. Read it with a CAS
+        // (0 -> 0), not a load: that orders us with the CAS in `mi_arena_schedule_purge`, so either we see the expire
+        // that a free sets, or that free sees our reset above. With a load both can miss (store buffering).
+        mi_msecs_t aexpire = 0;
+        mi_atomic_casi64_strong_acq_rel(&arena->purge_expire, &aexpire, (mi_msecs_t)0);
         if (aexpire != 0 && (next_expire == 0 || aexpire < next_expire)) { next_expire = aexpire; }
+        if (purged >= 1) {    // purged
+          if (max_purge_count <= 1 && _i + 1 < max_arena) {   // (after the last arena we did visit all)
+            all_visited = false;
+            break;
+          }
+          max_purge_count--;
+        }
       }
     }
-    MI_UNUSED(any_purged);
-    if (all_visited) {
-      // we saw every arena: subproc->purge_expire becomes the earliest pending
-      // per-arena expire (0 if none) so the scavenger's next wait is exact.
-      mi_msecs_t expected = arenas_expire;
-      mi_atomic_casi64_strong_acq_rel(&subproc->purge_expire, &expected, next_expire);
-    }
+    // the arenas we did not get to are for the next call: keep that one due
+    if (!all_visited && (next_expire == 0 || next_expire > now)) { next_expire = now; }
+    // subproc->purge_expire becomes the earliest pending per-arena expire (it stays 0 if there is none), unless a
+    // free set an earlier one in the meantime, so the scavenger's next wait is exact.
+    if (next_expire != 0) { mi_subproc_schedule_purge(subproc, next_expire); }
   }
+  return entered;
 }
 
 
