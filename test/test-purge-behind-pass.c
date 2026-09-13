@@ -156,21 +156,27 @@ static void test_fork_in_pass(int first_count) {
 static void test_free_into_visited_arena(int count) {
   // an arena of our own (a pass comes to it after the main one), and a heap that allocates in it only
   mi_arena_id_t arena_id;
-  // (twice the size of what goes in: a block does not span the 32 MiB chunks of an arena, so each chunk takes three of them)
-  if (mi_reserve_os_memory_ex((size_t)2 * (size_t)(count + 2) * BLOCK_SIZE, false /* commit */, false /* allow large */, true /* exclusive */, &arena_id) != 0) {
+  // Four times the size of what goes in: a block this large starts on a boundary in the arena (each one takes 32 MiB of it
+  // on a 32-bit target, and three share 32 MiB on a 64-bit one). What does not fit ends the part, it does not fail it.
+  if (mi_reserve_os_memory_ex((size_t)4 * (size_t)(count + 1) * BLOCK_SIZE, false /* commit */, false /* allow large */, true /* exclusive */, &arena_id) != 0) {
     fprintf(stderr, "test-purge-behind-pass: no two arena test (could not reserve an arena)\n");
     return;
   }
   mi_heap_t* const heap = mi_heap_new_in_arena(arena_id);
   static void* ours[MAX_FIRST];
   static void* mains[MAX_FIRST];
-  bool ok = (heap != NULL);
-  for (int i = 0; ok && i < count; i++) {
-    ours[i] = mi_heap_malloc(heap, BLOCK_SIZE);
-    ok = (ours[i] != NULL);
-    if (ok) { memset(ours[i], 1, BLOCK_SIZE); }
+  int ours_count = 0;
+  while (heap != NULL && ours_count < count && (ours[ours_count] = mi_heap_malloc(heap, BLOCK_SIZE)) != NULL) {
+    memset(ours[ours_count], 1, BLOCK_SIZE);
+    ours_count++;
   }
-  void* const late = (ok ? mi_malloc(BLOCK_SIZE) : NULL);
+  if (ours_count < count) {
+    fprintf(stderr, "test-purge-behind-pass: no two arena test (%d of %d blocks fit in the arena)\n", ours_count, count);
+    for (int i = 0; i < ours_count; i++) { mi_free(ours[i]); }
+    if (heap != NULL) { mi_heap_delete(heap); }
+    return;
+  }
+  void* const late = mi_malloc(BLOCK_SIZE);
   if (late == NULL || !alloc_blocks(mains, count)) {
     check("out of memory", false);
     return;
