@@ -410,9 +410,11 @@ void _mi_process_fork_child(void) {
   if (mi_atomic_exchange_acq_rel(&mi_fork_depth, 0) == 0) return;
   _mi_process_is_forked_child = true;
   _mi_scavenger_forked_child();   // the scavenger thread did not survive the fork; clear the state that says it did
-  _mi_arenas_forked_child();      // nor did a thread that was purging; release the guard it held
+  const bool purge_cut_off = _mi_arenas_purge_guard_reset();   // nor did a thread that was purging; release the guard it held
   mi_lock_init(&mi_subprocs_lock);
   for (mi_subproc_t* sp = mi_subprocs; sp != NULL; sp = sp->next) {
+    // the purge pass that was cut off may have been over this one: make a pass due, for the arenas whose expire is still set
+    if (purge_cut_off) { mi_atomic_storei64_relaxed(&sp->purge_expire, (mi_msecs_t)1); }
     mi_lock_init(&sp->arena_reserve_lock);
     mi_lock_init(&sp->heaps_lock);
     mi_lock_init(&sp->tlds_lock);

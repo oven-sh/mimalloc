@@ -666,6 +666,11 @@ void mi_process_init(void) mi_attr_noexcept {
 // Called when the process is done
 static void mi_process_done_once(void) {
   _mi_scavenger_stop();          // fork: stop the background scavenger before any teardown
+  #if defined(_WIN32)
+  // This runs in the process detach callback, after the system terminated every other thread. One that was in a purge
+  // pass then (the scavenger, as a rule) holds the purge guard for good, and the forced collect below would wait for it.
+  _mi_arenas_purge_guard_reset();
+  #endif
   _mi_heap_snapshot_on_exit();   // fork: heap snapshot / profile at exit, before anything is torn down
   _mi_prof_on_exit();
   // only shutdown if we were initialized
