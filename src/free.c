@@ -595,7 +595,7 @@ size_t _mi_page_usable_size(const mi_page_t* page, const void* p) mi_attr_noexce
   if mi_unlikely(page==NULL) return 0;
   mi_assert_internal(mi_ptr_page_validate(p,"_mi_page_usable_size") == page);
   const mi_block_t* block = _mi_page_ptr_unalign(page, p); // for safety, always unalign
-  if mi_likely((const void*)block==page) {
+  if mi_likely((const void*)block==p) {
     return mi_page_usable_size_of(page, block, false /* is guarded */);
   }
   else {
@@ -780,7 +780,7 @@ mi_decl_nodiscard static bool mi_check_padding_on_free(const mi_page_t* page, co
   }
   else {
     size_t wrong;
-    bool is_double_free;
+    bool is_double_free = false;   // stays unset when the canary is fine and only the padding bytes are not
     if mi_unlikely(!mi_verify_padding(page,block,usable_size,&wrong,&is_double_free)) {
       if (is_double_free) {
         _mi_error_message(EAGAIN, "double free detected of heap block %p with size %zu\n", block, *usable_size);
