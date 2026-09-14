@@ -1738,7 +1738,10 @@ int main(void) {
     CHECK("purging-actually-happened", purged_any);
     // the small size classes are what this rework unlocked: they must purge now
     CHECK("small-blocks-are-eligible", (ps[0] && ps[1] && ps[2] && ps[3]));
-    CHECK("medium-page-is-eligible", ps[7]);
+    // (without large pages, `MI_ENABLE_LARGE_PAGES=0`, a block of 64 KiB and its padding is a page of its own: nothing to purge in it)
+    if (MI_ENABLE_LARGE_PAGES || (65536 + MI_PADDING_SIZE) <= MI_MEDIUM_MAX_OBJ_SIZE) {
+      CHECK("medium-page-is-eligible", ps[7]);
+    }
   }
   else {
     CHECK("nothing-purged-when-off", !purged_any);
