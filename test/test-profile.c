@@ -42,6 +42,8 @@ typedef struct {
   uint64_t  watch_alloc_count;
   uint64_t  watch_free_count;
   bool      watch_bad_free;       // `on_free` got something that `on_alloc` did not set up
+  bool      in_alloc;             // set around an allocation call: no sampled block is freed inside one
+  uint64_t  free_in_alloc_count;
 } my_profiler_t;
 
 #define SMALL_MAX  1024
@@ -81,6 +83,7 @@ static void mi_cdecl on_free(mi_profiler_t* profiler, mi_profiler_sample_data_t*
   MI_UNUSED_RELEASE(data); MI_UNUSED_RELEASE(ptr);
   my_profiler_t* prof = downcast(profiler);
   prof->free_count++;
+  if (prof->in_alloc) { prof->free_in_alloc_count++; }
   if (heap == prof->watch_heap) { 
     prof->watch_free_count++; 
     if (data->user_data[0] != ptr) { prof->watch_bad_free = true; }
@@ -99,7 +102,7 @@ static my_profiler_t my_profiler = {
     NULL
   },
   0, 0, 0, 0, NULL,
-  TEST_THRESHOLD, 0, 0, 0, NULL, 0, 0, false
+  TEST_THRESHOLD, 0, 0, 0, NULL, 0, 0, false, false, 0
 };
 
 
@@ -392,6 +395,106 @@ bool test_profiler_guarded_mixed(void) {
 }
 
 
+// An aligned allocation that its size class aligns by itself is first tried as a plain allocation, of which the
+// start of a block is expected. When the countdown is used up inside it (a page refill, a collection) it must not be
+// made a sample there: the sampled block would be freed again inside the allocator, and the allocation that is
+// returned would never be one. Samples of aligned allocations stay until the program frees them, and there are as
+// many as the bytes call for, also with other allocations in between.
+#define ALIGNED_COUNT 120000
+static void* aligned_blocks[ALIGNED_COUNT];
+
+bool test_profiler_aligned(void) {
+  CHECK_BODY("profiler: samples of aligned allocations live until they are freed") {
+    const size_t rate = 64*1024;
+    // the size class aligns the first five by itself (three of them also with the padding of a debug build);
+    // the last one is above the small object sizes
+    const size_t sizes[6]      = { 64, 256, 120, 1016, 48, 12288 };
+    const size_t alignments[6] = { 64, 256,  64,  512, 16,  4096 };
+    my_profiler.threshold = rate;
+    mi_heap_t* heap = mi_heap_new();
+    for (int i = 0; i < 3000; i++) { mi_free(mi_heap_malloc(heap, 2000)); }   // let its theap pick up the rate
+    my_profiler.watch_heap = heap;
+    my_profiler.watch_alloc_count = 0;
+    my_profiler.watch_free_count = 0;
+    my_profiler.watch_bad_free = false;
+    my_profiler.free_in_alloc_count = 0;
+    size_t misaligned = 0;
+    uint64_t aligned_samples = 0;
+    uint64_t aligned_bytes = 0;
+    uint64_t freed_early = 0;
+    for (int i = 0; i < ALIGNED_COUNT; i++) {
+      const int k = (i / 500) % 6;   // runs of one size, so that pages fill up and are refilled
+      const size_t size = (k == 5 && (i % 50) != 0 ? sizes[0] : sizes[k]);   // (a large one now and then)
+      const size_t alignment = (size == sizes[k] ? alignments[k] : alignments[0]);
+      const uint64_t before = my_profiler.watch_alloc_count;
+      my_profiler.in_alloc = true;
+      aligned_blocks[i] = mi_heap_malloc_aligned(heap, size, alignment);
+      my_profiler.in_alloc = false;
+      aligned_samples += (my_profiler.watch_alloc_count - before);
+      if (((uintptr_t)aligned_blocks[i] % alignment) != 0) { misaligned++; }
+      aligned_bytes += size;
+      // other allocations in between (every tenth round many, to come by the periodic collection as well)
+      const uint64_t freed_before = my_profiler.watch_free_count;
+      const uint64_t sampled_before = my_profiler.watch_alloc_count;
+      for (int j = 0; j < ((i % 10) == 0 ? 12 : 2); j++) { mi_free(mi_heap_malloc(heap, 32 + 8*(size_t)j)); }
+      freed_early += (my_profiler.watch_free_count - freed_before) - (my_profiler.watch_alloc_count - sampled_before);  // an aligned block's sample freed here: never
+    }
+    const uint64_t sampled = my_profiler.watch_alloc_count;
+    const uint64_t freed_mid = my_profiler.watch_free_count;
+    for (int i = 0; i < ALIGNED_COUNT; i++) { mi_free(aligned_blocks[i]); }
+    const uint64_t freed = my_profiler.watch_free_count;
+    mi_heap_destroy(heap);
+    my_profiler.watch_heap = NULL;
+    my_profiler.threshold = TEST_THRESHOLD;
+    const uint64_t expected = aligned_bytes / rate;
+    fprintf(stderr, "  (%llu samples of aligned allocations for %llu expected, %llu samples in all, %llu freed inside an allocation, %llu of an aligned one freed early, %llu freed when the program freed them, %zu misaligned)\n",
+      (unsigned long long)aligned_samples, (unsigned long long)expected, (unsigned long long)sampled, (unsigned long long)my_profiler.free_in_alloc_count,
+      (unsigned long long)freed_early, (unsigned long long)(freed - freed_mid), misaligned);
+    result = (misaligned == 0 && my_profiler.free_in_alloc_count == 0 && freed_early == 0 && freed == sampled && !my_profiler.watch_bad_free
+              && (freed - freed_mid) == aligned_samples    // each is there until the program frees it
+              && aligned_samples > expected / 2 && aligned_samples < expected * 3);  // (block bytes count, not requested ones)
+  }
+  return true;
+}
+
+
+// The same for a sample that comes due when the theap picks up the profiler inside the allocation (a theap that was
+// there before the profiler started does so once in a while in the generic path, which sets the countdown to at most
+// the rate): with a request above the rate that is a sample straight away, also with fine-grained sampling.
+bool test_profiler_aligned_late_start(void) {
+  CHECK_BODY("profiler: aligned allocations when their theap picks up the profiler") {
+    mi_profiler_stop(&my_profiler.profiler);
+    mi_heap_t* heap = mi_heap_new();
+    mi_free(mi_heap_malloc(heap, 2000));   // its theap is there now, without a profiler
+    my_profiler.threshold = 64*1024;
+    my_profiler.watch_heap = heap;
+    my_profiler.watch_alloc_count = 0;
+    my_profiler.watch_free_count = 0;
+    my_profiler.watch_bad_free = false;
+    my_profiler.free_in_alloc_count = 0;
+    mi_profiler_start(&my_profiler.profiler);
+    size_t misaligned = 0;
+    for (int i = 0; i < 3000; i++) {
+      my_profiler.in_alloc = true;
+      void* p = mi_heap_malloc_aligned(heap, 128*1024, 4096);
+      my_profiler.in_alloc = false;
+      if (((uintptr_t)p % 4096) != 0) { misaligned++; }
+      mi_free(p);
+    }
+    const uint64_t sampled = my_profiler.watch_alloc_count;
+    const uint64_t freed = my_profiler.watch_free_count;
+    mi_heap_destroy(heap);
+    my_profiler.watch_heap = NULL;
+    my_profiler.threshold = TEST_THRESHOLD;
+    fprintf(stderr, "  (%llu samples, %llu freed, %llu freed inside an allocation, %zu misaligned)\n",
+      (unsigned long long)sampled, (unsigned long long)freed, (unsigned long long)my_profiler.free_in_alloc_count, misaligned);
+    result = (misaligned == 0 && my_profiler.free_in_alloc_count == 0 && freed == sampled && !my_profiler.watch_bad_free
+              && sampled >= 1000);   // each one after the theap picked it up
+  }
+  return true;
+}
+
+
 // ---------------------------------------------------------------------------
 // main
 // ---------------------------------------------------------------------------
@@ -411,6 +514,8 @@ int main(void) {
   test_profiler_heap_destroy();
   test_profiler_heap_destroy_recycled();
   test_profiler_guarded_mixed();
+  test_profiler_aligned();
+  test_profiler_aligned_late_start();
 
   mi_profiler_stop(&my_profiler.profiler);
 

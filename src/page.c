@@ -2270,8 +2270,11 @@ static mi_theap_t* mi_malloc_generic_admin(mi_theap_t* theap)
   Generic allocation
 ----------------------------------------------------------- */
 
-static mi_decl_noinline void* mi_malloc_generic_fallback(mi_theap_t* theap, size_t size, bool zero, size_t huge_alignment, mi_page_t** ppage) 
+static mi_decl_noinline void* mi_malloc_generic_fallback(mi_theap_t* theap, size_t size, size_t zero_huge_alignment, mi_page_t** ppage)
 {  
+  const bool zero = ((zero_huge_alignment & MI_MALLOC_GENERIC_ZERO) != 0);
+  const size_t huge_alignment = (zero_huge_alignment & ~(MI_MALLOC_GENERIC_ZERO | MI_MALLOC_GENERIC_BLOCK_START));
+
   // initialize if necessary
   theap = mi_malloc_generic_admin(theap);
   if (theap==NULL) return NULL;
@@ -2287,6 +2290,7 @@ static mi_decl_noinline void* mi_malloc_generic_fallback(mi_theap_t* theap, size
   bool sample_countdown_is_adjusted = false;
   if mi_unlikely(mi_theap_should_sample(theap,req_size)) {
     if (huge_alignment==0 && theap->sample_rate!=0) {
+      if ((zero_huge_alignment & MI_MALLOC_GENERIC_BLOCK_START)!=0) return NULL;
       return _mi_theap_malloc_sampled(theap,req_size,zero,ppage);    
     }    
     mi_assert_internal(!_mi_is_empty_theap(theap));       // cannot write to the empty theap
@@ -2351,12 +2355,13 @@ void* _mi_malloc_generic(mi_theap_t* theap, size_t size, size_t zero_huge_alignm
   #if !MI_THEAP_INITASNULL
   mi_assert_internal(theap != NULL);
   #endif
-  const bool zero = ((zero_huge_alignment & 1) != 0);
-  const size_t huge_alignment = (zero_huge_alignment & ~1);
+  // (the flags and the alignment are taken from `zero_huge_alignment` where they are used, so only that stays live)
+  #define mi_generic_zero()            ((zero_huge_alignment & MI_MALLOC_GENERIC_ZERO) != 0)
+  #define mi_generic_huge_alignment()  (zero_huge_alignment & ~(MI_MALLOC_GENERIC_ZERO | MI_MALLOC_GENERIC_BLOCK_START))
   mi_page_t* page = NULL;
 
   // fast path objects that fit in a small page
-  if mi_likely(mi_theap_is_initialized(theap) && ++theap->generic_count < 1000 && huge_alignment==0) {
+  if mi_likely(mi_theap_is_initialized(theap) && ++theap->generic_count < 1000 && mi_generic_huge_alignment()==0) {
     const size_t req_size = size - MI_PADDING_SIZE;  // correct for padding_size in case of an overflow on `size`         
     if (req_size < MI_SMALL_MAX_OBJ_SIZE)
     { 
@@ -2376,19 +2381,24 @@ void* _mi_malloc_generic(mi_theap_t* theap, size_t size, size_t zero_huge_alignm
           // allocation that comes through here, that is one above `MI_SMALL_SIZE_MAX` (these always do) far more 
           // often than a small one: with one such allocation for every 40 blocks of 64 bytes, less than 2% of the 
           // sampled bytes went to the blocks of 64 bytes (`test-profile.c:test_profiler_small_attribution`).
+          // (`alloc-aligned.c:mi_theap_malloc_zero_aligned_at_generic` relies on getting the start of a block: it gets
+          // NULL and goes on to its over-allocating path, where the sample is usually taken)
           if mi_unlikely(theap->sample_rate!=0 && mi_theap_should_sample(theap,req_size)) {
-            return _mi_theap_malloc_sampled(theap,req_size,zero,ppage);
+            if ((zero_huge_alignment & MI_MALLOC_GENERIC_BLOCK_START)!=0) return NULL;
+            return _mi_theap_malloc_sampled(theap,req_size,mi_generic_zero(),ppage);
           }
           #endif
           if (ppage!=NULL) { *ppage = page; }
           mi_assert_internal(mi_page_immediate_available(page)); // we should never recurse in _mi_page_malloc_zero
-          return _mi_page_malloc_zero(theap,page,size,zero);
+          return _mi_page_malloc_zero(theap,page,size,mi_generic_zero());
         }
       }
     }
   }
   // otherwise fallback
-  return mi_malloc_generic_fallback(theap,size,zero,huge_alignment,ppage);
+  return mi_malloc_generic_fallback(theap,size,zero_huge_alignment,ppage);
+  #undef mi_generic_zero
+  #undef mi_generic_huge_alignment
 }
 
 void* _mi_malloc_generic_no_sample(mi_theap_t* theap, size_t size, bool zero, mi_page_t** ppage) mi_attr_noexcept {
@@ -2398,7 +2408,7 @@ void* _mi_malloc_generic_no_sample(mi_theap_t* theap, size_t size, bool zero, mi
   const size_t sample_countdown = theap->sample_countdown;
   theap->sample_rate = 0;  // prevent a recursive call to mi_theap_malloc_sampled from _mi_malloc_generic
   theap->sample_countdown = MI_SAMPLE_COUNTDOWN_MAX;
-  void* p = _mi_malloc_generic(theap, size, (zero ? 1 : 0), ppage);
+  void* p = _mi_malloc_generic(theap, size, (zero ? MI_MALLOC_GENERIC_ZERO : 0), ppage);
   theap->sample_rate = sample_rate;
   theap->sample_countdown = sample_countdown;
   return p;
