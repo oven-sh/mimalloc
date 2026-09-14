@@ -67,6 +67,9 @@ mi_decl_export bool mi_subproc_profile(mi_subproc_id_t subproc_id, mi_profiler_t
 mi_decl_export bool mi_profile(mi_profiler_t* profiler);
 
 // start sampling
+// The theaps of other threads start at their next allocation that goes through the generic path (those in the
+// current and the main sub-process; elsewhere within 1000 of them). Takes the locks of the heap lists: not to be
+// called from a `mi_subproc_visit_heaps` visitor, from an `on_free` callback, or from a signal handler.
 mi_decl_export bool mi_profiler_start(mi_profiler_t* profiler);
 
 // end sampling

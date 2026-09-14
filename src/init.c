@@ -154,6 +154,9 @@ mi_decl_hidden mi_decl_cache_align const mi_theap_t _mi_theap_empty = {
   MI_BIN_FULL, 0,         // page retired min/max
   0,                      // pages_full_size
   0, 0,                   // generic count
+  #if MI_SAMPLE
+  MI_ATOMIC_VAR_INIT(0),  // generic fast limit
+  #endif
   NULL, NULL,             // tnext, tprev
   NULL, NULL,             // hnext, hprev
   MI_PAGE_QUEUES_EMPTY,
@@ -220,7 +223,7 @@ static void mi_heap_main_init_once(void) {
   mi_process_theap_meta.allow_page_abandon = false;  // for security, don't share with other threads
   mi_process_theap_meta.page_full_retain = 2;
   mi_process_theap_meta.sample_rate = 0; // no sampling for meta data
-  mi_process_theap_meta.sample_countdown = 0;
+  mi_process_theap_meta.sample_countdown = MI_SAMPLE_COUNTDOWN_MAX;  // (not 0: `mi_theap_should_sample` would hold)
   subproc_main->theap_meta = &mi_process_theap_meta;
 
   // mi_heap_theap_set(&mi_process_heap_main,&mi_process_theap_main); // set in `mi_thread_init(_theap_default)`

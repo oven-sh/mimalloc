@@ -304,6 +304,10 @@ void          _mi_page_map_unsafe_destroy(void);
 void*         _mi_malloc_generic(mi_theap_t* theap, size_t size, size_t zero_huge_alignment, mi_page_t** ppage)  mi_attr_noexcept mi_attr_malloc;
 #define MI_MALLOC_GENERIC_ZERO        ((size_t)1)   // bits in `zero_huge_alignment` below the huge alignment (a multiple of MI_SLICE_SIZE)
 #define MI_MALLOC_GENERIC_BLOCK_START ((size_t)2)   // the caller needs the start of a block: if this allocation is to be a sample, allocate nothing and return NULL (`mi_theap_should_sample` is true then)
+#if MI_SAMPLE==1
+void          _mi_theap_sync_sample_counts(mi_theap_t* theap);
+#endif
+void          _mi_theap_update_profiling(mi_theap_t* theap);
 void*         _mi_malloc_generic_no_sample(mi_theap_t* theap, size_t size, bool zero, mi_page_t** ppage)  mi_attr_noexcept mi_attr_malloc;
 
 void          _mi_page_retire(mi_page_t* page) mi_attr_noexcept;       // free the page if there are no other pages with many free blocks
@@ -1424,6 +1428,9 @@ static inline bool mi_page_claim_ownership(mi_page_t* page) {
 
 #define MI_SAMPLE_RATE_MAX        (SIZE_MAX/4)
 #define MI_SAMPLE_COUNTDOWN_MAX   (MI_MAX_ALLOC_SIZE)
+
+// `_mi_malloc_generic` takes its fast path for this many calls in a row, and then `mi_malloc_generic_admin` runs.
+#define MI_GENERIC_FAST_LIMIT   (1000)
 
 static inline bool mi_theap_should_sample(mi_theap_t* theap, size_t req_size) {
   // note: this should return `true` on an empty theap so we initialize it's countdown to `-1`.

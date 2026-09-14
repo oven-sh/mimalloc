@@ -681,6 +681,9 @@ struct mi_theap_s {
   size_t                pages_full_size;                     // optimization: total size of blocks in the pages of the full queue (issue #1220)
   long                  generic_count;                       // how often is `_mi_malloc_generic` called?
   long                  generic_collect_count;               // how often is `_mi_malloc_generic` called without collecting?
+  #if MI_SAMPLE
+  _Atomic(intptr_t)     generic_fast_limit;                  // `_mi_malloc_generic` takes its fast path while `generic_count` is below this: `MI_GENERIC_FAST_LIMIT`, or -1 when `mi_profiler_start` asks the theap to look at its profiler (see `page.c:mi_malloc_generic_fallback`)
+  #endif
 
   // theaps belong to heaps and threads
   mi_theap_t*           tnext;                               // list of theaps in this thread

@@ -254,7 +254,7 @@ bool _mi_page_is_valid(mi_page_t* page) {
 }
 #endif
 
-#if MI_STATS || MI_SAMPLE
+#if MI_STATS
 // Gets the theap belonging to a page.
 static mi_theap_t* mi_theap_of_page(mi_page_t* page) {
   mi_theap_t* theap = page->theap;
@@ -406,34 +406,54 @@ void _mi_page_update_stats_for(mi_page_t* page, mi_theap_t* theapx) {
 }
 #endif
 
+// Called when the free list of a page is refilled.
 static void mi_page_update_sample_countdown(mi_page_t* page) 
 {  
-  // adjust count down  
   const size_t alloc_count = mi_page_alloc_count(page);  
-  if (alloc_count==0) {
-    return; 
-  }
-  else if mi_unlikely(alloc_count>=0x8000) {  // if the count could overflow, update stats so the counter is reset
+  if mi_unlikely(alloc_count>=0x8000) {  // if the count could overflow, update stats so the counter is reset
     _mi_page_update_stats(page);
   }
-  #if MI_SAMPLE==1  // if ==2 the countdown is already always counted in `alloc.c:mi_page_alloc_zero_ex`
-  else {
-    mi_theap_t* theap = mi_theap_of_page(page);
-    if (theap==NULL) return;
-    mi_theap_adjust_sample_countdown(theap,page,alloc_count);
-    // update last_alloc to alloc_count
-    mi_assert_internal(alloc_count <= UINT16_MAX);      
-    #if MI_SIZE_SIZE >= 8
-      page->xused.used_alloc = (alloc_count << 48) | (page->xused.used_alloc & (~MI_ZU(0) >> 16));
-    #else
-      page->xlast_alloc = (uint16_t)alloc_count;
-    #endif
-    mi_assert_internal(mi_page_alloc_count(page) + mi_page_last_used(page) >= mi_page_used(page));
-    mi_assert_internal(mi_page_alloc_count(page) >= mi_page_last_alloc(page));
-
-  }
-  #endif
+  // (with `MI_SAMPLE==1` the blocks that were handed out are counted against the sample countdown by
+  //  `mi_theap_count_page_allocs`, with `MI_SAMPLE==2` in every `alloc.c:mi_page_alloc_zero_ex`)
 }
+
+#if MI_SAMPLE==1
+static void mi_page_set_last_alloc(mi_page_t* page, size_t alloc_count) {
+  mi_assert_internal(alloc_count <= UINT16_MAX);
+  #if MI_SIZE_SIZE >= 8
+    page->xused.used_alloc = (alloc_count << 48) | (page->xused.used_alloc & (~MI_ZU(0) >> 16));
+  #else
+    page->xlast_alloc = (uint16_t)alloc_count;
+  #endif
+  mi_assert_internal(mi_page_alloc_count(page) + mi_page_last_used(page) >= mi_page_used(page));
+  mi_assert_internal(mi_page_alloc_count(page) >= mi_page_last_alloc(page));
+}
+
+// Count the blocks that the fast path took from a page of `theap` since the last time against its sample countdown.
+// A theap that samples does so in the generic path: before it refills the free list of the first page of a size class
+// (`mi_theap_refill_is_sample`), and after an allocation in `mi_malloc_generic_fallback`. A theap that does not
+// sample counts nothing, and `_mi_malloc_generic` has only a test of `sample_rate` for it.
+static void mi_theap_count_page_allocs(mi_theap_t* theap, mi_page_t* page) {
+  mi_assert_internal(page->theap == theap);
+  const size_t alloc_count = mi_page_alloc_count(page);
+  if (alloc_count==0) return;
+  if mi_unlikely(alloc_count>=0x8000) {  // if the count could overflow, update stats so the counter is reset (this counts as well)
+    _mi_page_update_stats_for(page,theap);
+    return;
+  }
+  mi_theap_adjust_sample_countdown(theap,page,alloc_count);
+  mi_page_set_last_alloc(page,alloc_count);
+}
+
+// When a theap starts to sample, what its pages handed out before is not to be counted.
+void _mi_theap_sync_sample_counts(mi_theap_t* theap) {
+  for (size_t bin = 0; bin <= MI_BIN_FULL; bin++) {
+    for (mi_page_t* page = theap->pages[bin].first; page != NULL; page = page->next) {
+      mi_page_set_last_alloc(page, mi_page_alloc_count(page));
+    }
+  }
+}
+#endif
 
 
 /* -----------------------------------------------------------
@@ -2226,6 +2246,44 @@ static mi_theap_t* mi_theap_init(mi_theap_t* theap) {
   return theap;
 }
 
+// Start or stop profiling for a theap if its profiler was started or stopped.
+void _mi_theap_update_profiling(mi_theap_t* theap) {
+  if (theap->is_detached) return;  // (meta data is not sampled, see `theap.c:_mi_theap_init`)
+  #if MI_SAMPLE
+  // we look now: a request that comes in from here on is for a next look (0: no fast path in the meantime)
+  mi_atomic_exchange_acq_rel(&theap->generic_fast_limit, (intptr_t)0);
+  #endif
+  mi_heap_t* const heap = _mi_theap_heap(theap);
+  mi_profiler_t* prof = mi_atomic_load_ptr_acquire(mi_profiler_t, &heap->profiler);
+  const bool prof_enabled = (prof!=NULL && mi_profiler_is_enabled(prof));
+  if (prof_enabled != (theap->profile_sample_rate!=0)) {
+    if (theap->sample_rate==0 && (theap->profile_sample_rate!=0 || theap->guarded_sample_rate!=0)) {
+      // not inside `_mi_malloc_generic_no_sample`, which has set the sample rate aside and puts it back: at the next
+      // generic allocation. (If every one is a sample, `mi_malloc_generic_admin` can get here inside of it every time.)
+      #if MI_SAMPLE
+      mi_atomic_store_release(&theap->generic_fast_limit, (intptr_t)(-1));
+      #endif
+      return;
+    }
+    if (prof_enabled) {
+      _mi_theap_set_profile_sample_rate(theap,mi_max(1,prof->initial_sample_rate)); // start profiling
+      // with a full period, as in `theap.c:_mi_theap_init` (with guarded sampling on, the first sample point would be a
+      // profile sample, with what was requested since the theap was made)
+      theap->profile_sample_countdown = theap->profile_sample_rate;
+      theap->sample_countdown = theap->sample_rate;
+      theap->sample_requested = 0;
+    }
+    else {
+      _mi_theap_set_profile_sample_rate(theap,0); // stop profiling
+    }
+  }
+  #if MI_SAMPLE
+  // and back to the limit, unless a new request has come in
+  intptr_t expected = 0;
+  mi_atomic_cas_strong_acq_rel(&theap->generic_fast_limit, &expected, (intptr_t)MI_GENERIC_FAST_LIMIT);
+  #endif
+}
+
 static mi_theap_t* mi_malloc_generic_admin(mi_theap_t* theap) 
 {
   theap = mi_theap_init(theap);
@@ -2233,20 +2291,12 @@ static mi_theap_t* mi_malloc_generic_admin(mi_theap_t* theap)
   mi_assert_internal(mi_theap_is_initialized(theap));
 
   // do administrative tasks every N generic mallocs
-  if mi_unlikely(theap->generic_count >= 1000) {
+  if mi_unlikely(theap->generic_count >= MI_GENERIC_FAST_LIMIT) {
     theap->generic_collect_count += theap->generic_count;
     theap->generic_count = 0;
 
     // check if the profiler is enabled
-    mi_heap_t* const heap = _mi_theap_heap(theap);
-    mi_profiler_t* prof = mi_atomic_load_ptr_relaxed(mi_profiler_t, &heap->profiler);
-    const bool prof_enabled = (prof!=NULL && mi_profiler_is_enabled(prof));
-    if (prof_enabled && theap->profile_sample_rate==0) { 
-      _mi_theap_set_profile_sample_rate(theap,mi_max(1,prof->initial_sample_rate)); // start profiling
-    }
-    else if (!prof_enabled && theap->profile_sample_rate!=0) {
-      _mi_theap_set_profile_sample_rate(theap,0); // stop profiling
-    }
+    _mi_theap_update_profiling(theap);
 
     // do a full theap collect every once in a while (10000 by default)
     const long generic_collect = mi_option_get_clamp(mi_option_generic_collect, 1, 1000000L);
@@ -2274,6 +2324,14 @@ static mi_decl_noinline void* mi_malloc_generic_fallback(mi_theap_t* theap, size
 {  
   const bool zero = ((zero_huge_alignment & MI_MALLOC_GENERIC_ZERO) != 0);
   const size_t huge_alignment = (zero_huge_alignment & ~(MI_MALLOC_GENERIC_ZERO | MI_MALLOC_GENERIC_BLOCK_START));
+
+  #if MI_SAMPLE
+  // `mi_profiler_start` asks every theap to look at its profiler at its next generic allocation (and not only when
+  // `mi_malloc_generic_admin` does, which can be many megabytes of small blocks later)
+  if mi_unlikely(mi_theap_is_initialized(theap) && (intptr_t)mi_atomic_load_relaxed(&theap->generic_fast_limit) < 0) {
+    _mi_theap_update_profiling(theap);
+  }
+  #endif
 
   // initialize if necessary
   theap = mi_malloc_generic_admin(theap);
@@ -2331,7 +2389,13 @@ static mi_decl_noinline void* mi_malloc_generic_fallback(mi_theap_t* theap, size
   if (ppage!=NULL) { *ppage = page; }
   void* const p = _mi_page_malloc_zero(theap,page,size,zero);
   mi_assert_internal(p != NULL);
+  #if MI_SAMPLE==1
+  // (also for a theap that does not sample, which counts nothing but moves `last_alloc` up: we may be in
+  //  `_mi_malloc_generic_no_sample` for the block of a sample, which `_mi_theap_malloc_sampled` has counted)
+  mi_theap_count_page_allocs(theap,page);
+  #else
   mi_page_update_sample_countdown(page);
+  #endif
   
   // move full pages to the full queue
   // this will also call _mi_page_update_stats for huge pages  
@@ -2350,6 +2414,23 @@ static mi_decl_noinline void* mi_malloc_generic_fallback(mi_theap_t* theap, size
 // very large requested alignments in which case we use a huge singleton page.
 // Note: we put `bool zero, size_t huge_alignment` into one parameter (with zero in the low bit)
 // to use 4 parameters which compiles better on msvc for the malloc fast path.
+#if MI_SAMPLE==1
+// Called by a theap that samples before it refills the free list of `page` (the first one of its size class, or NULL)
+// for an allocation of `req_size`: is that allocation to be a sample? (`mi_malloc_generic_fallback` takes it then)
+// The blocks that the fast path took from the page are counted against the sample countdown now. If that uses up the
+// countdown, the allocation in progress (of the size class of those blocks) is the sample. If we leave it to the next
+// allocation that comes through the generic path, that is one above `MI_SMALL_SIZE_MAX` (these always do) far more
+// often than a small one: with one such allocation for every 40 blocks of 64 bytes, less than 2% of the sampled
+// bytes went to the blocks of 64 bytes (`test-profile.c:test_profiler_small_attribution`).
+// (if `mi_page_queue_find_free` comes up with another page than the first, that one is counted when it is the first)
+static mi_decl_noinline bool mi_theap_refill_is_sample(mi_theap_t* theap, mi_page_t* page, size_t req_size) {
+  if (mi_theap_should_sample(theap,req_size)) return true;
+  if (page==NULL) return false;
+  mi_theap_count_page_allocs(theap,page);
+  return mi_theap_should_sample(theap,req_size);
+}
+#endif
+
 void* _mi_malloc_generic(mi_theap_t* theap, size_t size, size_t zero_huge_alignment, mi_page_t** ppage) mi_attr_noexcept
 {
   #if !MI_THEAP_INITASNULL
@@ -2358,36 +2439,32 @@ void* _mi_malloc_generic(mi_theap_t* theap, size_t size, size_t zero_huge_alignm
   // (the flags and the alignment are taken from `zero_huge_alignment` where they are used, so only that stays live)
   #define mi_generic_zero()            ((zero_huge_alignment & MI_MALLOC_GENERIC_ZERO) != 0)
   #define mi_generic_huge_alignment()  (zero_huge_alignment & ~(MI_MALLOC_GENERIC_ZERO | MI_MALLOC_GENERIC_BLOCK_START))
+  // (the limit comes from the theap so that `mi_profiler_start` can send it to `mi_malloc_generic_fallback`)
+  #if MI_SAMPLE
+  #define mi_generic_fast_limit()      ((intptr_t)mi_atomic_load_relaxed(&theap->generic_fast_limit))
+  #else
+  #define mi_generic_fast_limit()      MI_GENERIC_FAST_LIMIT
+  #endif
   mi_page_t* page = NULL;
 
   // fast path objects that fit in a small page
-  if mi_likely(mi_theap_is_initialized(theap) && ++theap->generic_count < 1000 && mi_generic_huge_alignment()==0) {
+  if mi_likely(mi_theap_is_initialized(theap) && ++theap->generic_count < mi_generic_fast_limit() && mi_generic_huge_alignment()==0) {
     const size_t req_size = size - MI_PADDING_SIZE;  // correct for padding_size in case of an overflow on `size`         
     if (req_size < MI_SMALL_MAX_OBJ_SIZE)
     { 
-      #if MI_SAMPLE
+      #if MI_SAMPLE==2
       if mi_likely(!mi_theap_should_sample(theap,req_size)) // ensure we don't need to take a sample
       #endif
       {
         mi_page_queue_t* pq = mi_page_queue(theap, size);
         mi_assert_internal(pq!=NULL && !mi_page_queue_is_huge(pq));
+        #if MI_SAMPLE==1
+        // With coarse sampling this test is all there is in the generic path for a theap that does not sample.
+        if mi_unlikely(theap->sample_rate!=0 && mi_theap_refill_is_sample(theap,pq->first,req_size)) goto fallback;
+        #endif
         page = mi_page_queue_find_free(theap,pq);
         // mi_assert_internal(mi_page_block_size(page) <= MI_SMALL_MAX_OBJ_SIZE);
         if (page!=NULL) {        
-          #if MI_SAMPLE==1
-          // The blocks that the fast path took from a page are counted against the sample countdown when its free
-          // list is refilled, which is what `mi_page_queue_find_free` just did. If that used up the countdown, the
-          // allocation in progress (of the size class of those blocks) is the sample. If we leave it to the next 
-          // allocation that comes through here, that is one above `MI_SMALL_SIZE_MAX` (these always do) far more 
-          // often than a small one: with one such allocation for every 40 blocks of 64 bytes, less than 2% of the 
-          // sampled bytes went to the blocks of 64 bytes (`test-profile.c:test_profiler_small_attribution`).
-          // (`alloc-aligned.c:mi_theap_malloc_zero_aligned_at_generic` relies on getting the start of a block: it gets
-          // NULL and goes on to its over-allocating path, where the sample is usually taken)
-          if mi_unlikely(theap->sample_rate!=0 && mi_theap_should_sample(theap,req_size)) {
-            if ((zero_huge_alignment & MI_MALLOC_GENERIC_BLOCK_START)!=0) return NULL;
-            return _mi_theap_malloc_sampled(theap,req_size,mi_generic_zero(),ppage);
-          }
-          #endif
           if (ppage!=NULL) { *ppage = page; }
           mi_assert_internal(mi_page_immediate_available(page)); // we should never recurse in _mi_page_malloc_zero
           return _mi_page_malloc_zero(theap,page,size,mi_generic_zero());
@@ -2396,15 +2473,24 @@ void* _mi_malloc_generic(mi_theap_t* theap, size_t size, size_t zero_huge_alignm
     }
   }
   // otherwise fallback
+  #if MI_SAMPLE==1
+  fallback:
+  #endif
   return mi_malloc_generic_fallback(theap,size,zero_huge_alignment,ppage);
   #undef mi_generic_zero
   #undef mi_generic_huge_alignment
+  #undef mi_generic_fast_limit
 }
 
 void* _mi_malloc_generic_no_sample(mi_theap_t* theap, size_t size, bool zero, mi_page_t** ppage) mi_attr_noexcept {
   theap = mi_theap_init(theap);
   if (theap==NULL) return NULL;
   const size_t sample_rate = theap->sample_rate;
+  if (sample_rate==0) {
+    // nothing to set aside (with `MI_SAMPLE==2` the first allocation of a thread comes here through `_mi_theap_empty`,
+    // and this call may well be where the new theap starts to sample: `_mi_theap_update_profiling`)
+    return _mi_malloc_generic(theap, size, (zero ? MI_MALLOC_GENERIC_ZERO : 0), ppage);
+  }
   const size_t sample_countdown = theap->sample_countdown;
   theap->sample_rate = 0;  // prevent a recursive call to mi_theap_malloc_sampled from _mi_malloc_generic
   theap->sample_countdown = MI_SAMPLE_COUNTDOWN_MAX;
