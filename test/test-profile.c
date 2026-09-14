@@ -15,6 +15,7 @@ terms of the MIT license. A copy of the license can be found in the file
 
 #include "mimalloc.h"
 #include "mimalloc-profile.h"
+#include "mimalloc-stats.h"
 #include "mimalloc/internal.h"
 #include "testhelper.h"
 
@@ -334,6 +335,63 @@ bool test_profiler_heap_destroy_recycled(void) {
 }
 
 
+// Sampled blocks next to guarded ones (in a build with MI_GUARDED; both kinds make `mi_free` take its path for 
+// interior pointers, and a sample is profiled or guarded, never both), with and without an alignment, leave through
+// `mi_free` on this thread, `mi_free` on another thread, a `mi_heap_realloc` that moves them, and `mi_heap_destroy`. 
+// Each sampled block is reported once, with the pointer `on_alloc` got (`on_free` asserts that).
+#define MIXED_COUNT 6000
+static void* mixed_blocks[MIXED_COUNT];
+
+static void mixed_free_on_other_thread(intptr_t tid) {
+  MI_UNUSED(tid);
+  for (int i = 1; i < MIXED_COUNT; i += 4) { mi_free(mixed_blocks[i]); mixed_blocks[i] = NULL; }
+}
+
+bool test_profiler_guarded_mixed(void) {
+  CHECK_BODY("profiler: sampled, guarded and aligned blocks through free, realloc, another thread and mi_heap_destroy") {
+    const long guarded_rate = mi_option_get(mi_option_guarded_sample_rate);
+    mi_option_set(mi_option_guarded_sample_rate, 1024);   // picked up by the theaps of the new heap and thread
+    my_profiler.threshold = 16*1024;
+    mi_heap_t* heap = mi_heap_new();
+    my_profiler.watch_heap = heap;
+    my_profiler.watch_alloc_count = 0;
+    my_profiler.watch_free_count = 0;
+    my_profiler.watch_bad_free = false;
+    const size_t sizes[5] = { 40, 700, 3000, 20000, 70000 };
+    const size_t alignments[3] = { 64, 1024, 16384 };
+    size_t guarded = 0;
+    for (int i = 0; i < MIXED_COUNT; i++) {
+      const size_t size = sizes[i % 5];
+      mixed_blocks[i] = (i % 3 == 0 ? mi_heap_malloc_aligned(heap, size, alignments[(i / 3) % 3]) : mi_heap_malloc(heap, size));
+      memset(mixed_blocks[i], 1, (size < 64 ? size : 64));
+    }
+    const uint64_t sampled = my_profiler.watch_alloc_count;
+    #if MI_GUARDED
+    mi_stats_t stats; mi_stats_init(&stats);
+    if (mi_heap_stats_get(heap, &stats)) { guarded = (size_t)stats.malloc_guarded_count.total; }
+    #endif
+    for (int i = 0; i < MIXED_COUNT; i += 4) { mi_free(mixed_blocks[i]); mixed_blocks[i] = NULL; }
+    run_os_threads(1, &mixed_free_on_other_thread);
+    for (int i = 2; i < MIXED_COUNT; i += 4) {
+      mixed_blocks[i] = mi_heap_realloc(heap, mixed_blocks[i], 2*sizes[i % 5] + 100000);   // moves: a new block (that may be sampled) and a free
+    }
+    const uint64_t freed_before = my_profiler.watch_free_count;
+    const uint64_t sampled_all = my_profiler.watch_alloc_count;
+    mi_heap_destroy(heap);   // the reallocated ones and every fourth of the first ones
+    my_profiler.watch_heap = NULL;
+    my_profiler.threshold = TEST_THRESHOLD;
+    mi_option_set(mi_option_guarded_sample_rate, guarded_rate);
+    fprintf(stderr, "  (%llu of %d sampled, %zu guarded, %llu sampled with the moved ones; %llu freed before the destroy, %llu after)\n", (unsigned long long)sampled, MIXED_COUNT, guarded, (unsigned long long)sampled_all, (unsigned long long)freed_before, (unsigned long long)my_profiler.watch_free_count);
+    #if MI_GUARDED
+    if (guarded < 100) { result = false; }
+    else
+    #endif
+    result = (sampled > 500 && freed_before > sampled/2 && freed_before < sampled_all && my_profiler.watch_free_count == sampled_all && !my_profiler.watch_bad_free);
+  }
+  return true;
+}
+
+
 // ---------------------------------------------------------------------------
 // main
 // ---------------------------------------------------------------------------
@@ -352,6 +410,7 @@ int main(void) {
   test_profiler_new_thread_no_phantom_period();
   test_profiler_heap_destroy();
   test_profiler_heap_destroy_recycled();
+  test_profiler_guarded_mixed();
 
   mi_profiler_stop(&my_profiler.profiler);
 

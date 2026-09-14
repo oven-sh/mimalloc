@@ -213,10 +213,14 @@ mi_decl_noinline mi_decl_restrict void* _mi_theap_malloc_profiled(mi_theap_t* th
 }
 
 void _mi_page_profile_on_free(mi_page_t* page, mi_block_t* block, void* p) {
+  MI_UNUSED_RELEASE(p);
   mi_assert_internal(mi_block_ptr_is_sampled(block,p));
+  uintptr_t* const pcheck = (uintptr_t*)(block + 1);
+  const uintptr_t check = mi_profile_block_check(NULL,block);
+  if mi_unlikely(check==0 || *pcheck != check) return;  // not a block that `_mi_theap_malloc_profiled` set up
   // The free list only overwrites the tag. Clear the check word too, or the block could come back as a regular 
   // block that starts with the value of the tag and still has the check behind it (see `_mi_page_profile_free_all`).
-  *((uintptr_t*)(block + 1)) = 0;
+  *pcheck = 0;
 
   // get the heap and profiler
   mi_heap_t* const heap = mi_page_heap(page);
@@ -224,9 +228,12 @@ void _mi_page_profile_on_free(mi_page_t* page, mi_block_t* block, void* p) {
   mi_profiler_t* prof = mi_heap_profiler(heap);
   if (prof==NULL || !mi_profiler_is_enabled(prof) || prof->on_free==NULL) return;
   
-  // call the on_free callback
+  // Call the on_free callback with the pointer that `on_alloc` got. `p` is another one if the block was allocated 
+  // with an alignment: `alloc-aligned.c` aligns inside the block that `_mi_theap_malloc_profiled` returned.
   mi_profiler_sample_data_t* const sample_data = (mi_profiler_sample_data_t*)((uint8_t*)block + MI_PROFILE_SAMPLE_DATA_OFFSET);
-  (*prof->on_free)(prof, sample_data, p, heap);
+  void* const sampled_p = (uint8_t*)block + mi_profile_user_offset(sample_data->user_data_size);
+  mi_assert_internal((uint8_t*)p >= (uint8_t*)sampled_p);
+  (*prof->on_free)(prof, sample_data, sampled_p, heap);
 }
 
 // `mi_heap_destroy` frees the pages of a heap without a `mi_free` of each block: 
