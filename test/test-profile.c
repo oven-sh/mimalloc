@@ -458,6 +458,46 @@ bool test_profiler_aligned(void) {
 }
 
 
+// `mi_profiler_stop` and `mi_profiler_start` on one thread while another one is being sampled.
+static _Atomic(size_t) toggle_done;
+static _Atomic(size_t) toggle_samples;
+static size_t mi_cdecl toggle_on_alloc(mi_profiler_t* profiler, mi_profiler_sample_data_t* data, void* ptr, size_t requested_size, size_t threshold, uint64_t bytes_since_last_sample, const mi_heap_t* heap) {
+  MI_UNUSED(profiler); MI_UNUSED(data); MI_UNUSED(ptr); MI_UNUSED(requested_size); MI_UNUSED(threshold); MI_UNUSED(bytes_since_last_sample); MI_UNUSED(heap);
+  mi_atomic_increment_relaxed(&toggle_samples);
+  return 1024;
+}
+static mi_profiler_t toggle_profiler = { NULL, 0, 1024, &toggle_on_alloc, NULL, NULL };
+
+static void toggle_thread(intptr_t tid) {
+  if (tid == 0) {
+    for (int i = 0; i < 300000; i++) { mi_free(mi_malloc(2048)); }   // each one is above the rate: a sample when the profiler runs
+    mi_atomic_store_release(&toggle_done, (size_t)1);
+  }
+  else {
+    while (mi_atomic_load_acquire(&toggle_done) == 0) {
+      mi_profiler_stop(&toggle_profiler);
+      mi_profiler_start(&toggle_profiler);
+    }
+  }
+}
+
+bool test_profiler_stop_while_sampling(void) {
+  CHECK_BODY("profiler: stop and start while another thread is sampled") {
+    mi_profiler_stop(&my_profiler.profiler);
+    mi_profile(NULL);
+    mi_profile(&toggle_profiler);
+    mi_profiler_start(&toggle_profiler);
+    run_os_threads(2, &toggle_thread);
+    mi_profiler_stop(&toggle_profiler);
+    mi_profile(NULL);
+    mi_profile(&my_profiler.profiler);
+    mi_profiler_start(&my_profiler.profiler);
+    result = (mi_atomic_load_relaxed(&toggle_samples) > 0);   // (an assertion failed in a debug build)
+  }
+  return true;
+}
+
+
 // The same for a sample that comes due when the theap picks up the profiler inside the allocation (a theap that was
 // there before the profiler started does so once in a while in the generic path, which sets the countdown to at most
 // the rate): with a request above the rate that is a sample straight away, also with fine-grained sampling.
@@ -591,6 +631,7 @@ int main(void) {
   test_profiler_heap_destroy_recycled();
   test_profiler_guarded_mixed();
   test_profiler_aligned();
+  test_profiler_stop_while_sampling();
   test_profiler_aligned_late_start();
   test_profiler_start_with_running_threads();
 

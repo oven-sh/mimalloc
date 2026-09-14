@@ -72,7 +72,7 @@ mi_decl_export bool mi_profile(mi_profiler_t* profiler);
 // called from a `mi_subproc_visit_heaps` visitor, from an `on_free` callback, or from a signal handler.
 mi_decl_export bool mi_profiler_start(mi_profiler_t* profiler);
 
-// end sampling
+// end sampling (a thread that is taking a sample right now may still call `on_alloc` after this returns)
 mi_decl_export bool mi_profiler_stop(mi_profiler_t* profiler);
 
 #ifdef __cplusplus
