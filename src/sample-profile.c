@@ -170,7 +170,8 @@ mi_decl_noinline mi_decl_restrict void* _mi_theap_malloc_profiled(mi_theap_t* th
     _mi_theap_update_profiling(theap);
     return _mi_malloc_generic_no_sample(theap,size,zero,ppage);
   }
-  mi_assert_internal(prof!=NULL && prof->on_alloc!=NULL && mi_profiler_is_enabled(prof));
+  // (`mi_profiler_stop` on another thread may have come in since: this sample still goes to the profiler)
+  mi_assert_internal(prof->on_alloc!=NULL);
   
   void* p = NULL;
   size_t new_sample_rate = 0;
