@@ -2706,6 +2706,8 @@ static int mi_arena_try_purge(mi_arena_t* arena, mi_msecs_t now, bool force)
 // purge forward to `now` and wake the scavenger, which does the madvise off-thread. Arena
 // slices sit in no page and are owned by no thread, so this is the scavenger's job; only the
 // theap collect and the hole sweep have to run on the owner.
+static void mi_subproc_schedule_purge(mi_subproc_t* subproc, mi_msecs_t expire);
+
 void _mi_arenas_purge_now(mi_subproc_t* subproc) {
   if (subproc == NULL) return;
   const long delay = mi_arena_purge_delay();
@@ -2716,14 +2718,16 @@ void _mi_arenas_purge_now(mi_subproc_t* subproc) {
   for (size_t i = 0; i < max_arena; i++) {
     mi_arena_t* const arena = mi_arena_from_index(subproc, i);
     if (arena == NULL) continue;
-    const mi_msecs_t expire = mi_atomic_loadi64_relaxed(&arena->purge_expire);
+    mi_msecs_t expire = mi_atomic_loadi64_relaxed(&arena->purge_expire);
     if (expire == 0) continue;                 // nothing queued for this arena
     any_scheduled = true;
-    if (expire > now) { mi_atomic_storei64_release(&arena->purge_expire, now); }
+    // CAS, not a store: a pass that went into the arena since has reset the expire, and that reset stands
+    if (expire > now) { mi_atomic_casi64_strong_acq_rel(&arena->purge_expire, &expire, now); }
   }
   if (!any_scheduled) return;
-  const mi_msecs_t sexpire = mi_atomic_loadi64_relaxed(&subproc->purge_expire);
-  if (sexpire == 0 || sexpire > now) { mi_atomic_storei64_release(&subproc->purge_expire, now); }
+  // through the CAS loop that the passes use, and not a load and a store: a pass resets `purge_expire` first thing, and a
+  // value that was read before that reset says nothing about what the pass leaves behind
+  mi_subproc_schedule_purge(subproc, now);
   if (_mi_scavenger_is_running()) {
     _mi_scavenger_wake(subproc);
   }

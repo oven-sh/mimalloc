@@ -20,6 +20,9 @@ terms of the MIT license. A copy of the license can be found in the file
 // 2. A fork in the middle of a pass. The child has no thread that ends the pass, so an arena that the pass had yet
 //    to come to stays armed there with the expire of the subprocess reset. An arena of its own is freed into a
 //    little later than the main one, so that the pass over the main one finds it not yet due.
+// 3. A free into an arena that the pass has left already. With more than one arena, a pass that reads the expire of
+//    each arena as it leaves it and installs the earliest one at its end misses that free: the arena is armed after it
+//    was read. Both arenas get a batch, and one more block goes into the main arena while the pass is in the other one.
 //
 // Counters, not RSS: they read the same on every platform and in every build.
 
@@ -44,7 +47,13 @@ static void check(const char* name, bool ok) {
 #define MAX_FIRST   (32)
 #define MAX_SECOND  (8)
 #define BLOCK_SIZE  ((size_t)8 * 1024 * 1024)
+#if defined(MI_TSAN) || defined(MI_TEST_LIGHT)
+#define ROUNDS      (2)     // a sanitizer run is slow, and each test has a time limit there
+#define LIGHT       (1)
+#else
 #define ROUNDS      (3)
+#define LIGHT       (0)
+#endif
 #define BOUND_SECS  (10)    // a pass comes `purge_delay` (100ms) after a free
 
 // the counters of the subprocess itself: read without a lock, and without touching our theap
@@ -150,6 +159,59 @@ static void test_fork_in_pass(int first_count) {
 }
 #endif
 
+static void test_free_into_visited_arena(int count) {
+  // an arena of our own (a pass comes to it after the main one), and a heap that allocates in it only
+  mi_arena_id_t arena_id;
+  // Four times the size of what goes in: a block this large starts on a boundary in the arena (each one takes 32 MiB of it
+  // on a 32-bit target, and three share 32 MiB on a 64-bit one). What does not fit ends the part, it does not fail it.
+  if (mi_reserve_os_memory_ex((size_t)4 * (size_t)(count + 1) * BLOCK_SIZE, false /* commit */, false /* allow large */, true /* exclusive */, &arena_id) != 0) {
+    fprintf(stderr, "test-purge-behind-pass: no two arena test (could not reserve an arena)\n");
+    return;
+  }
+  mi_heap_t* const heap = mi_heap_new_in_arena(arena_id);
+  static void* ours[MAX_FIRST];
+  static void* mains[MAX_FIRST];
+  int ours_count = 0;
+  while (heap != NULL && ours_count < count && (ours[ours_count] = mi_heap_malloc(heap, BLOCK_SIZE)) != NULL) {
+    memset(ours[ours_count], 1, BLOCK_SIZE);
+    ours_count++;
+  }
+  if (ours_count < count) {
+    fprintf(stderr, "test-purge-behind-pass: no two arena test (%d of %d blocks fit in the arena)\n", ours_count, count);
+    for (int i = 0; i < ours_count; i++) { mi_free(ours[i]); }
+    if (heap != NULL) { mi_heap_delete(heap); }
+    return;
+  }
+  void* const late = mi_malloc(BLOCK_SIZE);
+  if (late == NULL || !alloc_blocks(mains, count)) {
+    check("out of memory", false);
+    return;
+  }
+  memset(late, 1, BLOCK_SIZE);
+  const size_t total = (size_t)(2 * count + 1) * BLOCK_SIZE;
+
+  size_t purged0, passes0;
+  counters(&purged0, &passes0);
+  for (int i = 0; i < count; i++) { mi_free(mains[i]); }   // the main arena is armed first, so it is due no later than ours
+  for (int i = 0; i < count; i++) { mi_free(ours[i]); }
+
+  // wait for the scavenger to go into the second of the two; only spin, a park or a collect would purge as well
+  size_t purged1, passes1;
+  time_t deadline = time(NULL) + BOUND_SECS;
+  do { counters(&purged1, &passes1); } while (passes1 - passes0 < 2 && time(NULL) < deadline);
+  check("two arenas: the scavenger goes into both", passes1 - passes0 >= 2);
+
+  mi_free(late);   // into the main arena: the pass has reset its expire and has read it again when it left
+
+  deadline = time(NULL) + BOUND_SECS;
+  do { counters(&purged1, &passes1); } while (purged1 - purged0 < total && time(NULL) < deadline);
+  char name[160];
+  snprintf(name, sizeof(name), "two arenas: a free into the arena that the pass has left is purged as well (%zu of %zu MiB)",
+           (purged1 - purged0) / (1024 * 1024), total / (1024 * 1024));
+  check(name, purged1 - purged0 >= total);
+  mi_heap_delete(heap);
+}
+
 int main(void) {
   if (!mi_option_is_enabled(mi_option_scavenger) || mi_option_get(mi_option_purge_delay) <= 0) {
     fprintf(stderr, "test-purge-behind-pass: skipped (no scavenger, or no purge delay)\n");
@@ -168,5 +230,6 @@ int main(void) {
   const int second_count = (sizeof(void*) >= 8 ? MAX_SECOND : MAX_SECOND / 4);
   test_free_behind_pass(first_count, second_count);
   test_fork_in_pass(first_count);
+  if (failures == 0) { test_free_into_visited_arena(first_count / (LIGHT ? 4 : 2)); }
   return failures;
 }
