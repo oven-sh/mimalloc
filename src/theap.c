@@ -551,6 +551,10 @@ void _mi_theap_init(mi_theap_t* theap, mi_heap_t* heap, mi_tld_t* tld)
     _mi_random_split(&head_random, &theap->random); // &theap->random is used as nonce so it is ok if threads capture the same head->random
   }
   // theap->cookie = _mi_theap_random_next(theap) | 1;
+  #if MI_SAMPLE
+  mi_atomic_store_relaxed(&theap->generic_fast_limit, (intptr_t)MI_GENERIC_FAST_LIMIT);
+  theap->sample_countdown = MI_SAMPLE_COUNTDOWN_MAX;   // (`_mi_theap_empty` has -1, for which `mi_theap_should_sample` holds)
+  #endif
   _mi_theap_guarded_init(theap); // needs theap->random
   #if MI_PROFILE
   // A profiler that is running samples this theap from its first allocation on, and not only after
@@ -582,6 +586,16 @@ void _mi_theap_init(mi_theap_t* theap, mi_heap_t* heap, mi_tld_t* tld)
     if (head!=NULL) { head->hprev = theap; }
     heap->theaps = theap;
   }
+  #if MI_PROFILE && MI_SAMPLE
+  // `mi_profiler_start` leaves a request to look at the profiler with the theaps on that list: if it ran between
+  // our look above and here, it has missed this one.
+  if (!theap->is_detached && theap->profile_sample_rate==0) {
+    mi_profiler_t* const prof = mi_atomic_load_ptr_acquire(mi_profiler_t,&heap->profiler);
+    if (prof!=NULL && mi_profiler_is_enabled(prof)) {
+      mi_atomic_store_release(&theap->generic_fast_limit, (intptr_t)(-1));
+    }
+  }
+  #endif
 }
 
 mi_theap_t* _mi_theap_alloc(mi_heap_t* heap, mi_tld_t* tld) {

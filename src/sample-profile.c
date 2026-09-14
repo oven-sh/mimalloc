@@ -19,9 +19,19 @@ size_t _mi_theap_update_sample_rate(mi_theap_t* theap) {
   if (theap->sample_rate == 0 || (theap->guarded_sample_rate!=0 && theap->sample_rate > theap->guarded_sample_rate)) {
     theap->sample_rate = theap->guarded_sample_rate;
   }
-  if (theap->sample_countdown > theap->sample_rate) {
+  if (theap->sample_rate == 0) {
+    // (not 0: `mi_theap_should_sample` would hold until the generic path gets to `mi_malloc_generic_fallback`, and
+    //  `alloc-aligned.c` would over-allocate until then)
+    theap->sample_countdown = MI_SAMPLE_COUNTDOWN_MAX;
+  }
+  else if (theap->sample_countdown > theap->sample_rate) {
     theap->sample_countdown = theap->sample_rate;  // todo: adjust difference?
   }
+  #if MI_SAMPLE==1
+  if (old_sample_rate==0 && theap->sample_rate!=0) {
+    _mi_theap_sync_sample_counts(theap);  // a theap that does not sample does not count what its pages hand out
+  }
+  #endif
   return old_sample_rate;
 }
 
@@ -154,7 +164,12 @@ mi_decl_noinline mi_decl_restrict void* _mi_theap_malloc_profiled(mi_theap_t* th
   const size_t req_size = size - MI_PADDING_SIZE;
   mi_assert_internal(req_size<=requested_since_last_sample);
   mi_profiler_t* const prof = mi_theap_get_enabled_profiler(theap);
-  if (prof == NULL) { return _mi_malloc_generic_no_sample(theap,size,zero,ppage); }
+  if (prof == NULL) {
+    // the profiler was stopped: no need to wait for `mi_malloc_generic_admin` to see that (when every allocation is a
+    // sample, all other generic allocations are inside `_mi_malloc_generic_no_sample`, where it does not look)
+    _mi_theap_update_profiling(theap);
+    return _mi_malloc_generic_no_sample(theap,size,zero,ppage);
+  }
   mi_assert_internal(prof!=NULL && prof->on_alloc!=NULL && mi_profiler_is_enabled(prof));
   
   void* p = NULL;
@@ -311,10 +326,33 @@ mi_decl_export bool mi_profile( mi_profiler_t* profiler) {
   return mi_subproc_profile(mi_subproc_main(),profiler);
 }
 
+// Ask the theaps of the heaps of a sub-process that have this profiler to look at it at their next generic
+// allocation: without this they only do so every `MI_GENERIC_FAST_LIMIT` generic allocations, which is many
+// megabytes of small blocks. (The theaps belong to other threads: we only leave the request.)
+static void mi_profiler_request_look(mi_subproc_t* subproc, mi_profiler_t* profiler) {
+  #if MI_SAMPLE
+  mi_lock(&subproc->heaps_lock) {
+    for (mi_heap_t* heap = subproc->heaps; heap!=NULL; heap = heap->next) {
+      if (mi_heap_profiler(heap)!=profiler) continue;
+      mi_lock(&heap->theaps_lock) {
+        for (mi_theap_t* theap = heap->theaps; theap!=NULL; theap = theap->hnext) {
+          if (theap->is_detached) continue;  // (meta data is not sampled)
+          mi_atomic_store_release(&theap->generic_fast_limit, (intptr_t)(-1));
+        }
+      }
+    }
+  }
+  #else
+  MI_UNUSED(subproc); MI_UNUSED(profiler);
+  #endif
+}
+
 bool mi_profiler_start(mi_profiler_t* profiler ) {
   if (profiler==NULL) return false;
   const bool was_running = mi_profiler_set_enabled(profiler,true);  
   if (was_running) return true;
+  mi_profiler_request_look(_mi_subproc(),profiler);
+  if (_mi_subproc() != _mi_subproc_main()) { mi_profiler_request_look(_mi_subproc_main(),profiler); }
   // for the main heap, if this is the profiler, start the theap more aggressively
   // otherwise it will be picked up when theaps take the slow generic malloc path.
   mi_heap_t* heap = mi_heap_main();

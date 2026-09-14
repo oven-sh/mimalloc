@@ -195,7 +195,7 @@ mi_subproc_id_t mi_subproc_new(void) {
   theap_meta->allow_page_abandon = false;
   theap_meta->page_full_retain = 2;
   theap_meta->sample_rate = 0;        // no sampling for meta data
-  theap_meta->sample_countdown = 0;
+  theap_meta->sample_countdown = MI_SAMPLE_COUNTDOWN_MAX;  // (not 0: `mi_theap_should_sample` would hold)
   subproc->theap_meta = theap_meta;
 
   return _mi_subproc_to_id(subproc);

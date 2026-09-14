@@ -495,6 +495,82 @@ bool test_profiler_aligned_late_start(void) {
 }
 
 
+// A profiler that is started while threads are allocating: `mi_profiler_start` asks their theaps to look at the
+// profiler at their next generic allocation. Every thread gets its first sample after about one period of what it
+// requests from then on: not many megabytes later (when its theap looks by itself), and not at once for what its
+// pages handed out before (a theap that does not sample does not count that).
+#define LATE_THREADS  4
+#define LATE_RATE     (256*1024)
+static _Atomic(size_t) late_warm;                  // threads that are done with their allocations before the start
+static _Atomic(size_t) late_started;
+static _Atomic(size_t) late_first[LATE_THREADS];   // what a thread requested after the start, up to its first sample
+static mi_decl_thread size_t   late_requested;
+static mi_decl_thread intptr_t late_tid = -1;
+
+static size_t mi_cdecl late_on_alloc(mi_profiler_t* profiler, mi_profiler_sample_data_t* data, void* ptr, size_t requested_size, size_t threshold, uint64_t bytes_since_last_sample, const mi_heap_t* heap) {
+  MI_UNUSED(profiler); MI_UNUSED(data); MI_UNUSED(ptr); MI_UNUSED(threshold); MI_UNUSED(bytes_since_last_sample); MI_UNUSED(heap);
+  if (late_tid >= 0 && mi_atomic_load_relaxed(&late_first[late_tid]) == 0) {
+    mi_atomic_store_release(&late_first[late_tid], late_requested + requested_size);
+  }
+  return LATE_RATE;
+}
+
+static mi_profiler_t late_profiler = { NULL, 0, LATE_RATE, &late_on_alloc, NULL, NULL };
+
+static size_t late_step(void** slots, uint64_t* r) {   // free a slot that is in use, or fill it; returns the size it allocated
+  *r ^= *r << 13; *r ^= *r >> 7; *r ^= *r << 17;
+  const size_t slot = (size_t)(*r >> 32) % 256;
+  if (slots[slot] != NULL) { mi_free(slots[slot]); slots[slot] = NULL; return 0; }
+  const size_t size = 16 + (size_t)(*r % 1024);
+  slots[slot] = mi_malloc(size);
+  return size;
+}
+
+static void late_thread(intptr_t tid) {
+  if (tid == LATE_THREADS) {
+    // the one that starts the profiler, once the others have allocated for a while
+    while (mi_atomic_load_acquire(&late_warm) < LATE_THREADS) { mi_atomic_pause(); }
+    mi_profiler_start(&late_profiler);
+    mi_atomic_store_release(&late_started, (size_t)1);
+    return;
+  }
+  void* slots[256];
+  memset(slots, 0, sizeof(slots));
+  uint64_t r = 0x9E3779B97F4A7C15ull + (uint64_t)tid;
+  for (size_t allocs = 0; allocs < 250000; ) { if (late_step(slots,&r) != 0) { allocs++; } }
+  mi_atomic_increment_acq_rel(&late_warm);
+  while (mi_atomic_load_acquire(&late_started) == 0) { mi_atomic_pause(); }
+  late_tid = tid;
+  late_requested = 0;
+  while (mi_atomic_load_relaxed(&late_first[tid]) == 0 && late_requested < 16*LATE_RATE) {
+    late_requested += late_step(slots,&r);
+  }
+  late_tid = -1;
+  for (size_t i = 0; i < 256; i++) { mi_free(slots[i]); }
+}
+
+bool test_profiler_start_with_running_threads(void) {
+  CHECK_BODY("profiler: threads that are allocating when the profiler starts are sampled from then on") {
+    mi_profiler_stop(&my_profiler.profiler);
+    mi_profile(NULL);
+    mi_profile(&late_profiler);
+    run_os_threads(LATE_THREADS + 1, &late_thread);
+    mi_profiler_stop(&late_profiler);
+    mi_profile(NULL);
+    mi_profile(&my_profiler.profiler);
+    result = true;
+    fprintf(stderr, "  (first sample after");
+    for (size_t i = 0; i < LATE_THREADS; i++) {
+      const size_t first = mi_atomic_load_acquire(&late_first[i]);
+      fprintf(stderr, " %zu", first);
+      result = result && (first >= LATE_RATE/2 && first <= 2*LATE_RATE);
+    }
+    fprintf(stderr, " bytes, at a rate of %d)\n", LATE_RATE);
+  }
+  return true;
+}
+
+
 // ---------------------------------------------------------------------------
 // main
 // ---------------------------------------------------------------------------
@@ -516,6 +592,7 @@ int main(void) {
   test_profiler_guarded_mixed();
   test_profiler_aligned();
   test_profiler_aligned_late_start();
+  test_profiler_start_with_running_threads();
 
   mi_profiler_stop(&my_profiler.profiler);
 
