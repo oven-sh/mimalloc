@@ -491,13 +491,7 @@ static bool test_large_pages(void) {
   for (size_t i = 1; i < LARGE_N; i += 2) { mi_free(ptrs[i]); ptrs[i] = NULL; }
 
   before = hole_stats();
-  {
-    // (the free blocks of a large page stay for `purge_holes_min_interval` after the last allocation from it)
-    const long interval = mi_option_get(mi_option_purge_holes_min_interval);
-    mi_option_set(mi_option_purge_holes_min_interval, 0);
-    mi_on_thread_idle();
-    mi_option_set(mi_option_purge_holes_min_interval, interval);
-  }
+  mi_on_thread_idle();   // (`main` has set `purge_holes_min_interval` to 0: nothing waits for the last allocation to be long enough ago)
   after = hole_stats();
   npurged = purged_blocks(ptrs, LARGE_N);
 
@@ -1715,6 +1709,9 @@ int main(void) {
   // VACUOUS in a release build on macOS: MADV_FREE_REUSABLE is lazy, so a discard that
   // wrongly covers a live block leaves its data intact until the kernel reclaims the page.
   mi_option_set(mi_option_purge_holes_eager_zero, 1);
+  // No waiting here for the free blocks of a large page, which stay for `purge_holes_min_interval` after the last allocation
+  // from it (`test-purge-holes-large.c` is about that): on a 32-bit target the 64 KiB blocks below are in one.
+  mi_option_set(mi_option_purge_holes_min_interval, 0);
   fprintf(stderr, "purge_holes is %s, os page size is %zu\n",
           (purging_enabled ? "ON" : "OFF"), (size_t)_mi_os_page_size());
 
