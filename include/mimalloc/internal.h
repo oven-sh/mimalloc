@@ -302,6 +302,8 @@ void          _mi_page_map_unsafe_destroy(void);
 
 // "page.c"
 void*         _mi_malloc_generic(mi_theap_t* theap, size_t size, size_t zero_huge_alignment, mi_page_t** ppage)  mi_attr_noexcept mi_attr_malloc;
+#define MI_MALLOC_GENERIC_ZERO        ((size_t)1)   // bits in `zero_huge_alignment` below the huge alignment (a multiple of MI_SLICE_SIZE)
+#define MI_MALLOC_GENERIC_BLOCK_START ((size_t)2)   // the caller needs the start of a block: if this allocation is to be a sample, allocate nothing and return NULL (`mi_theap_should_sample` is true then)
 void*         _mi_malloc_generic_no_sample(mi_theap_t* theap, size_t size, bool zero, mi_page_t** ppage)  mi_attr_noexcept mi_attr_malloc;
 
 void          _mi_page_retire(mi_page_t* page) mi_attr_noexcept;       // free the page if there are no other pages with many free blocks

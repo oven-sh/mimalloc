@@ -66,6 +66,21 @@ static void* mi_theap_malloc_zero_no_guarded(mi_theap_t* theap, size_t size, boo
 }
 #endif
 
+// A plain allocation for the naturally aligned path below. It has checked that no sample is due and relies on getting
+// the start of a block; a sample can still come due inside the allocation (a page refill with coarse sampling, a
+// collection, a theap that picks up a profiler just then), and `page.c:_mi_malloc_generic` would make this allocation
+// the sample (at an offset in a larger block). It returns NULL then, with nothing allocated and
+// `mi_theap_should_sample` true.
+static void* mi_theap_malloc_zero_block_start(mi_theap_t* theap, size_t size, bool zero, mi_page_t** ppage) {
+  #if MI_SAMPLE
+  void* const p = _mi_malloc_generic(theap, size + MI_PADDING_SIZE, (zero ? MI_MALLOC_GENERIC_ZERO : 0) | MI_MALLOC_GENERIC_BLOCK_START, ppage);
+  mi_track_malloc(p, size, zero);
+  return p;
+  #else
+  return mi_theap_malloc_zero_no_guarded(theap, size, zero, ppage);
+  #endif
+}
+
 // Fallback aligned allocation that over-allocates -- split out for better codegen
 static mi_decl_noinline void* mi_theap_malloc_zero_aligned_at_overalloc(mi_theap_t* const theap, const size_t size, const size_t alignment, const size_t offset, const bool zero, mi_page_t** ppage) mi_attr_noexcept
 {
@@ -171,15 +186,23 @@ static mi_decl_noinline void* mi_theap_malloc_zero_aligned_at_generic(mi_theap_t
       if (offset == 0 && mi_malloc_is_naturally_aligned(size,alignment))    
       {
         mi_page_t* page = NULL;
-        void* p = mi_theap_malloc_zero_no_guarded(theap, size, zero, &page);
+        void* p = mi_theap_malloc_zero_block_start(theap, size, zero, &page);
         if (ppage!=NULL) { *ppage = page; }    
         const bool is_aligned_or_null = (((uintptr_t)p) & (alignment-1))==0;
         if mi_likely(is_aligned_or_null) {
-          return p;
+          #if MI_SAMPLE
+          // else a sample is due: go on to the over-allocating path, which copes with an offset pointer (it usually
+          // takes the sample for this allocation; a small one can still come from a page's free list with coarse
+          // sampling, and then the next allocation through the generic path is the sample)
+          if mi_likely(p!=NULL || !mi_theap_should_sample(theap,size))
+          #endif
+          {
+            return p;
+          }
         }
         else {
           // this should never happen if the `mi_malloc_is_naturally_aligned` check is correct..
-          // (but it can happen if this allocation just so happens to be sampled but we checked for that)
+          // (a sampled allocation is not returned here: `mi_theap_malloc_zero_block_start`)
           mi_assert_internal(false); // p==NULL || mi_block_ptr_is_profiled_or_guarded(_mi_page_ptr_unalign(page,p),p));
           mi_free(p);
         }
