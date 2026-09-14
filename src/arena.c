@@ -3060,6 +3060,9 @@ static bool mi_heap_delete_page(const mi_heap_t* heap, const mi_heap_area_t* are
     #if MI_GUARDED
     _mi_page_unguard_all(page);          // remove potential interior guard pages 
     #endif
+    #if MI_PROFILE
+    _mi_page_profile_free_all(area,page); // the sampled blocks that are still in use get their `on_free`
+    #endif
     // destroy the page
     // Drop what is (still) on the thread-free list first: `_mi_arenas_page_free` collects it, and with the used
     // count reset that reads as a corrupted list (more blocks freed than were in use).
