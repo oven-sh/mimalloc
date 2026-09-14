@@ -221,8 +221,8 @@ typedef struct mi_purge_holes_stats_s {
   size_t discard_calls;       // discard syscalls (madvise/MEM_RESET)
   size_t reuse_calls;         // reuse syscalls made when handing a hole back
   size_t pages_freed;         // pages the sweep found completely free and gave back to the arena
-  // What hole punching cannot reach: the pages the sweep found ineligible (a huge page, a
-  // large page whose OS pages do not fit the bitmap, pinned memory, a custom-commit arena).
+  // What hole punching cannot reach: the pages the sweep found ineligible (a huge page,
+  // pinned memory, a custom-commit arena).
   // Gauges over the last idle sweep (`mi_on_thread_idle`), which resets them.
   size_t ineligible_pages;
   size_t ineligible_bytes;      // total size of those pages

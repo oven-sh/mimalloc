@@ -916,7 +916,7 @@ if(MI_USE_CXX)
   set_source_files_properties(${mi_sources} PROPERTIES LANGUAGE CXX )
   set_source_files_properties(src/static.c test/test-api.c test/test-api-fill.c test/test-stress.c test/test-stress-heaps.c  test/test-stress-subprocs.c test/test-profile.c PROPERTIES LANGUAGE CXX )
   # the white-box tests call internal functions, whose names are mangled now; the heap tests use C11 atomics, which MSVC lacks in C mode
-  set_source_files_properties(test/test-theap-sentinel.c test/test-purge-holes.c test/test-commit-fail.c
+  set_source_files_properties(test/test-theap-sentinel.c test/test-purge-holes.c test/test-purge-holes-large.c test/test-commit-fail.c
                               test/test-heap-aba.c test/test-heap-delete-race.c test/test-heap-teardown.c
                               test/test-abandoned-lazy.c PROPERTIES LANGUAGE CXX )
 endif()
@@ -1153,7 +1153,7 @@ if (MI_BUILD_TESTS)
   endif()
   if(MI_BUILD_STATIC AND NOT MI_DEBUG_TSAN)
     # these reach into internals that the shared library (which the TSAN build links the tests against) does not export
-    list(APPEND mi_static_tests theap-sentinel purge-holes)
+    list(APPEND mi_static_tests theap-sentinel purge-holes purge-holes-large)
   endif()
   if (MI_DEBUG)
     list(APPEND mi_static_tests commit-fail)  # uses mi_debug_fail_os_commit_after (MI_DEBUG>0 only)
@@ -1171,7 +1171,7 @@ if (MI_BUILD_TESTS)
       message(STATUS "cannot build TSAN tests without MI_BUILD_SHARED being enabled")
     endif()
     set(mi_test_env "")
-    if(MI_GUARDED AND TEST_NAME STREQUAL "purge-holes")
+    if(MI_GUARDED AND (TEST_NAME STREQUAL "purge-holes" OR TEST_NAME STREQUAL "purge-holes-large"))
       list(APPEND mi_test_env MIMALLOC_GUARDED_SAMPLE_RATE=0)     # it knows the page layout, which guard pages change (set explicitly: the CI sets a rate for the whole job)
     elseif(MI_GUARDED AND TEST_NAME STREQUAL "profile")
       list(APPEND mi_test_env MIMALLOC_GUARDED_SAMPLE_RATE=0)     # it checks what the samples add up to, which guarded samples in between change (set explicitly: the CI sets a rate for the whole job); the case with guarded blocks sets its own rate
@@ -1179,6 +1179,9 @@ if (MI_BUILD_TESTS)
       list(APPEND mi_test_env MIMALLOC_GUARDED_SAMPLE_RATE=1024)
     elseif(TEST_NAME STREQUAL "stress-heaps")
       list(APPEND mi_test_env MIMALLOC_ARENA_EAGER_COMMIT=0 MIMALLOC_PAGE_COMMIT_ON_DEMAND=0)
+    endif()
+    if(TEST_NAME STREQUAL "purge-holes-large")
+      list(APPEND mi_test_env MIMALLOC_ALLOW_THP=0)  # it checks with mincore that what was discarded is gone, which a huge page that is put together again would undo
     endif()
     if(TEST_NAME STREQUAL "thp-optout")
       list(APPEND mi_test_env MIMALLOC_ALLOW_THP=0)  # off from the start: covers the mappings made during initialization too
@@ -1197,6 +1200,9 @@ if (MI_BUILD_TESTS)
   # the same hole-purging tests with the feature turned off: it must be a no-op
   if(TARGET mimalloc-test-purge-holes)
     add_test(NAME test-purge-holes-off COMMAND ${CMAKE_COMMAND} -E env MIMALLOC_PURGE_HOLES=0 MIMALLOC_GUARDED_SAMPLE_RATE=0 $<TARGET_FILE:mimalloc-test-purge-holes>)
+  endif()
+  if(TARGET mimalloc-test-purge-holes-large)
+    add_test(NAME test-purge-holes-large-off COMMAND ${CMAKE_COMMAND} -E env MIMALLOC_PURGE_HOLES=0 MIMALLOC_GUARDED_SAMPLE_RATE=0 $<TARGET_FILE:mimalloc-test-purge-holes-large>)
   endif()
 
   # with no scavenger to hand off to, `mi_on_thread_idle_start` must do the work inline instead

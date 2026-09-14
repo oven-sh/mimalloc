@@ -462,11 +462,11 @@ static bool test_abandoned(void) {
 }
 
 // ---------------------------------------------------------------------------
-// 6. large pages (4MB, for blocks over ~84KB). Whether they fit the OS-page bitmap depends
-//    on the OS page size: 4MB/4KB = 1024 bits does not fit, 4MB/16KB = 256 bits does. So we
-//    assert what the page itself reports: either it is eligible and its holes are discarded,
-//    or it is ineligible and the sweep counts it (and discards nothing). Either way its data
-//    must survive.
+// 6. large pages (4MB, for blocks over ~84KB). They fit the bitmap with a unit of 16KB where the
+//    OS page is smaller than that (4MB/4KB = 1024 OS pages would not fit; see `mi_page_purge_unit`
+//    and `test-purge-holes-large.c`). We assert what the page itself reports: it is eligible and
+//    its holes are discarded (the other branch is for a page that cannot be purged at all, which
+//    a large page of many blocks no longer is). Either way its data must survive.
 // ---------------------------------------------------------------------------
 
 #define LARGE_N   (32)

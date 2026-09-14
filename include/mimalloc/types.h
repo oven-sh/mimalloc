@@ -246,13 +246,14 @@ terms of the MIT license. A copy of the license can be found in the file
 #error maximum object size may be too small to hold local thread data
 #endif
 
-// Hole purging: a bitmap of the OS pages inside a mimalloc page whose memory has been
-// discarded. It is indexed by OS page (not by block), so its size does not depend on the
-// size class: a page needs `page_size/os_page_size` bits (plus one for the partial OS page
-// that holds the page header). 256 bits covers every small (64 KiB) and medium (512 KiB)
-// page on every OS page size, and a large (4 MiB) page when the OS page is 16 KiB. A large
-// page on a 4 KiB OS page needs 1025 bits and stays ineligible -- the capacity check is at
-// runtime (see `mi_page_can_purge_holes` and the "Page hole purging" section in page.c).
+// Hole purging: a bitmap of the purge units inside a mimalloc page whose memory has been
+// discarded. It is indexed by unit (not by block), so its size does not depend on the size
+// class. The unit is the OS page wherever the block area of the page then fits the bitmap:
+// every small (64 KiB) and medium (512 KiB) page on every OS page size, and a large (4 MiB)
+// page when the OS page is 16 KiB or more. A page that needs more bits than that (a large page
+// on a 4 KiB OS page would need 1024) uses the smallest power-of-two multiple of the OS page
+// that fits: 16 KiB for that page (see `mi_page_purge_unit` and the "Page hole purging"
+// section in page.c).
 #define MI_PAGE_PURGE_BITS                (256)
 #define MI_PAGE_PURGE_WORDS               (MI_PAGE_PURGE_BITS / 64)
 
