@@ -420,6 +420,7 @@ void _mi_process_fork_child(void) {
   _mi_process_is_forked_child = true;
   _mi_scavenger_forked_child();   // the scavenger thread did not survive the fork; clear the state that says it did
   _mi_arenas_purge_guard_release();   // taken by the prepare handler: no purge pass was in progress, so each `purge_expire` is as a finished pass left it
+  _mi_page_purge_holes_forked_child();
   mi_lock_init(&mi_subprocs_lock);
   for (mi_subproc_t* sp = mi_subprocs; sp != NULL; sp = sp->next) {
     mi_lock_init(&sp->arena_reserve_lock);

@@ -70,20 +70,84 @@ static inline uint64_t mi_page_sweep_state(const mi_page_t* page) {
   return (((uint64_t)page->capacity) << 32) | (uint64_t)mi_page_used(page);
 }
 
-// An allocation from a large page puts the time into `swept_state` instead (`mi_malloc_generic_fallback`), under a bit that
-// no `(capacity,used)` has and with the top bit clear, which `MI_PAGE_SWEPT_NONE` has set: the sweep leaves the free blocks
-// of a large page that was allocated from a moment ago (see `_mi_page_purge_holes`).
+// The hole sweep's epoch: a counter that only a sweep moves (`_mi_page_purge_holes_epoch_advance`), and at most once in
+// `purge_holes_min_interval`. It is the only notion of time that the allocating side has for the rule that the free
+// blocks of a large page stay while the page is in use (`_mi_page_purge_holes`): an allocation from a large page leaves
+// the epoch it sees in `swept_state` (`mi_malloc_generic_fallback`), under a bit that no `(capacity,used)` has and with the
+// top bit clear, which `MI_PAGE_SWEPT_NONE` has set. No clock is read there.
+// Process-wide, as the clock and the option are (a page of any subprocess can be compared with it).
+// (a cache line of their own: both are written once per epoch, and the counters of the sweep further down on every discard)
+typedef struct mi_holes_time_s {
+  _Atomic(int64_t)   start;   // `_mi_clock_now()` when the current epoch began; `MI_HOLES_EPOCH_MOVING` while a sweep moves it
+  _Atomic(uintptr_t) epoch;   // read (relaxed) by every allocation from a large page
+  uint8_t            padding[64 - sizeof(uintptr_t) - sizeof(int64_t)];
+} mi_holes_time_t;
+static mi_decl_cache_align mi_holes_time_t mi_holes_time;
+#define mi_holes_epoch            (mi_holes_time.epoch)
+#define mi_holes_epoch_start      (mi_holes_time.start)
+#define MI_HOLES_EPOCH_MOVING     (INT64_MIN)
+
 #define MI_PAGE_SWEPT_ALLOC       (((uint64_t)1) << 62)
 #define MI_PAGE_SWEPT_ALLOC_MASK  (((uint64_t)3) << 62)
 static inline void mi_page_sweep_state_set_alloc(mi_page_t* page) {
-  // (the coarse clock: a few nanoseconds. It never runs ahead of `_mi_clock_now`, which the sweep compares it with, and
-  //  can be a tick of the OS behind it, so the blocks may go up to 10 ms before the interval is over)
-  page->swept_state = (MI_PAGE_SWEPT_ALLOC | (((uint64_t)_mi_clock_now_coarse()) & ~MI_PAGE_SWEPT_ALLOC_MASK));
+  // The low 32 bits of the epoch. Written only when it differs: a page that is allocated from all the time is written
+  // to once per epoch, and not at all when nothing sweeps (the epoch stands still then).
+  const uint64_t stamp = (MI_PAGE_SWEPT_ALLOC | (uint64_t)((uint32_t)mi_atomic_load_relaxed(&mi_holes_epoch)));
+  if (page->swept_state != stamp) { page->swept_state = stamp; }
 }
-static inline bool mi_page_sweep_state_is_alloc(const mi_page_t* page, mi_msecs_t* when) {
+static inline bool mi_page_sweep_state_is_alloc(const mi_page_t* page, uint32_t* epoch) {
   if ((page->swept_state & MI_PAGE_SWEPT_ALLOC_MASK) != MI_PAGE_SWEPT_ALLOC) return false;
-  *when = (mi_msecs_t)(page->swept_state & ~MI_PAGE_SWEPT_ALLOC_MASK);
+  *epoch = (uint32_t)page->swept_state;
   return true;
+}
+
+// How many epochs ago was the page allocated from, for a page that `mi_page_sweep_state_is_alloc`? In 32 bits: a page
+// that was left for a multiple of 2^32 epochs (13 years of sweeping with the default interval) reads as young once
+// more, and is taken two epochs later.
+// The epoch is read now and not once per sweep: whoever hands us a page (a thread that parks, one that abandons it)
+// does so with a release that we acquired, so what we read here is not older than what is in the page. (If it were,
+// the page would read as very old and its blocks would go now, which is what happened to every page before this rule.)
+static inline uint32_t mi_page_sweep_state_alloc_age(uint32_t epoch) {
+  return (_mi_page_purge_holes_epoch() - epoch);
+}
+
+// Move the epoch on if the current one has lasted for `purge_holes_min_interval`. Called by every idle sweep as the first
+// thing it does (`_mi_thread_idle_work`: a caller that sweeps every interval by its own clock is to find the epoch that its
+// last call began as old as that); the clock is read here and nowhere on the allocating side.
+// What the sweep relies on is that the epoch after the one of an allocation lasted for the whole interval by the time
+// a third one is there to be seen (`_mi_page_purge_holes`): an epoch begins for everybody else at the increment below,
+// so the time it began is a reading of the clock from AFTER that, and until that time is known nobody else moves it
+// (a sweeper that is preempted in between delays the next epoch; it can never shorten this one). Any number of threads
+// sweep at the same time (the scavenger for the parked ones, and each thread that calls `mi_on_thread_idle` itself).
+void _mi_page_purge_holes_epoch_advance(void) {
+  if (!mi_option_is_enabled(mi_option_purge_holes)) return;
+  const mi_msecs_t interval = (mi_msecs_t)mi_option_get_clamp(mi_option_purge_holes_min_interval, 0, 3600000);
+  if (interval <= 0) return;   // nothing is held then
+  int64_t start = mi_atomic_loadi64_acquire(&mi_holes_epoch_start);
+  if (start != MI_HOLES_EPOCH_MOVING) {
+    const mi_msecs_t now = _mi_clock_now();
+    if (now >= start && (now - start) < interval) return;   // to the millisecond, as the clock is. (A clock that went back: move it, the new start heals that.)
+    if (mi_atomic_casi64_strong_acq_rel(&mi_holes_epoch_start, &start, MI_HOLES_EPOCH_MOVING)) {
+      mi_atomic_add_acq_rel(&mi_holes_epoch, (uintptr_t)1);
+      mi_atomic_storei64_release(&mi_holes_epoch_start, (int64_t)_mi_clock_now());
+      return;
+    }
+  }
+  // Another sweep is moving it right now, which is an increment and a reading of the clock: let it, so that this sweep
+  // sees the new epoch (bounded: if that thread is not running we go on with the old one, which only keeps pages longer).
+  for (int i = 0; i < 1000 && mi_atomic_loadi64_acquire(&mi_holes_epoch_start) == MI_HOLES_EPOCH_MOVING; i++) { mi_atomic_pause(); }
+}
+
+// (for `test-purge-holes-large.c`)
+uint32_t _mi_page_purge_holes_epoch(void) {
+  return (uint32_t)mi_atomic_load_acquire(&mi_holes_epoch);
+}
+
+// A `fork` can land between the two stores above, in a thread that is not there in the child.
+void _mi_page_purge_holes_forked_child(void) {
+  if (mi_atomic_loadi64_relaxed(&mi_holes_epoch_start) == MI_HOLES_EPOCH_MOVING) {
+    mi_atomic_storei64_release(&mi_holes_epoch_start, (int64_t)_mi_clock_now());
+  }
 }
 
 // Anything that changes which blocks are free *without* changing `(capacity,used)` must say so,
@@ -747,12 +811,13 @@ void _mi_page_purge_holes_end(mi_tld_t* tld) {
 }
 
 // Called once per idle sweep of `tld`'s heaps, before its passes (`mi_purge_holes_of`): decides
-// whether this sweep ignores `page->swept_state` (see `_mi_page_purge_holes`).
+// whether this sweep ignores `page->swept_state` (see `_mi_page_purge_holes`), and notes its epoch.
 void _mi_page_purge_holes_sweep_begin(mi_tld_t* tld) {
   const long every = mi_option_get(mi_option_purge_holes_full_every);
   const size_t seq = ++tld->holes_sweep_seq;
   tld->holes_sweep_full = (every > 0 && (seq % (size_t)every) == 0);
   if (tld->holes_sweep_full) { mi_atomic_addi64_relaxed(&mi_holes_full_sweeps, 1); }
+  tld->holes_sweep_epoch = _mi_page_purge_holes_epoch();   // the sweep owns the time that large pages are held by (see `_mi_page_purge_holes`): no page of this sweep is compared with an older epoch than this
 }
 
 static inline bool mi_page_bits_at(const uint64_t* bits, size_t k) {
@@ -1056,20 +1121,25 @@ void _mi_page_purge_holes(mi_page_t* page, mi_tld_t* tld) {
   // The free blocks of a large page are whole buffers (96 KiB and up). A thread parks, and is swept, far more often than
   // it is idle, and a busy one takes those buffers again at once: giving them back in between costs it a discard and a
   // page fault for every OS page of every buffer (a server with 256 KiB request bodies lost a tenth of its throughput
-  // that way). So they stay while the last allocation from the page is less than `purge_holes_min_interval` ago: the
-  // allocation left the time in `swept_state` (`used` does not tell, it is the same at every park of a busy server).
-  // The same for the blocks of such a page that are not formed yet: it is about to form them. Whoever sweeps a thread
-  // that stays parked comes back for them (`_mi_theap_sweep_parked`); `mi_on_thread_idle_pending` tells its caller.
+  // that way). So they stay while the page is in use (`used` does not tell, it is the same at every park of a busy
+  // server): an allocation from the page leaves the sweep's epoch in `swept_state`, and the blocks stay while that is
+  // the current epoch or the one before. An epoch lasts for `purge_holes_min_interval` at least and only a sweep ends
+  // it (`_mi_page_purge_holes_epoch_advance`), so with the third epoch there to be seen, the whole of the second one lies between
+  // the allocation and now: the blocks of a page that is two epochs old were left alone for the interval at least. A
+  // busy thread puts the new epoch in its pages within the interval and keeps them for good; after the last allocation
+  // the blocks go one to two intervals later if something sweeps that often. A sweep ends one epoch at the most, so
+  // where one thread sweeps, the first sweep after an allocation finds the page young whenever it comes, and it takes
+  // a second or a third one, an interval apart each, to take the blocks. The same for the blocks of such a page that
+  // are not formed yet: it is about to form them. Whoever sweeps a thread that stays parked comes back for them (`_mi_theap_sweep_parked`);
+  // `mi_on_thread_idle_pending` tells its caller.
   // (Not for memory that cannot be given back at all, which is counted below as it always was.)
-  mi_msecs_t allocated_at;
-  if (mi_page_holes_madvisable(page) && mi_page_sweep_state_is_alloc(page, &allocated_at)) {
-    const mi_msecs_t interval = (mi_msecs_t)mi_option_get_clamp(mi_option_purge_holes_min_interval, 0, 3600000);
-    const mi_msecs_t age = _mi_clock_now() - allocated_at;
-    if (age >= 0 && age < interval) {
+  uint32_t allocated_in;
+  if (mi_page_holes_madvisable(page) && mi_page_sweep_state_is_alloc(page, &allocated_in)) {
+    if (mi_page_sweep_state_alloc_age(allocated_in) < 2 && mi_option_get(mi_option_purge_holes_min_interval) > 0) {
       // Say that something was left. Also for an abandoned page that this sweep passes: a large page is abandoned when it
-      // is full, so that is where most of a thread's own buffers are (and those of others; hence "one more sweep", not
-      // "until nothing is left", in `_mi_theap_sweep_parked`). With nothing to take now, the time stays for what is freed
-      // until the next sweep.
+      // is full, so that is where most of a thread's own buffers are (and those of others; hence a fixed number of
+      // sweeps, not "until nothing is left", in `_mi_theap_sweep_parked`). With nothing to take now, the epoch stays for
+      // what is freed until the next sweep.
       if (page->free != NULL || mi_page_unformed_tail_pending(page)) { tld->holes_sweep_deferred = true; }
       return;
     }
@@ -2469,7 +2539,7 @@ static mi_decl_noinline void* mi_malloc_generic_fallback(mi_theap_t* theap, size
   // this will also call _mi_page_update_stats for huge pages  
   if (mi_page_block_size(page) > MI_SMALL_MAX_OBJ_SIZE) {
     if (mi_page_block_size(page) > MI_MEDIUM_MAX_OBJ_SIZE && page->reserved > 1) {   // (not a huge page, which is one block: the sweep never looks at it)
-      mi_page_sweep_state_set_alloc(page);   // a large page is in use: the idle sweep leaves its free blocks for now (see `_mi_page_purge_holes`)
+      mi_page_sweep_state_set_alloc(page);   // a large page is in use: the idle sweep leaves its free blocks for now (see `_mi_page_purge_holes`). A load, and a store once per epoch.
     }
     if (mi_page_is_full(page)) {
       mi_page_to_full(page, mi_page_queue_of(page));

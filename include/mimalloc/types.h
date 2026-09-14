@@ -538,8 +538,8 @@ typedef struct mi_page_s {
   // A sweep that finds it unchanged skips the page without walking its free list at all: nothing
   // was allocated or freed in it since, so the sweep has nothing new to discard (see
   // `_mi_page_purge_holes`). `MI_PAGE_SWEPT_NONE` means "unknown". In a large page an allocation
-  // puts the time here instead (bit 62 set, bit 63 clear; `mi_page_sweep_state_set_alloc` in
-  // page.c). Cold, like `purged` above.
+  // puts the epoch of the sweep here instead (bit 62 set, bit 63 clear; `mi_page_sweep_state_set_alloc`
+  // in page.c). Cold, like `purged` above.
   uint64_t                  swept_state;
 } mi_page_t;
 
@@ -810,11 +810,13 @@ typedef int64_t  mi_msecs_t;
 #define MI_PARK_SWEEPING  (2)
 
 // How far the sweep of the current park is (`tld->park_swept`). A sweep leaves the free blocks of a large page that was
-// allocated from less than `purge_holes_min_interval` ago (`_mi_page_purge_holes`); a park where that happened is swept
-// once more, that long after its first sweep.
+// allocated from in the current epoch of the sweep or the one before (`_mi_page_purge_holes`); a park where that happened
+// is swept again `purge_holes_min_interval` later, which is when the epoch moves on, until the epoch is two on from the
+// first sweep of the park (`_mi_theap_sweep_parked`): `MI_PARK_SWEPT_SMALL + k` after sweep `k+1`, which is not the last.
 #define MI_PARK_SWEPT_NONE   (0)
 #define MI_PARK_SWEPT_DONE   (1)
 #define MI_PARK_SWEPT_SMALL  (2)   // but for large pages that were in use a moment ago: come back for those if the thread stays parked
+#define MI_PARK_SWEEPS_MAX   (6)   // sweeps of one park at the most (two or three unless a sweeper that moves the epoch is held up)
 
 struct mi_tld_s {
   mi_threadid_t         thread_id;            // thread id of this thread
@@ -848,6 +850,8 @@ struct mi_tld_s {
   size_t                holes_sweep_skipped;  // per-sweep counters, folded into the process-wide ones in `_mi_page_purge_holes_end`
   size_t                holes_sweep_visited;
   bool                  holes_sweep_deferred; // this sweep left the free blocks of a large page that was just in use (see `_mi_page_purge_holes`)
+  uint32_t              holes_sweep_epoch;    // the epoch of the sweep (`page.c`) when the current sweep began: its pages were compared with that one or a later one
+  uint32_t              holes_park_epoch;     // ..and that of the first sweep of the current park: what the thread left when it parked is from that epoch or an earlier one
 };
 
 

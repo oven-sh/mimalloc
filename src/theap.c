@@ -274,6 +274,7 @@ void _mi_thread_idle_work(mi_tld_t* tld, mi_theap_t* theap0) mi_attr_noexcept {
   if (tld == NULL) return;
   // each phase is a full walk: an owner waiting in `_mi_park_leave` cannot allocate until we stop
   if (mi_atomic_load_relaxed(&tld->park_reclaim) != 0) return;
+  _mi_page_purge_holes_epoch_advance();   // first of all: see there
   if (theap0 != NULL && mi_theap_is_initialized(theap0)) {
     mi_theap_collect(theap0, false /* not forced */);
   }
@@ -320,7 +321,7 @@ void mi_on_thread_idle(void) mi_attr_noexcept {
 }
 
 // Did the last sweep of this thread's heaps (by `mi_on_thread_idle`, or by the scavenger while the thread was parked)
-// leave the free blocks of a large page that was allocated from less than `purge_holes_min_interval` ago
+// leave the free blocks of a large page that was allocated from in the current epoch of the sweep or the one before
 // (`_mi_page_purge_holes`; one of this thread, or an abandoned one of its heaps)? After `mi_on_thread_idle` nothing
 // comes back for those by itself. Owner only, and not while it is parked (the scavenger writes the flag then).
 bool mi_on_thread_idle_pending(void) mi_attr_noexcept {
@@ -379,7 +380,7 @@ void mi_on_thread_idle_end(void) mi_attr_noexcept {
 // clear before freeing anything. So the lock covers the walk, not the work.
 //
 // Returns in how many msecs a park that was passed over for `purge_holes_min_interval`, or one that is to be
-// swept once more for its large pages, becomes due (0: none), so the scavenger can wake for it instead of
+// swept again for its large pages, becomes due (0: none), so the scavenger can wake for it instead of
 // leaving it to its safety timeout.
 mi_msecs_t _mi_theap_sweep_parked(mi_subproc_t* subproc) {
   if (subproc == NULL) return 0;
@@ -407,20 +408,37 @@ mi_msecs_t _mi_theap_sweep_parked(mi_subproc_t* subproc) {
       }
     }
     if (claimed == NULL) return due_in;   // nothing parked (any more) that is due yet
-    claimed->holes_sweep_last = _mi_clock_now();
-    // A sweep leaves the free blocks of a large page that was allocated from a moment ago (`_mi_page_purge_holes`): a
-    // thread parks far more often than it is idle. If this thread stays parked nothing sweeps it again, so such a park
-    // is not marked as done: `holes_sweep_last` makes it due again in `purge_holes_min_interval`, and if the thread is
-    // still in the same park then, that sweep finds the allocation long enough ago and takes them.
-    const bool first = (mi_atomic_load_relaxed(&claimed->park_swept) == MI_PARK_SWEPT_NONE);
+    // A sweep leaves the free blocks of a large page that was allocated from in the current epoch of the sweep or the one
+    // before (`_mi_page_purge_holes`): a thread parks far more often than it is idle. If this thread stays parked nothing
+    // sweeps it again, so such a park is not marked as done: `holes_sweep_last` makes it due again in
+    // `purge_holes_min_interval`, and if the thread is still in the same park then, that sweep moves the epoch on (it is
+    // that long since this one did, or found it moved a moment before), and so does the one after it.
+    // When is that over? What the thread left when it parked is from the epoch of the first sweep of the park at the
+    // latest (`holes_park_epoch`), and a page is taken when it is two epochs old. So a sweep that began two epochs on
+    // from the first has seen all of that as old: what it still left was allocated from since, by other threads (the
+    // abandoned pages, which this sweep passes as well), and is for whoever sweeps after that. That is the second or the
+    // third sweep of the park; more only where a sweeper was held up while it moved the epoch, and
+    // `MI_PARK_SWEEPS_MAX` whatever happens. Each is `purge_holes_min_interval` after the END of the one before, by
+    // the same `holes_sweep_last` that spaces the sweeps of a thread that parks all the time, and the scavenger sleeps
+    // until then (the return value). So nothing spins, the work for a park is bounded, and a thread that was just swept
+    // is not due, so the next one in the list is claimed.
+    const uint32_t swept = mi_atomic_load_relaxed(&claimed->park_swept);
     claimed->holes_sweep_deferred = false;
     _mi_thread_idle_work(claimed, theap0);
+    // After the work: the sweep that comes back is to find the epoch that this one began (if it did) as old as the interval.
+    claimed->holes_sweep_last = _mi_clock_now();
     // Mark BEFORE releasing: a `park_swept` set after the store could land on the thread's *next*
     // park and silently skip that sweep. Cleared by `mi_on_thread_idle_start`. If we bailed out
     // early on `park_reclaim`, the owner is leaving the park anyway, so the rest is its next park's.
-    // (one more sweep at the most: the second one can only leave pages that other threads have been using since, the
-    //  abandoned ones that it passes as well, and those are for whoever sweeps after that)
-    mi_atomic_store_release(&claimed->park_swept, (uint32_t)(first && claimed->holes_sweep_deferred ? MI_PARK_SWEPT_SMALL : MI_PARK_SWEPT_DONE));
+    uint32_t next = MI_PARK_SWEPT_DONE;
+    if (swept == MI_PARK_SWEPT_NONE) { claimed->holes_park_epoch = claimed->holes_sweep_epoch; }
+    if (claimed->holes_sweep_deferred) {
+      const uint32_t sweeps = (swept == MI_PARK_SWEPT_NONE ? 1 : (swept - MI_PARK_SWEPT_SMALL) + 2);   // this one included
+      if ((uint32_t)(claimed->holes_sweep_epoch - claimed->holes_park_epoch) < 2 && sweeps < MI_PARK_SWEEPS_MAX) {
+        next = MI_PARK_SWEPT_SMALL + (sweeps - 1);
+      }
+    }
+    mi_atomic_store_release(&claimed->park_swept, next);
     // Back to PARKED, not RUNNING: the owner is still blocked and still owns the transition out.
     mi_atomic_store_release(&claimed->park_state, MI_PARK_PARKED);
   }
