@@ -314,7 +314,20 @@ void mi_on_thread_idle(void) mi_attr_noexcept {
   mi_theap_t* const theap0 = _mi_theap_default();
   if (theap0 == NULL || !mi_theap_is_initialized(theap0) || theap0->tld == NULL) return;
   if (theap0->tld->thread_id != _mi_thread_id()) return;
-  _mi_thread_idle_work(theap0->tld, theap0);
+  mi_tld_t* const tld = theap0->tld;
+  tld->holes_sweep_deferred = false;
+  _mi_thread_idle_work(tld, theap0);
+}
+
+// Did the last sweep of this thread's heaps (by `mi_on_thread_idle`, or by the scavenger while the thread was parked)
+// leave the free blocks of a large page that was allocated from less than `purge_holes_min_interval` ago
+// (`_mi_page_purge_holes`; one of this thread, or an abandoned one of its heaps)? After `mi_on_thread_idle` nothing
+// comes back for those by itself. Owner only, and not while it is parked (the scavenger writes the flag then).
+bool mi_on_thread_idle_pending(void) mi_attr_noexcept {
+  mi_theap_t* const theap0 = _mi_theap_default();
+  if (theap0 == NULL || !mi_theap_is_initialized(theap0) || theap0->tld == NULL) return false;
+  if (theap0->tld->thread_id != _mi_thread_id()) return false;
+  return theap0->tld->holes_sweep_deferred;
 }
 
 // Declare that this thread will not allocate or free until `mi_on_thread_idle_end` -- the sweep's
@@ -340,7 +353,7 @@ bool mi_on_thread_idle_start(void) mi_attr_noexcept {
   // The scavenger has no TLS of ours to find the default theap with, so leave it here.
   tld->park_theap0 = theap0;
   mi_atomic_store_release(&tld->park_reclaim, 0);
-  mi_atomic_store_release(&tld->park_swept, 0);
+  mi_atomic_store_release(&tld->park_swept, (uint32_t)MI_PARK_SWEPT_NONE);
   uint32_t expected = MI_PARK_RUNNING;
   if (!mi_atomic_cas_strong_acq_rel(&tld->park_state, &expected, MI_PARK_PARKED)) return false;
   mi_atomic_increment_relaxed(&tld->subproc->parked_count);
@@ -365,8 +378,9 @@ void mi_on_thread_idle_end(void) mi_attr_noexcept {
 // path out of a park (`mi_on_thread_idle_end`, and teardown via `_mi_park_leave`) waits for it to
 // clear before freeing anything. So the lock covers the walk, not the work.
 //
-// Returns in how many msecs a park that was passed over for `purge_holes_min_interval` becomes
-// due (0: none was), so the scavenger can wake for it instead of leaving it to its safety timeout.
+// Returns in how many msecs a park that was passed over for `purge_holes_min_interval`, or one that is to be
+// swept once more for its large pages, becomes due (0: none), so the scavenger can wake for it instead of
+// leaving it to its safety timeout.
 mi_msecs_t _mi_theap_sweep_parked(mi_subproc_t* subproc) {
   if (subproc == NULL) return 0;
   if (mi_atomic_load_relaxed(&subproc->parked_count) == 0) return 0;
@@ -378,7 +392,7 @@ mi_msecs_t _mi_theap_sweep_parked(mi_subproc_t* subproc) {
       const mi_msecs_t now = _mi_clock_now();
       const mi_msecs_t interval = (mi_msecs_t)mi_option_get_clamp(mi_option_purge_holes_min_interval, 0, 3600000);
       for (mi_tld_t* tld = subproc->tlds; tld != NULL; tld = tld->subproc_next) {
-        if (mi_atomic_load_acquire(&tld->park_swept) != 0) continue;   // already done for this park
+        if (mi_atomic_load_acquire(&tld->park_swept) == MI_PARK_SWEPT_DONE) continue;   // already done for this park
         if (interval > 0 && tld->holes_sweep_last != 0 && now - tld->holes_sweep_last < interval) {
           if (mi_atomic_load_relaxed(&tld->park_state) == MI_PARK_PARKED) {
             const mi_msecs_t due = interval - (now - tld->holes_sweep_last);
@@ -394,11 +408,19 @@ mi_msecs_t _mi_theap_sweep_parked(mi_subproc_t* subproc) {
     }
     if (claimed == NULL) return due_in;   // nothing parked (any more) that is due yet
     claimed->holes_sweep_last = _mi_clock_now();
+    // A sweep leaves the free blocks of a large page that was allocated from a moment ago (`_mi_page_purge_holes`): a
+    // thread parks far more often than it is idle. If this thread stays parked nothing sweeps it again, so such a park
+    // is not marked as done: `holes_sweep_last` makes it due again in `purge_holes_min_interval`, and if the thread is
+    // still in the same park then, that sweep finds the allocation long enough ago and takes them.
+    const bool first = (mi_atomic_load_relaxed(&claimed->park_swept) == MI_PARK_SWEPT_NONE);
+    claimed->holes_sweep_deferred = false;
     _mi_thread_idle_work(claimed, theap0);
     // Mark BEFORE releasing: a `park_swept` set after the store could land on the thread's *next*
     // park and silently skip that sweep. Cleared by `mi_on_thread_idle_start`. If we bailed out
     // early on `park_reclaim`, the owner is leaving the park anyway, so the rest is its next park's.
-    mi_atomic_store_release(&claimed->park_swept, 1);
+    // (one more sweep at the most: the second one can only leave pages that other threads have been using since, the
+    //  abandoned ones that it passes as well, and those are for whoever sweeps after that)
+    mi_atomic_store_release(&claimed->park_swept, (uint32_t)(first && claimed->holes_sweep_deferred ? MI_PARK_SWEPT_SMALL : MI_PARK_SWEPT_DONE));
     // Back to PARKED, not RUNNING: the owner is still blocked and still owns the transition out.
     mi_atomic_store_release(&claimed->park_state, MI_PARK_PARKED);
   }

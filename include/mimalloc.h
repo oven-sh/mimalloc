@@ -205,7 +205,16 @@ mi_decl_export void mi_collect(bool force)      mi_attr_noexcept;
 // Owner-thread rules make each thread's own idle point the ONLY safe place to sweep
 // its heaps -- no other thread can do it for us. Safe on any thread; on a thread that
 // never allocated it is a no-op. purge_delay still applies to the arena drain.
+// The free blocks of a large page (blocks of 96 KiB and up) stay while the last allocation
+// from that page is less than `purge_holes_min_interval` ago: a thread parks more often
+// than it is idle, and a busy one takes those buffers again at once. That holds for this
+// call as well (it is made from loops that are busy, too), and nothing comes back for what
+// it leaves: `mi_on_thread_idle_pending` is true then, and a caller that is about to block
+// for good calls this once more, `purge_holes_min_interval` later (once: what is left after
+// that are pages that other threads are using). The `_start`/`_end` pair below does that by
+// itself.
 mi_decl_export void mi_on_thread_idle(void)     mi_attr_noexcept;
+mi_decl_export bool mi_on_thread_idle_pending(void) mi_attr_noexcept;  // did the last sweep of this thread's heaps (its `mi_on_thread_idle`, or the scavenger's during a park) leave free blocks of a large page that was just in use? Not to be called between `_start` and `_end`.
 mi_decl_export bool mi_on_thread_idle_start(void) mi_attr_noexcept;  // about to block: hand the theaps to the scavenger. false = nothing handed off, no _end needed
 mi_decl_export void mi_on_thread_idle_end(void)   mi_attr_noexcept;  // awake again: take them back (pairs with a true from _start)
 mi_decl_export void mi_scavenger_stop(void)      mi_attr_noexcept;  // stop and join the background scavenger thread; a no-op if it is not running
@@ -599,7 +608,7 @@ typedef enum mi_option_e {
   mi_option_scavenger,                  // run a background scavenger thread that purges freed arena memory when due (=1)
   mi_option_purge_holes,                // discard the memory of free blocks inside a still-used page (=1)
   mi_option_purge_holes_eager_zero,     // zero a hole before discarding it, so that an over-discard destroys data even on an OS that reclaims lazily (=0; for testing -- always on when MI_DEBUG>1)
-  mi_option_purge_holes_min_interval,  // min milliseconds between idle sweeps of one thread's heaps (=100, 0=every park). See `_mi_theap_sweep_parked`.
+  mi_option_purge_holes_min_interval,  // min milliseconds between idle sweeps of one thread's heaps (=100, 0=every park). Also how long the free blocks of a large page stay after the last allocation from that page (whoever sweeps, and however often). See `_mi_theap_sweep_parked`, `_mi_page_purge_holes`.
   mi_option_purge_holes_full_every,     // every N'th idle sweep walks every page instead of skipping the unchanged ones (=64, 0=never). See `_mi_page_purge_holes`.
   _mi_option_last,
   // legacy option names

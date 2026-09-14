@@ -12,6 +12,9 @@ terms of the MIT license. A copy of the license can be found in the file
 #include "mimalloc/prim-tls.h"
 
 #include <string.h> // memset
+#if defined(__linux__)
+#include <time.h>   // clock_gettime (`_mi_clock_now_coarse`)
+#endif
 
 #if defined(_MSC_VER) && (_MSC_VER < 1920)
 #pragma warning(disable:4204)  // non-constant aggregate initializer
@@ -570,6 +573,18 @@ static mi_msecs_t mi_clock_diff;
 
 mi_msecs_t _mi_clock_now(void) {
   return _mi_prim_clock_now();
+}
+
+// The time of `_mi_clock_now` where an approximation will do (how long ago a large page was allocated from, `page.c`). On
+// Linux the coarse variant of the clock that `_mi_prim_clock_now` reads costs a fifth of it; it is the time of the last tick.
+mi_msecs_t _mi_clock_now_coarse(void) {
+  #if defined(__linux__) && defined(CLOCK_MONOTONIC_COARSE)
+  struct timespec t;
+  if (clock_gettime(CLOCK_MONOTONIC_COARSE, &t) == 0) {
+    return ((mi_msecs_t)t.tv_sec * 1000) + ((mi_msecs_t)t.tv_nsec / 1000000L);
+  }
+  #endif
+  return _mi_clock_now();
 }
 
 mi_msecs_t _mi_clock_start(void) {

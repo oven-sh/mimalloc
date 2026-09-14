@@ -491,7 +491,13 @@ static bool test_large_pages(void) {
   for (size_t i = 1; i < LARGE_N; i += 2) { mi_free(ptrs[i]); ptrs[i] = NULL; }
 
   before = hole_stats();
-  mi_on_thread_idle();
+  {
+    // (the free blocks of a large page stay for `purge_holes_min_interval` after the last allocation from it)
+    const long interval = mi_option_get(mi_option_purge_holes_min_interval);
+    mi_option_set(mi_option_purge_holes_min_interval, 0);
+    mi_on_thread_idle();
+    mi_option_set(mi_option_purge_holes_min_interval, interval);
+  }
   after = hole_stats();
   npurged = purged_blocks(ptrs, LARGE_N);
 

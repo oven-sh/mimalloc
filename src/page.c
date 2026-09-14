@@ -70,6 +70,22 @@ static inline uint64_t mi_page_sweep_state(const mi_page_t* page) {
   return (((uint64_t)page->capacity) << 32) | (uint64_t)mi_page_used(page);
 }
 
+// An allocation from a large page puts the time into `swept_state` instead (`mi_malloc_generic_fallback`), under a bit that
+// no `(capacity,used)` has and with the top bit clear, which `MI_PAGE_SWEPT_NONE` has set: the sweep leaves the free blocks
+// of a large page that was allocated from a moment ago (see `_mi_page_purge_holes`).
+#define MI_PAGE_SWEPT_ALLOC       (((uint64_t)1) << 62)
+#define MI_PAGE_SWEPT_ALLOC_MASK  (((uint64_t)3) << 62)
+static inline void mi_page_sweep_state_set_alloc(mi_page_t* page) {
+  // (the coarse clock: a few nanoseconds. It never runs ahead of `_mi_clock_now`, which the sweep compares it with, and
+  //  can be a tick of the OS behind it, so the blocks may go up to 10 ms before the interval is over)
+  page->swept_state = (MI_PAGE_SWEPT_ALLOC | (((uint64_t)_mi_clock_now_coarse()) & ~MI_PAGE_SWEPT_ALLOC_MASK));
+}
+static inline bool mi_page_sweep_state_is_alloc(const mi_page_t* page, mi_msecs_t* when) {
+  if ((page->swept_state & MI_PAGE_SWEPT_ALLOC_MASK) != MI_PAGE_SWEPT_ALLOC) return false;
+  *when = (mi_msecs_t)(page->swept_state & ~MI_PAGE_SWEPT_ALLOC_MASK);
+  return true;
+}
+
 // Anything that changes which blocks are free *without* changing `(capacity,used)` must say so,
 // or the next sweep would wrongly skip the page. That is exactly `mi_page_unpurge_range`: it puts
 // discarded blocks back on the free list, and a purged block was already free.
@@ -849,26 +865,34 @@ size_t _mi_page_unformed_purged_bytes(const mi_page_t* page) {
 }
 
 // Discard the OS pages of the unformed tail that are not discarded already.
-static void mi_page_purge_unformed_tail(mi_page_t* page) {
-  if (!mi_page_holes_madvisable(page)) return;
-  uintptr_t lo, hi;
-  mi_page_unformed_tail_range(page, &lo, &hi);
-  if (lo >= hi) return;
+// The part of the unformed tail that is not discarded yet, `[*dlo,*hi)`, and where the discarded part starts once that is
+// discarded too (`*lo`). Returns false if there is none.
+static bool mi_page_unformed_tail_todo(const mi_page_t* page, uintptr_t* lo, uintptr_t* dlo, uintptr_t* hi) {
+  *lo = 0; *dlo = 0; *hi = 0;
+  if (!mi_page_holes_madvisable(page)) return false;
+  mi_page_unformed_tail_range(page, lo, hi);
+  if (*lo >= *hi) return false;
   const uintptr_t pstart = (uintptr_t)mi_page_start(page);
-  mi_assert_internal(hi - pstart <= UINT32_MAX);   // only a huge page can be that big, and it has no tail
-  if (hi - pstart > UINT32_MAX) return;
+  mi_assert_internal(*hi - pstart <= UINT32_MAX);   // only a huge page can be that big, and it has no tail
+  if (*hi - pstart > UINT32_MAX) return false;
 
   // the part of the tail that is not discarded yet (the tail can only grow to the right,
   // when `mi_page_extend_free` commits more of the page)
-  uintptr_t dlo = lo;
+  *dlo = *lo;
   const size_t already = _mi_page_unformed_purged_bytes(page);
   if (already > 0) {
-    mi_assert_internal(pstart + page->unformed_purged_lo >= lo);   // extend un-discards what it formats
+    mi_assert_internal(pstart + page->unformed_purged_lo >= *lo);   // extend un-discards what it formats
     const uintptr_t uhi = pstart + page->unformed_purged_hi;
-    if (uhi > dlo) { dlo = uhi; }
-    lo = pstart + page->unformed_purged_lo;
+    if (uhi > *dlo) { *dlo = uhi; }
+    *lo = pstart + page->unformed_purged_lo;
   }
-  if (dlo >= hi) return;   // nothing new
+  return (*dlo < *hi);   // (else nothing new)
+}
+
+static void mi_page_purge_unformed_tail(mi_page_t* page) {
+  uintptr_t lo, dlo, hi;
+  if (!mi_page_unformed_tail_todo(page, &lo, &dlo, &hi)) return;
+  const uintptr_t pstart = (uintptr_t)mi_page_start(page);
 
   if (!_mi_os_discard(mi_page_subproc(page), (void*)dlo, (size_t)(hi - dlo))) return;   // the discard failed: leave the page as it was
   page->unformed_purged_lo = (uint32_t)(lo - pstart);
@@ -876,6 +900,12 @@ static void mi_page_purge_unformed_tail(mi_page_t* page) {
   mi_atomic_addi64_relaxed(&mi_holes_unformed_discard_calls, 1);
   mi_atomic_addi64_relaxed(&mi_holes_unformed_bytes_total, (int64_t)(hi - dlo));
   mi_atomic_addi64_relaxed(&mi_holes_unformed_bytes, (int64_t)(hi - dlo));
+}
+
+// Has the unformed tail OS pages that `mi_page_purge_unformed_tail` would discard now?
+static bool mi_page_unformed_tail_pending(const mi_page_t* page) {
+  uintptr_t lo, dlo, hi;
+  return mi_page_unformed_tail_todo(page, &lo, &dlo, &hi);
 }
 
 // Tell the OS we are using the discarded unformed tail below `end` again, *before* anything
@@ -1023,6 +1053,27 @@ void _mi_page_purge_holes(mi_page_t* page, mi_tld_t* tld) {
   if (!mi_option_is_enabled(mi_option_purge_holes)) return;
   if (mi_page_all_free(page)) return;                     // the page itself is about to be freed
   if (mi_option_get(mi_option_purge_delay) < 0) return;   // purging disabled
+  // The free blocks of a large page are whole buffers (96 KiB and up). A thread parks, and is swept, far more often than
+  // it is idle, and a busy one takes those buffers again at once: giving them back in between costs it a discard and a
+  // page fault for every OS page of every buffer (a server with 256 KiB request bodies lost a tenth of its throughput
+  // that way). So they stay while the last allocation from the page is less than `purge_holes_min_interval` ago: the
+  // allocation left the time in `swept_state` (`used` does not tell, it is the same at every park of a busy server).
+  // The same for the blocks of such a page that are not formed yet: it is about to form them. Whoever sweeps a thread
+  // that stays parked comes back for them (`_mi_theap_sweep_parked`); `mi_on_thread_idle_pending` tells its caller.
+  // (Not for memory that cannot be given back at all, which is counted below as it always was.)
+  mi_msecs_t allocated_at;
+  if (mi_page_holes_madvisable(page) && mi_page_sweep_state_is_alloc(page, &allocated_at)) {
+    const mi_msecs_t interval = (mi_msecs_t)mi_option_get_clamp(mi_option_purge_holes_min_interval, 0, 3600000);
+    const mi_msecs_t age = _mi_clock_now() - allocated_at;
+    if (age >= 0 && age < interval) {
+      // Say that something was left. Also for an abandoned page that this sweep passes: a large page is abandoned when it
+      // is full, so that is where most of a thread's own buffers are (and those of others; hence "one more sweep", not
+      // "until nothing is left", in `_mi_theap_sweep_parked`). With nothing to take now, the time stays for what is freed
+      // until the next sweep.
+      if (page->free != NULL || mi_page_unformed_tail_pending(page)) { tld->holes_sweep_deferred = true; }
+      return;
+    }
+  }
   mi_page_purge_unformed_tail(page);                      // the blocks that are not formed yet: resident, but never handed out
   if (!mi_page_can_purge_holes(page)) { _mi_page_holes_count_ineligible(page); return; }
 
@@ -2417,6 +2468,9 @@ static mi_decl_noinline void* mi_malloc_generic_fallback(mi_theap_t* theap, size
   // move full pages to the full queue
   // this will also call _mi_page_update_stats for huge pages  
   if (mi_page_block_size(page) > MI_SMALL_MAX_OBJ_SIZE) {
+    if (mi_page_block_size(page) > MI_MEDIUM_MAX_OBJ_SIZE && page->reserved > 1) {   // (not a huge page, which is one block: the sweep never looks at it)
+      mi_page_sweep_state_set_alloc(page);   // a large page is in use: the idle sweep leaves its free blocks for now (see `_mi_page_purge_holes`)
+    }
     if (mi_page_is_full(page)) {
       mi_page_to_full(page, mi_page_queue_of(page));
     }

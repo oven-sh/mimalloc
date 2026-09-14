@@ -537,7 +537,9 @@ typedef struct mi_page_s {
   // The `(capacity,used)` the last hole sweep left this page in, packed as `(capacity<<32)|used`.
   // A sweep that finds it unchanged skips the page without walking its free list at all: nothing
   // was allocated or freed in it since, so the sweep has nothing new to discard (see
-  // `_mi_page_purge_holes`). `MI_PAGE_SWEPT_NONE` means "unknown". Cold, like `purged` above.
+  // `_mi_page_purge_holes`). `MI_PAGE_SWEPT_NONE` means "unknown". In a large page an allocation
+  // puts the time here instead (bit 62 set, bit 63 clear; `mi_page_sweep_state_set_alloc` in
+  // page.c). Cold, like `purged` above.
   uint64_t                  swept_state;
 } mi_page_t;
 
@@ -807,6 +809,13 @@ typedef int64_t  mi_msecs_t;
 #define MI_PARK_PARKED    (1)
 #define MI_PARK_SWEEPING  (2)
 
+// How far the sweep of the current park is (`tld->park_swept`). A sweep leaves the free blocks of a large page that was
+// allocated from less than `purge_holes_min_interval` ago (`_mi_page_purge_holes`); a park where that happened is swept
+// once more, that long after its first sweep.
+#define MI_PARK_SWEPT_NONE   (0)
+#define MI_PARK_SWEPT_DONE   (1)
+#define MI_PARK_SWEPT_SMALL  (2)   // but for large pages that were in use a moment ago: come back for those if the thread stays parked
+
 struct mi_tld_s {
   mi_threadid_t         thread_id;            // thread id of this thread
   size_t                thread_seq;           // thread sequence id (linear count of created threads)
@@ -824,7 +833,7 @@ struct mi_tld_s {
   _Atomic(uint32_t)     park_state;           // MI_PARK_*: whether another thread may sweep our theaps right now
   _Atomic(uint32_t)     park_reclaim;         // set by the owner to get its theaps back; the sweep stops at the next page
   mi_theap_t*           park_theap0;          // default theap, captured at the park (the scavenger has no TLS to find it)
-  _Atomic(uint32_t)     park_swept;           // this park's sweep is done: don't claim it again until the thread re-parks
+  _Atomic(uint32_t)     park_swept;           // MI_PARK_SWEPT_*: how far this park's sweep is; back to 0 when the thread parks again
   mi_tld_t*             subproc_next;         // list of tlds in the subproc, so the scavenger can find parked threads
   size_t                holes_sweep_seq;      // idle sweeps run over THIS tld's heaps (paces `purge_holes_full_every`)
   mi_msecs_t            holes_sweep_last;     // when this tld's heaps were last swept (paces `purge_holes_min_interval`)
@@ -838,6 +847,7 @@ struct mi_tld_s {
   bool                  holes_sweep_full;     // this sweep ignores `page->swept_state` (see `_mi_page_purge_holes`)
   size_t                holes_sweep_skipped;  // per-sweep counters, folded into the process-wide ones in `_mi_page_purge_holes_end`
   size_t                holes_sweep_visited;
+  bool                  holes_sweep_deferred; // this sweep left the free blocks of a large page that was just in use (see `_mi_page_purge_holes`)
 };
 
 

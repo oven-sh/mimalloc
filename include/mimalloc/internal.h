@@ -339,7 +339,7 @@ void          _mi_theap_collect_abandon(mi_theap_t* theap);
 
 
 void          _mi_thread_idle_work(mi_tld_t* tld, mi_theap_t* theap0) mi_attr_noexcept;
-mi_msecs_t    _mi_theap_sweep_parked(mi_subproc_t* subproc);   // msecs until a rate-limited park becomes due (0: none)
+mi_msecs_t    _mi_theap_sweep_parked(mi_subproc_t* subproc);   // msecs until a park becomes due that was passed over for the rate limit, or that is to be swept once more for its large pages (0: none)
 void          _mi_park_leave(mi_tld_t* tld);
 void          _mi_scavenger_forked_child(void);
 bool          _mi_theap_area_visit_blocks(const mi_heap_area_t* area, mi_page_t* page, mi_block_visit_fun* visitor, void* arg);
@@ -382,6 +382,7 @@ void          _mi_stats_init(void);
 void          _mi_stats_merge_into(mi_stats_t* to, mi_stats_t* from);
 
 mi_msecs_t    _mi_clock_now(void);
+mi_msecs_t    _mi_clock_now_coarse(void);   // same clock; may lag by a tick of the OS (up to 10 ms) where that makes it cheaper
 mi_msecs_t    _mi_clock_end(mi_msecs_t start);
 mi_msecs_t    _mi_clock_start(void);
 

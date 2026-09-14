@@ -13,7 +13,8 @@ terms of the MIT license. A copy of the license can be found in the file
 // are discarded at an idle sweep (on Linux: that they are not resident any more) while their live neighbours keep
 // every byte, what comes back when the blocks are used again (`mi_zalloc` included), frees from another thread into
 // a page with holes, `mi_realloc` next to holes, a page that is abandoned with holes, `mi_heap_destroy` /
-// `mi_heap_delete` of a heap with such pages.
+// `mi_heap_delete` of a heap with such pages, and when they are discarded: not while the last allocation from the page
+// is less than `purge_holes_min_interval` ago, neither by an inline sweep nor in the park handoff.
 //
 // Run with MIMALLOC_PURGE_HOLES=0 to check that nothing is discarded then and everything else still holds.
 
@@ -25,8 +26,12 @@ terms of the MIT license. A copy of the license can be found in the file
 #include "mimalloc.h"
 #include "mimalloc-stats.h"
 #include "mimalloc/internal.h"   // _mi_ptr_page, mi_page_purge_unit, _mi_page_purged_count, _mi_page_purge_os_page_blocks
+#include "mimalloc/prim-tls.h"   // _mi_theap_default
 
 #include "testhelper.h"
+#if !defined(_WIN32)
+#include <time.h>
+#endif
 
 #if defined(__linux__)
 #include <sys/mman.h>
@@ -81,6 +86,18 @@ static size_t pattern_check(const void* p, size_t size, size_t id) {
   return size;
 }
 
+// (a parked thread may not allocate, so it waits with this)
+static void sleep_ms(unsigned ms) {
+  #if defined(_WIN32)
+  Sleep(ms);
+  #else
+  struct timespec ts;
+  ts.tv_sec = (time_t)(ms / 1000);
+  ts.tv_nsec = (long)(ms % 1000) * 1000000L;
+  nanosleep(&ts, NULL);
+  #endif
+}
+
 // The resident bytes of the OS pages that lie wholly inside `[p, p+size)`; `SIZE_MAX` where we cannot tell.
 static size_t resident_bytes(const void* p, size_t size) {
   #if HAVE_MINCORE
@@ -104,7 +121,8 @@ static size_t resident_bytes(const void* p, size_t size) {
   #endif
 }
 
-// An idle sweep.
+// An idle sweep. (The free blocks of a large page stay for `purge_holes_min_interval` after the last allocation from the
+// page; `main` sets that to 0 for the cases that are about something else.)
 static void sweep(void) {
   mi_on_thread_idle();
 }
@@ -638,12 +656,188 @@ static bool test_double_free(void) {
 }
 
 // ---------------------------------------------------------------------------
+// 9. the park handoff: the sweep of a park leaves the free blocks of a large page that was allocated from less than
+//    `purge_holes_min_interval` ago (a thread parks far more often than it is idle, and a busy one takes those buffers
+//    again at once); the park is swept once more that long after, which takes them, and then it is done and not swept
+//    again
+// ---------------------------------------------------------------------------
+
+static size_t count_purged_in(void** freed, size_t n, size_t bsize, const mi_page_t* only);
+
+static bool test_park_defers_large(void) {
+  const size_t size = large_size(1);
+  const long interval_ms = 300;
+  void* ptrs[MAXB];
+  void* freed[MAXB];
+  size_t usable = 0;
+  bool ok_all = true;
+  const size_t n = 24;
+  memset(ptrs, 0, sizeof(ptrs)); memset(freed, 0, sizeof(freed));
+  const long old_interval = mi_option_get(mi_option_purge_holes_min_interval);
+  mi_option_set(mi_option_purge_holes_min_interval, interval_ms);
+  if (!alloc_filled(ptrs, n - 1, size, &usable)) { free_all(ptrs, n); return false; }
+  const mi_msecs_t t_alloc = _mi_clock_now();   // before the last allocation: the pages are at least this young
+  ptrs[n - 1] = mi_malloc(size);
+  if (ptrs[n - 1] == NULL) { free_all(ptrs, n); return false; }
+  pattern_fill(ptrs[n - 1], usable, n - 1);
+  const mi_page_t* const page0 = _mi_ptr_page(ptrs[0]);
+  const bool large = is_large_page(page0);
+  const size_t bsize = page0->block_size;
+  size_t nfreed = 0;
+  for (size_t i = 0; i < n; i++) { if ((i % 2) == 1) { freed[i] = ptrs[i]; mi_free(ptrs[i]); ptrs[i] = NULL; nfreed++; } }
+
+  const hole_stats_t before = hole_stats();
+  if (!mi_on_thread_idle_start()) {
+    fprintf(stderr, "(no scavenger to hand off to: not tested) ");
+  }
+  else {
+    // (nothing in here may allocate or free, and with malloc overridden that includes printing)
+    mi_tld_t* const tld = _mi_theap_default()->tld;
+    // the first sweep of the park: it leaves the large pages, so the park is not done
+    const mi_msecs_t t0 = _mi_clock_now();
+    while (mi_atomic_load_acquire(&tld->park_swept) == MI_PARK_SWEPT_NONE && _mi_clock_now() - t0 < 10000) { sleep_ms(2); }
+    const uint32_t swept1 = mi_atomic_load_acquire(&tld->park_swept);
+    const hole_stats_t s1 = hole_stats();
+    const mi_msecs_t t1 = _mi_clock_now();
+    // the thread stays parked: the park is swept once more, which takes them, and then it is done
+    while (mi_atomic_load_acquire(&tld->park_swept) != MI_PARK_SWEPT_DONE && _mi_clock_now() - t0 < 20000) { sleep_ms(2); }
+    const bool park_done = (mi_atomic_load_acquire(&tld->park_swept) == MI_PARK_SWEPT_DONE);
+    const mi_msecs_t t2 = _mi_clock_now();
+    // ..and nothing comes back for it
+    const size_t seq0 = tld->holes_sweep_seq;
+    sleep_ms((unsigned)(3 * interval_ms));
+    const size_t seq1 = tld->holes_sweep_seq;
+    mi_on_thread_idle_end();
+
+    if (purging_enabled && large) {
+      const size_t npurged = count_purged_in(freed, n, bsize, NULL);
+      if (swept1 == MI_PARK_SWEPT_NONE) { fprintf(stderr, "\n  the park was not swept\n"); ok_all = false; }
+      else if ((t1 - t_alloc) < interval_ms) {
+        // the allocations were less than the interval ago when we looked: that sweep left the large pages
+        if (swept1 != MI_PARK_SWEPT_SMALL) { fprintf(stderr, "\n  the first sweep of the park, %lld ms after the allocations, marked it as done\n", (long long)(t1 - t_alloc)); ok_all = false; }
+        if ((s1.bytes_now - before.bytes_now) >= (int64_t)bsize) {
+          fprintf(stderr, "\n  the first sweep of the park, %lld ms after the allocations, discarded %lld bytes\n", (long long)(t1 - t_alloc), (long long)(s1.bytes_now - before.bytes_now));
+          ok_all = false;
+        }
+        if (park_done && (t2 - t_alloc) < interval_ms) { fprintf(stderr, "\n  the park was done %lld ms after the allocations\n", (long long)(t2 - t_alloc)); ok_all = false; }
+      }
+      if (npurged != nfreed) { fprintf(stderr, "\n  %zu of the %zu free blocks of the large pages were discarded while the thread stayed parked\n", npurged, nfreed); ok_all = false; }
+      if (!park_done || seq1 != seq0) {
+        fprintf(stderr, "\n  the park was %s, and swept %zu more times in the %ld ms after that\n", (park_done ? "done" : "NOT marked as done"), seq1 - seq0, 3 * interval_ms);
+        ok_all = false;
+      }
+      fprintf(stderr, "(first sweep %lld ms after the allocations, done after %lld ms) ", (long long)(t1 - t_alloc), (long long)(t2 - t_alloc));
+    }
+  }
+  if (!survivors_intact(ptrs, n, usable, "park")) { ok_all = false; }
+  mi_option_set(mi_option_purge_holes_min_interval, old_interval);
+  free_all(ptrs, n);
+  return ok_all;
+}
+
+// ---------------------------------------------------------------------------
+// 10. ..and the same for the sweep that a thread does itself: nothing of a large page goes while the last allocation
+//     from it is recent, whatever was freed, and `mi_on_thread_idle_pending` says so; it goes at the first sweep after that
+// ---------------------------------------------------------------------------
+
+static size_t count_purged_in(void** freed, size_t n, size_t bsize, const mi_page_t* only) {
+  size_t npurged = 0;
+  for (size_t i = 0; i < n; i++) {
+    const mi_page_t* const page = (freed[i] != NULL ? freed_block_page(freed[i], bsize) : NULL);
+    if (page != NULL && (only == NULL || page == only) && mi_page_block_is_purged(page, freed[i])) { npurged++; }
+  }
+  return npurged;
+}
+
+static bool test_recent_allocation(void) {
+  const size_t size = large_size(1);
+  const long interval_ms = 300;
+  void* ptrs[MAXB];
+  void* freed[MAXB];
+  size_t usable = 0;
+  bool ok_all = true;
+  const size_t n = 16;
+  memset(ptrs, 0, sizeof(ptrs)); memset(freed, 0, sizeof(freed));
+  const long old_interval = mi_option_get(mi_option_purge_holes_min_interval);
+  mi_option_set(mi_option_purge_holes_min_interval, interval_ms);
+  if (!alloc_filled(ptrs, n - 1, size, &usable)) { free_all(ptrs, n); return false; }
+  const mi_msecs_t t_alloc = _mi_clock_now();   // before the last allocation: the pages are at least this young
+  ptrs[n - 1] = mi_malloc(size);
+  if (ptrs[n - 1] == NULL) { free_all(ptrs, n); return false; }
+  pattern_fill(ptrs[n - 1], usable, n - 1);
+  const bool large = is_large_page(_mi_ptr_page(ptrs[0]));
+  const size_t bsize = _mi_ptr_page(ptrs[0])->block_size;
+  size_t nfreed = 0;
+  for (size_t i = 0; i < n; i++) { if ((i % 4) != 0) { freed[i] = ptrs[i]; mi_free(ptrs[i]); ptrs[i] = NULL; nfreed++; } }
+  if (purging_enabled && large) {
+    mi_on_thread_idle();
+    const bool all1 = !mi_on_thread_idle_pending();
+    const size_t n1 = count_purged_in(freed, n, bsize, NULL);
+    if (_mi_clock_now() - t_alloc < interval_ms) {
+      if (n1 != 0) { fprintf(stderr, "\n  a sweep right after the allocations discarded %zu blocks of the large pages\n", n1); ok_all = false; }
+      if (all1) { fprintf(stderr, "\n  a sweep that left the free blocks of large pages did not say so\n"); ok_all = false; }
+    }
+    // wait until the allocations are long enough ago, but for one page: take a block out of it and put it back
+    // (blocks of this class until one comes out of these pages: others may have free blocks as well)
+    sleep_ms((unsigned)interval_ms + 20);
+    void* extra[64];
+    size_t nextra = 0;
+    const mi_page_t* hit = NULL;
+    mi_msecs_t t_hit = 0;
+    while (hit == NULL && nextra < 64) {
+      t_hit = _mi_clock_now();   // before the allocation
+      void* const p = mi_malloc(size);
+      if (p == NULL) break;
+      memset(p, 0x3E, size);
+      extra[nextra++] = p;
+      for (size_t i = 0; i < n; i++) { if (freed[i] == p) { hit = _mi_ptr_page(p); } }
+    }
+    free_all(extra, nextra);
+    mi_on_thread_idle();
+    const bool all2 = !mi_on_thread_idle_pending();
+    const bool in_time = (_mi_clock_now() - t_hit < interval_ms);
+    if (hit == NULL) { fprintf(stderr, "(no block came out of the pages under test) "); }
+    else if (in_time) {
+      const size_t nhit = count_purged_in(freed, n, bsize, hit);
+      if (nhit != 0) { fprintf(stderr, "\n  a sweep discarded %zu blocks of a large page that was allocated from a moment before\n", nhit); ok_all = false; }
+      if (all2) { fprintf(stderr, "\n  a sweep that left the free blocks of a large page did not say so\n"); ok_all = false; }
+    }
+    // the pages that were not allocated from in the meantime went in that sweep
+    size_t nother = 0, nother_purged = 0;
+    for (size_t i = 0; i < n; i++) {
+      const mi_page_t* const page = (freed[i] != NULL ? freed_block_page(freed[i], bsize) : NULL);
+      if (page != NULL && page != hit) { nother++; if (mi_page_block_is_purged(page, freed[i])) { nother_purged++; } }
+    }
+    if (nother_purged != nother) { fprintf(stderr, "\n  %zu of the %zu free blocks in the pages that were left alone for %ld ms were discarded\n", nother_purged, nother, interval_ms); ok_all = false; }
+    // and the last one once it has been left alone for as long
+    sleep_ms((unsigned)interval_ms + 20);
+    mi_on_thread_idle();
+    const bool all3 = !mi_on_thread_idle_pending();
+    const size_t n3 = count_purged_in(freed, n, bsize, NULL);
+    if (n3 != nfreed) { fprintf(stderr, "\n  %zu of the %zu free blocks are discarded after the pages were left alone\n", n3, nfreed); ok_all = false; }
+    if (!all3) { fprintf(stderr, "\n  a sweep that left nothing says that it did\n"); ok_all = false; }
+    // a sweep after that has nothing to do in them
+    const hole_stats_t s3 = hole_stats();
+    mi_on_thread_idle();
+    const hole_stats_t s4 = hole_stats();
+    if (s4.discards != s3.discards) { fprintf(stderr, "\n  a sweep of pages that were swept and not touched since made %lld discards\n", (long long)(s4.discards - s3.discards)); ok_all = false; }
+    fprintf(stderr, "(%zu + %zu of %zu free blocks) ", nother_purged, n3 - nother_purged, nfreed);
+  }
+  if (!survivors_intact(ptrs, n, usable, "recent allocation")) { ok_all = false; }
+  mi_option_set(mi_option_purge_holes_min_interval, old_interval);
+  free_all(ptrs, n);
+  return ok_all;
+}
+
+// ---------------------------------------------------------------------------
 
 int main(void) {
   mi_version();
   purging_enabled = mi_option_is_enabled(mi_option_purge_holes);
   // zero every hole before it is discarded, so that a discard that covers a live block shows on every OS (see `test-purge-holes.c`)
   mi_option_set(mi_option_purge_holes_eager_zero, 1);
+  // no waiting for the free blocks of a large page (the cases that are about that set their own interval)
+  mi_option_set(mi_option_purge_holes_min_interval, 0);
   fprintf(stderr, "purge_holes is %s, os page size is %zu, large pages are %zu KiB for blocks over %zu up to %zu bytes\n",
           (purging_enabled ? "ON" : "OFF"), (size_t)_mi_os_page_size(), (size_t)(MI_LARGE_PAGE_SIZE / MI_KiB),
           (size_t)MI_MEDIUM_MAX_OBJ_SIZE, (size_t)MI_LARGE_MAX_OBJ_SIZE);
@@ -661,6 +855,8 @@ int main(void) {
   CHECK("heap-destroy", test_heap_destroy());
   CHECK("heap-delete", test_heap_delete());
   CHECK("double-free-of-a-purged-block", test_double_free());
+  CHECK("park-defers-large-pages", test_park_defers_large());
+  CHECK("recent-allocation", test_recent_allocation());
 
   // everything above is freed by now, so every hole must have been handed back
   mi_collect(true);
