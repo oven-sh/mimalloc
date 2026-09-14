@@ -70,6 +70,86 @@ static inline uint64_t mi_page_sweep_state(const mi_page_t* page) {
   return (((uint64_t)page->capacity) << 32) | (uint64_t)mi_page_used(page);
 }
 
+// The hole sweep's epoch: a counter that only a sweep moves (`_mi_page_purge_holes_epoch_advance`), and at most once in
+// `purge_holes_min_interval`. It is the only notion of time that the allocating side has for the rule that the free
+// blocks of a large page stay while the page is in use (`_mi_page_purge_holes`): an allocation from a large page leaves
+// the epoch it sees in `swept_state` (`mi_malloc_generic_fallback`), under a bit that no `(capacity,used)` has and with the
+// top bit clear, which `MI_PAGE_SWEPT_NONE` has set. No clock is read there.
+// Process-wide, as the clock and the option are (a page of any subprocess can be compared with it).
+// (a cache line of their own: both are written once per epoch, and the counters of the sweep further down on every discard)
+typedef struct mi_holes_time_s {
+  _Atomic(int64_t)   start;   // `_mi_clock_now()` when the current epoch began; `MI_HOLES_EPOCH_MOVING` while a sweep moves it
+  _Atomic(uintptr_t) epoch;   // read (relaxed) by every allocation from a large page
+  uint8_t            padding[64 - sizeof(uintptr_t) - sizeof(int64_t)];
+} mi_holes_time_t;
+static mi_decl_cache_align mi_holes_time_t mi_holes_time;
+#define mi_holes_epoch            (mi_holes_time.epoch)
+#define mi_holes_epoch_start      (mi_holes_time.start)
+#define MI_HOLES_EPOCH_MOVING     (INT64_MIN)
+
+#define MI_PAGE_SWEPT_ALLOC       (((uint64_t)1) << 62)
+#define MI_PAGE_SWEPT_ALLOC_MASK  (((uint64_t)3) << 62)
+static inline void mi_page_sweep_state_set_alloc(mi_page_t* page) {
+  // The low 32 bits of the epoch. Written only when it differs: a page that is allocated from all the time is written
+  // to once per epoch, and not at all when nothing sweeps (the epoch stands still then).
+  const uint64_t stamp = (MI_PAGE_SWEPT_ALLOC | (uint64_t)((uint32_t)mi_atomic_load_relaxed(&mi_holes_epoch)));
+  if (page->swept_state != stamp) { page->swept_state = stamp; }
+}
+static inline bool mi_page_sweep_state_is_alloc(const mi_page_t* page, uint32_t* epoch) {
+  if ((page->swept_state & MI_PAGE_SWEPT_ALLOC_MASK) != MI_PAGE_SWEPT_ALLOC) return false;
+  *epoch = (uint32_t)page->swept_state;
+  return true;
+}
+
+// How many epochs ago was the page allocated from, for a page that `mi_page_sweep_state_is_alloc`? In 32 bits: a page
+// that was left for a multiple of 2^32 epochs (13 years of sweeping with the default interval) reads as young once
+// more, and is taken two epochs later.
+// The epoch is read now and not once per sweep: whoever hands us a page (a thread that parks, one that abandons it)
+// does so with a release that we acquired, so what we read here is not older than what is in the page. (If it were,
+// the page would read as very old and its blocks would go now, which is what happened to every page before this rule.)
+static inline uint32_t mi_page_sweep_state_alloc_age(uint32_t epoch) {
+  return (_mi_page_purge_holes_epoch() - epoch);
+}
+
+// Move the epoch on if the current one has lasted for `purge_holes_min_interval`. Called by every idle sweep as the first
+// thing it does (`_mi_thread_idle_work`: a caller that sweeps every interval by its own clock is to find the epoch that its
+// last call began as old as that); the clock is read here and nowhere on the allocating side.
+// What the sweep relies on is that the epoch after the one of an allocation lasted for the whole interval by the time
+// a third one is there to be seen (`_mi_page_purge_holes`): an epoch begins for everybody else at the increment below,
+// so the time it began is a reading of the clock from AFTER that, and until that time is known nobody else moves it
+// (a sweeper that is preempted in between delays the next epoch; it can never shorten this one). Any number of threads
+// sweep at the same time (the scavenger for the parked ones, and each thread that calls `mi_on_thread_idle` itself).
+void _mi_page_purge_holes_epoch_advance(void) {
+  if (!mi_option_is_enabled(mi_option_purge_holes)) return;
+  const mi_msecs_t interval = (mi_msecs_t)mi_option_get_clamp(mi_option_purge_holes_min_interval, 0, 3600000);
+  if (interval <= 0) return;   // nothing is held then
+  int64_t start = mi_atomic_loadi64_acquire(&mi_holes_epoch_start);
+  if (start != MI_HOLES_EPOCH_MOVING) {
+    const mi_msecs_t now = _mi_clock_now();
+    if (now >= start && (now - start) < interval) return;   // to the millisecond, as the clock is. (A clock that went back: move it, the new start heals that.)
+    if (mi_atomic_casi64_strong_acq_rel(&mi_holes_epoch_start, &start, MI_HOLES_EPOCH_MOVING)) {
+      mi_atomic_add_acq_rel(&mi_holes_epoch, (uintptr_t)1);
+      mi_atomic_storei64_release(&mi_holes_epoch_start, (int64_t)_mi_clock_now());
+      return;
+    }
+  }
+  // Another sweep is moving it right now, which is an increment and a reading of the clock: let it, so that this sweep
+  // sees the new epoch (bounded: if that thread is not running we go on with the old one, which only keeps pages longer).
+  for (int i = 0; i < 1000 && mi_atomic_loadi64_acquire(&mi_holes_epoch_start) == MI_HOLES_EPOCH_MOVING; i++) { mi_atomic_pause(); }
+}
+
+// (for `test-purge-holes-large.c`)
+uint32_t _mi_page_purge_holes_epoch(void) {
+  return (uint32_t)mi_atomic_load_acquire(&mi_holes_epoch);
+}
+
+// A `fork` can land between the two stores above, in a thread that is not there in the child.
+void _mi_page_purge_holes_forked_child(void) {
+  if (mi_atomic_loadi64_relaxed(&mi_holes_epoch_start) == MI_HOLES_EPOCH_MOVING) {
+    mi_atomic_storei64_release(&mi_holes_epoch_start, (int64_t)_mi_clock_now());
+  }
+}
+
 // Anything that changes which blocks are free *without* changing `(capacity,used)` must say so,
 // or the next sweep would wrongly skip the page. That is exactly `mi_page_unpurge_range`: it puts
 // discarded blocks back on the free list, and a purged block was already free.
@@ -92,19 +172,19 @@ static inline void mi_page_purged_clear(mi_page_t* page, size_t k) {
   page->purged[k / 64] &= ~((uint64_t)1 << (k % 64));
 }
 
-// the OS pages that the block at index `idx` overlaps (relative to `mi_page_purge_base`)
-static inline void mi_page_block_os_pages(const mi_page_t* page, size_t idx, size_t* kfirst, size_t* klast) {
-  const size_t os_size = _mi_os_page_size();
-  const uintptr_t base = mi_page_purge_base(page);
+// the units that the block at index `idx` overlaps (relative to `mi_page_purge_base`); `os_size` is `mi_page_purge_unit(page)`
+static inline void mi_page_block_os_pages(const mi_page_t* page, size_t os_size, size_t idx, size_t* kfirst, size_t* klast) {
+  const uintptr_t base = mi_page_purge_base_of(page, os_size);
   const uintptr_t lo = (uintptr_t)mi_page_start(page) + (idx * page->block_size);
   *kfirst = (size_t)(lo - base) / os_size;
   *klast = (size_t)((lo + page->block_size - 1) - base) / os_size;
 }
 
-// the blocks that overlap OS page `k`, or `false` if that OS page is not entirely inside
+// the blocks that overlap unit `k`, or `false` if that unit is not entirely inside
 // the *committed* block area (see `_mi_page_purge_os_page_blocks`)
-static bool mi_page_os_page_blocks(const mi_page_t* page, size_t k, size_t* first, size_t* last) {
-  return _mi_page_purge_os_page_blocks(_mi_os_page_size(), page->block_size, (uintptr_t)mi_page_start(page),
+static bool mi_page_os_page_blocks(const mi_page_t* page, size_t os_size, size_t k, size_t* first, size_t* last) {
+  mi_assert_internal(os_size == mi_page_purge_unit(page));
+  return _mi_page_purge_os_page_blocks(os_size, page->block_size, (uintptr_t)mi_page_start(page),
                                        page->capacity, k, first, last);
 }
 
@@ -112,6 +192,7 @@ static bool mi_page_os_page_blocks(const mi_page_t* page, size_t k, size_t* firs
 // (the blocks of a maximal run of discarded OS pages are contiguous)
 size_t _mi_page_purged_count(const mi_page_t* page) {
   if (!mi_page_has_purged(page)) return 0;
+  const size_t os_size = mi_page_purge_unit(page);
   size_t total = 0;
   size_t k = 0;
   while (k < MI_PAGE_PURGE_BITS) {
@@ -119,8 +200,8 @@ size_t _mi_page_purged_count(const mi_page_t* page) {
     const size_t k0 = k;
     while (k < MI_PAGE_PURGE_BITS && mi_page_os_page_purged(page, k)) { k++; }
     size_t first, last, first1, last1;
-    if (!mi_page_os_page_blocks(page, k0, &first, &last)) { mi_assert_internal(false); continue; }
-    if (!mi_page_os_page_blocks(page, k - 1, &first1, &last1)) { mi_assert_internal(false); continue; }
+    if (!mi_page_os_page_blocks(page, os_size, k0, &first, &last)) { mi_assert_internal(false); continue; }
+    if (!mi_page_os_page_blocks(page, os_size, k - 1, &first1, &last1)) { mi_assert_internal(false); continue; }
     total += (last1 - first) + 1;
   }
   return total;
@@ -530,7 +611,7 @@ static inline bool mi_page_free_quick_collect(mi_page_t* page) {
   Page hole purging.
 
   A page returns to the arena only once *every* block is free, so one live
-  block pins the whole page (up to 512KB). Here we discard the memory of the
+  block pins the whole page (64KB, 512KB or 4MB). Here we discard the memory of the
   free blocks inside a still-used page.
 
   The unit of discarding is an OS page, so that is what we track: `page->purged`
@@ -538,6 +619,16 @@ static inline bool mi_page_free_quick_collect(mi_page_t* page) {
   `mi_page_purge_base(page) + k*os_page_size`). Its size does not depend on the
   size class, so *every* size class is eligible -- a run of adjacent free blocks
   covering one whole OS page is enough, no matter how small the blocks are.
+
+  The bitmap has `MI_PAGE_PURGE_BITS` bits, which is an OS page per bit for a small
+  and a medium page. A large (4 MiB) page has more OS pages than that unless they are
+  16 KiB or more, so there a bit stands for the smallest power-of-two multiple of the
+  OS page that makes the page fit: 16 KiB on a 4 KiB OS page (`mi_page_purge_unit`).
+  That is the only difference: read "OS page" below as "unit" (and `os_size` in the
+  code is the unit of the page at hand). The blocks of a large page are 96 KiB and up
+  in steps of at least 16 KiB and start at the slice (where the page meta data is kept
+  apart from the page), so each free block in it is discarded as a whole; nothing
+  relies on that, the rule below decides unit by unit.
 
   We discard an OS page only when EVERY block overlapping it is free. That makes
   the purged state of a block *derived*:
@@ -720,12 +811,13 @@ void _mi_page_purge_holes_end(mi_tld_t* tld) {
 }
 
 // Called once per idle sweep of `tld`'s heaps, before its passes (`mi_purge_holes_of`): decides
-// whether this sweep ignores `page->swept_state` (see `_mi_page_purge_holes`).
+// whether this sweep ignores `page->swept_state` (see `_mi_page_purge_holes`), and notes its epoch.
 void _mi_page_purge_holes_sweep_begin(mi_tld_t* tld) {
   const long every = mi_option_get(mi_option_purge_holes_full_every);
   const size_t seq = ++tld->holes_sweep_seq;
   tld->holes_sweep_full = (every > 0 && (seq % (size_t)every) == 0);
   if (tld->holes_sweep_full) { mi_atomic_addi64_relaxed(&mi_holes_full_sweeps, 1); }
+  tld->holes_sweep_epoch = _mi_page_purge_holes_epoch();   // the sweep owns the time that large pages are held by (see `_mi_page_purge_holes`): no page of this sweep is compared with an older epoch than this
 }
 
 static inline bool mi_page_bits_at(const uint64_t* bits, size_t k) {
@@ -733,10 +825,10 @@ static inline bool mi_page_bits_at(const uint64_t* bits, size_t k) {
   return ((bits[k / 64] >> (k % 64)) & 1) != 0;
 }
 
-// does the block at index `idx` overlap any OS page in `bits`?
-static bool mi_page_block_overlaps(const mi_page_t* page, size_t idx, const uint64_t* bits) {
+// does the block at index `idx` overlap any unit in `bits`?
+static bool mi_page_block_overlaps(const mi_page_t* page, size_t os_size, size_t idx, const uint64_t* bits) {
   size_t kfirst, klast;
-  mi_page_block_os_pages(page, idx, &kfirst, &klast);
+  mi_page_block_os_pages(page, os_size, idx, &kfirst, &klast);
   for (size_t k = kfirst; k <= klast && k < MI_PAGE_PURGE_BITS; k++) {
     if (mi_page_bits_at(bits, k)) return true;
   }
@@ -750,8 +842,8 @@ static bool mi_page_block_overlaps(const mi_page_t* page, size_t idx, const uint
 // the range can still overlap a hole we are not touching: those stay purged.
 static void mi_page_unpurge_range(mi_page_t* page, size_t k0, size_t k1, bool discarded) {
   mi_assert_internal(k0 <= k1 && k1 < MI_PAGE_PURGE_BITS);
-  const size_t os_size = _mi_os_page_size();
-  const uintptr_t dstart = mi_page_purge_base(page) + (k0 * os_size);
+  const size_t os_size = mi_page_purge_unit(page);
+  const uintptr_t dstart = mi_page_purge_base_of(page, os_size) + (k0 * os_size);
   const size_t dsize = ((k1 - k0) + 1) * os_size;
   if (discarded) { _mi_os_reuse(mi_page_subproc(page), (void*)dstart, dsize); }
 
@@ -762,8 +854,8 @@ static void mi_page_unpurge_range(mi_page_t* page, size_t k0, size_t k1, bool di
                                           // (before any early return below: the bits are already cleared)
 
   size_t first, last, first1, last1;
-  if (!mi_page_os_page_blocks(page, k0, &first, &last) ||
-      !mi_page_os_page_blocks(page, k1, &first1, &last1)) {
+  if (!mi_page_os_page_blocks(page, os_size, k0, &first, &last) ||
+      !mi_page_os_page_blocks(page, os_size, k1, &first1, &last1)) {
     mi_assert_internal(false);   // a discarded OS page is always entirely inside the block area
     return;
   }
@@ -804,7 +896,8 @@ static void mi_page_unpurge_range(mi_page_t* page, size_t k0, size_t k1, bool di
 // Can this page's memory be discarded at ALL? Pinned (large/huge OS pages) memory cannot be
 // madvise'd away, and an arena with a custom commit function owns its own decommit. Note this
 // is deliberately weaker than `mi_page_can_purge_holes`, which also rejects pages whose OS
-// pages do not fit the `purged` bitmap -- the unformed tail needs no bitmap.
+// pages do not fit the `purged` bitmap (none since the unit of the bitmap follows the size of the page) and a page of a
+// single block -- the unformed tail needs no bitmap.
 static bool mi_page_holes_madvisable(const mi_page_t* page) {
   if (page->memid.is_pinned) return false;
   const mi_arena_t* const arena = mi_memid_arena(page->memid);
@@ -837,26 +930,34 @@ size_t _mi_page_unformed_purged_bytes(const mi_page_t* page) {
 }
 
 // Discard the OS pages of the unformed tail that are not discarded already.
-static void mi_page_purge_unformed_tail(mi_page_t* page) {
-  if (!mi_page_holes_madvisable(page)) return;
-  uintptr_t lo, hi;
-  mi_page_unformed_tail_range(page, &lo, &hi);
-  if (lo >= hi) return;
+// The part of the unformed tail that is not discarded yet, `[*dlo,*hi)`, and where the discarded part starts once that is
+// discarded too (`*lo`). Returns false if there is none.
+static bool mi_page_unformed_tail_todo(const mi_page_t* page, uintptr_t* lo, uintptr_t* dlo, uintptr_t* hi) {
+  *lo = 0; *dlo = 0; *hi = 0;
+  if (!mi_page_holes_madvisable(page)) return false;
+  mi_page_unformed_tail_range(page, lo, hi);
+  if (*lo >= *hi) return false;
   const uintptr_t pstart = (uintptr_t)mi_page_start(page);
-  mi_assert_internal(hi - pstart <= UINT32_MAX);   // only a huge page can be that big, and it has no tail
-  if (hi - pstart > UINT32_MAX) return;
+  mi_assert_internal(*hi - pstart <= UINT32_MAX);   // only a huge page can be that big, and it has no tail
+  if (*hi - pstart > UINT32_MAX) return false;
 
   // the part of the tail that is not discarded yet (the tail can only grow to the right,
   // when `mi_page_extend_free` commits more of the page)
-  uintptr_t dlo = lo;
+  *dlo = *lo;
   const size_t already = _mi_page_unformed_purged_bytes(page);
   if (already > 0) {
-    mi_assert_internal(pstart + page->unformed_purged_lo >= lo);   // extend un-discards what it formats
+    mi_assert_internal(pstart + page->unformed_purged_lo >= *lo);   // extend un-discards what it formats
     const uintptr_t uhi = pstart + page->unformed_purged_hi;
-    if (uhi > dlo) { dlo = uhi; }
-    lo = pstart + page->unformed_purged_lo;
+    if (uhi > *dlo) { *dlo = uhi; }
+    *lo = pstart + page->unformed_purged_lo;
   }
-  if (dlo >= hi) return;   // nothing new
+  return (*dlo < *hi);   // (else nothing new)
+}
+
+static void mi_page_purge_unformed_tail(mi_page_t* page) {
+  uintptr_t lo, dlo, hi;
+  if (!mi_page_unformed_tail_todo(page, &lo, &dlo, &hi)) return;
+  const uintptr_t pstart = (uintptr_t)mi_page_start(page);
 
   if (!_mi_os_discard(mi_page_subproc(page), (void*)dlo, (size_t)(hi - dlo))) return;   // the discard failed: leave the page as it was
   page->unformed_purged_lo = (uint32_t)(lo - pstart);
@@ -864,6 +965,12 @@ static void mi_page_purge_unformed_tail(mi_page_t* page) {
   mi_atomic_addi64_relaxed(&mi_holes_unformed_discard_calls, 1);
   mi_atomic_addi64_relaxed(&mi_holes_unformed_bytes_total, (int64_t)(hi - dlo));
   mi_atomic_addi64_relaxed(&mi_holes_unformed_bytes, (int64_t)(hi - dlo));
+}
+
+// Has the unformed tail OS pages that `mi_page_purge_unformed_tail` would discard now?
+static bool mi_page_unformed_tail_pending(const mi_page_t* page) {
+  uintptr_t lo, dlo, hi;
+  return mi_page_unformed_tail_todo(page, &lo, &dlo, &hi);
 }
 
 // Tell the OS we are using the discarded unformed tail below `end` again, *before* anything
@@ -897,8 +1004,8 @@ void _mi_page_unpurge_unformed_upto(mi_page_t* page, uintptr_t end) {
 static bool mi_page_purge_holes_walk(mi_page_t* page, mi_tld_t* tld) {
   if (page->free == NULL) return true;                    // nothing to take off the free list
 
-  const size_t os_size = _mi_os_page_size();
-  const size_t nbits = mi_page_purge_bits(page);
+  const size_t os_size = mi_page_purge_unit(page);        // the unit of the bitmap: the OS page in all but large pages
+  const size_t nbits = mi_page_purge_bits_of(page, os_size);
   mi_assert_internal(nbits <= MI_PAGE_PURGE_BITS);
   if (nbits > MI_PAGE_PURGE_BITS) return true;
   bool complete = true;
@@ -913,7 +1020,7 @@ static bool mi_page_purge_holes_walk(mi_page_t* page, mi_tld_t* tld) {
     mi_assert_internal(!mi_page_block_index_is_purged(page, idx));   // it is on the free list, so not purged
     nvisited++;
     size_t kfirst, klast;
-    mi_page_block_os_pages(page, idx, &kfirst, &klast);
+    mi_page_block_os_pages(page, os_size, idx, &kfirst, &klast);
     for (size_t k = kfirst; k <= klast && k < nbits; k++) {
       mi_assert_internal(nfree[k] < UINT16_MAX);
       nfree[k]++;
@@ -931,7 +1038,7 @@ static bool mi_page_purge_holes_walk(mi_page_t* page, mi_tld_t* tld) {
   for (size_t k = 0; k < nbits; k++) {
     if (mi_page_os_page_purged(page, k)) continue;                 // discarded already
     size_t first, last;
-    if (!mi_page_os_page_blocks(page, k, &first, &last)) continue; // not entirely inside the block area
+    if (!mi_page_os_page_blocks(page, os_size, k, &first, &last)) continue; // not entirely inside the block area
     size_t nfreek = nfree[k];
     if (mi_page_block_index_is_purged(page, first)) { nfreek++; }
     if (last != first && mi_page_block_index_is_purged(page, last)) { nfreek++; }
@@ -950,7 +1057,7 @@ static bool mi_page_purge_holes_walk(mi_page_t* page, mi_tld_t* tld) {
   mi_block_t* b = page->free;
   while (b != NULL) {
     mi_block_t* const next = mi_block_next(page, b);
-    if (mi_page_block_overlaps(page, mi_page_block_index(page, b), todo)) {
+    if (mi_page_block_overlaps(page, os_size, mi_page_block_index(page, b), todo)) {
       ndropped++;   // it becomes purged in step 4
     }
     else {
@@ -972,7 +1079,7 @@ static bool mi_page_purge_holes_walk(mi_page_t* page, mi_tld_t* tld) {
     const size_t k0 = k;
     while (k < nbits && mi_page_bits_at(todo, k)) { k++; }
     const size_t dsize = (k - k0) * os_size;
-    if (_mi_os_discard(mi_page_subproc(page), (void*)(mi_page_purge_base(page) + (k0 * os_size)), dsize)) {
+    if (_mi_os_discard(mi_page_subproc(page), (void*)(mi_page_purge_base_of(page, os_size) + (k0 * os_size)), dsize)) {
       mi_holes_count_discard(dsize);
     }
     else {
@@ -1011,6 +1118,32 @@ void _mi_page_purge_holes(mi_page_t* page, mi_tld_t* tld) {
   if (!mi_option_is_enabled(mi_option_purge_holes)) return;
   if (mi_page_all_free(page)) return;                     // the page itself is about to be freed
   if (mi_option_get(mi_option_purge_delay) < 0) return;   // purging disabled
+  // The free blocks of a large page are whole buffers (96 KiB and up). A thread parks, and is swept, far more often than
+  // it is idle, and a busy one takes those buffers again at once: giving them back in between costs it a discard and a
+  // page fault for every OS page of every buffer (a server with 256 KiB request bodies lost a tenth of its throughput
+  // that way). So they stay while the page is in use (`used` does not tell, it is the same at every park of a busy
+  // server): an allocation from the page leaves the sweep's epoch in `swept_state`, and the blocks stay while that is
+  // the current epoch or the one before. An epoch lasts for `purge_holes_min_interval` at least and only a sweep ends
+  // it (`_mi_page_purge_holes_epoch_advance`), so with the third epoch there to be seen, the whole of the second one lies between
+  // the allocation and now: the blocks of a page that is two epochs old were left alone for the interval at least. A
+  // busy thread puts the new epoch in its pages within the interval and keeps them for good; after the last allocation
+  // the blocks go one to two intervals later if something sweeps that often. A sweep ends one epoch at the most, so
+  // where one thread sweeps, the first sweep after an allocation finds the page young whenever it comes, and it takes
+  // a second or a third one, an interval apart each, to take the blocks. The same for the blocks of such a page that
+  // are not formed yet: it is about to form them. Whoever sweeps a thread that stays parked comes back for them (`_mi_theap_sweep_parked`);
+  // `mi_on_thread_idle_pending` tells its caller.
+  // (Not for memory that cannot be given back at all, which is counted below as it always was.)
+  uint32_t allocated_in;
+  if (mi_page_holes_madvisable(page) && mi_page_sweep_state_is_alloc(page, &allocated_in)) {
+    if (mi_page_sweep_state_alloc_age(allocated_in) < 2 && mi_option_get(mi_option_purge_holes_min_interval) > 0) {
+      // Say that something was left. Also for an abandoned page that this sweep passes: a large page is abandoned when it
+      // is full, so that is where most of a thread's own buffers are (and those of others; hence a fixed number of
+      // sweeps, not "until nothing is left", in `_mi_theap_sweep_parked`). With nothing to take now, the epoch stays for
+      // what is freed until the next sweep.
+      if (page->free != NULL || mi_page_unformed_tail_pending(page)) { tld->holes_sweep_deferred = true; }
+      return;
+    }
+  }
   mi_page_purge_unformed_tail(page);                      // the blocks that are not formed yet: resident, but never handed out
   if (!mi_page_can_purge_holes(page)) { _mi_page_holes_count_ineligible(page); return; }
 
@@ -1053,8 +1186,8 @@ bool _mi_page_unpurge_run(mi_page_t* page) {
 void _mi_page_unpurge_all(mi_page_t* page) {
   _mi_page_unpurge_unformed_upto(page, UINTPTR_MAX);   // the unformed tail goes back as well
   if (!mi_page_has_purged(page)) return;
-  const size_t os_size = _mi_os_page_size();
-  const uintptr_t base = mi_page_purge_base(page);
+  const size_t os_size = mi_page_purge_unit(page);
+  const uintptr_t base = mi_page_purge_base_of(page, os_size);
   size_t k = 0;
   while (k < MI_PAGE_PURGE_BITS) {
     if (!mi_page_os_page_purged(page, k)) { k++; continue; }
@@ -1063,8 +1196,8 @@ void _mi_page_unpurge_all(mi_page_t* page) {
     const size_t dsize = (k - k0) * os_size;
     _mi_os_reuse(mi_page_subproc(page), (void*)(base + (k0 * os_size)), dsize);
     size_t first, last, first1, last1;
-    if (mi_page_os_page_blocks(page, k0, &first, &last) &&
-        mi_page_os_page_blocks(page, k - 1, &first1, &last1)) {
+    if (mi_page_os_page_blocks(page, os_size, k0, &first, &last) &&
+        mi_page_os_page_blocks(page, os_size, k - 1, &first1, &last1)) {
       mi_holes_count_reuse(dsize, (last1 - first) + 1, true);
     }
     else {
@@ -1134,7 +1267,7 @@ static bool mi_holes_block_is_free(const mi_page_t* page, const uint64_t* freeli
 
 // How many bytes of this page would be discardable if the OS page size were `G`? A G-aligned,
 // G-sized span can be discarded exactly when it lies wholly inside the block area and every
-// block overlapping it is free -- the same rule the real sweep applies at `_mi_os_page_size()`.
+// block overlapping it is free -- the same rule the real sweep applies at the unit of the page (`mi_page_purge_unit`).
 static void mi_page_holes_granularity_curve(const mi_page_t* page, const uint64_t* freelisted, mi_holes_report_t* rep) {
   const size_t bs = page->block_size;
   const size_t cap = page->capacity;
@@ -1195,11 +1328,11 @@ void _mi_page_holes_report_page(const mi_page_t* page, mi_holes_report_t* rep) {
     return;
   }
 
-  const size_t os_size = _mi_os_page_size();
+  const size_t os_size = mi_page_purge_unit(page);   // the unit of the bitmap: the OS page in all but large pages
   const uintptr_t pstart = (uintptr_t)mi_page_start(page);
   const uintptr_t pend = pstart + (cap * bs);
-  const uintptr_t base = mi_page_purge_base(page);
-  const size_t nbits = mi_page_purge_bits(page);
+  const uintptr_t base = mi_page_purge_base_of(page, os_size);
+  const size_t nbits = mi_page_purge_bits_of(page, os_size);
   mi_assert_internal(nbits <= MI_PAGE_PURGE_BITS);
 
   for (size_t k = 0; k < nbits; k++) {
@@ -1275,6 +1408,11 @@ void _mi_page_holes_report_print(const mi_holes_report_t* rep) {
 
   _mi_fprintf(NULL, NULL, "\nholes report: os page = %zu bytes, %zu pages (%zu ineligible, %zu never madvise-able)\n",
               _mi_os_page_size(), rep->total_pages, rep->ineligible_pages, rep->unmadvisable_pages);
+  size_t large_unit = _mi_os_page_size();
+  while ((large_unit * MI_PAGE_PURGE_BITS) < MI_LARGE_PAGE_SIZE && large_unit < MI_PAGE_PURGE_MAX_UNIT) { large_unit <<= 1; }
+  if (large_unit > _mi_os_page_size()) {
+    _mi_fprintf(NULL, NULL, "  (in a large page an \"OS page\" below is its unit of %zu bytes: the sweep works at that size there)\n", large_unit);
+  }
 
   mi_holes_bin_t total;
   _mi_memzero(&total, sizeof(total));
@@ -2400,6 +2538,9 @@ static mi_decl_noinline void* mi_malloc_generic_fallback(mi_theap_t* theap, size
   // move full pages to the full queue
   // this will also call _mi_page_update_stats for huge pages  
   if (mi_page_block_size(page) > MI_SMALL_MAX_OBJ_SIZE) {
+    if (mi_page_block_size(page) > MI_MEDIUM_MAX_OBJ_SIZE && page->reserved > 1) {   // (not a huge page, which is one block: the sweep never looks at it)
+      mi_page_sweep_state_set_alloc(page);   // a large page is in use: the idle sweep leaves its free blocks for now (see `_mi_page_purge_holes`). A load, and a store once per epoch.
+    }
     if (mi_page_is_full(page)) {
       mi_page_to_full(page, mi_page_queue_of(page));
     }

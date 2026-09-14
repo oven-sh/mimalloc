@@ -462,11 +462,11 @@ static bool test_abandoned(void) {
 }
 
 // ---------------------------------------------------------------------------
-// 6. large pages (4MB, for blocks over ~84KB). Whether they fit the OS-page bitmap depends
-//    on the OS page size: 4MB/4KB = 1024 bits does not fit, 4MB/16KB = 256 bits does. So we
-//    assert what the page itself reports: either it is eligible and its holes are discarded,
-//    or it is ineligible and the sweep counts it (and discards nothing). Either way its data
-//    must survive.
+// 6. large pages (4MB, for blocks over ~84KB). They fit the bitmap with a unit of 16KB where the
+//    OS page is smaller than that (4MB/4KB = 1024 OS pages would not fit; see `mi_page_purge_unit`
+//    and `test-purge-holes-large.c`). We assert what the page itself reports: it is eligible and
+//    its holes are discarded (the other branch is for a page that cannot be purged at all, which
+//    a large page of many blocks no longer is). Either way its data must survive.
 // ---------------------------------------------------------------------------
 
 #define LARGE_N   (32)
@@ -491,7 +491,7 @@ static bool test_large_pages(void) {
   for (size_t i = 1; i < LARGE_N; i += 2) { mi_free(ptrs[i]); ptrs[i] = NULL; }
 
   before = hole_stats();
-  mi_on_thread_idle();
+  mi_on_thread_idle();   // (`main` has set `purge_holes_min_interval` to 0: nothing waits for the last allocation to be long enough ago)
   after = hole_stats();
   npurged = purged_blocks(ptrs, LARGE_N);
 
@@ -1709,6 +1709,9 @@ int main(void) {
   // VACUOUS in a release build on macOS: MADV_FREE_REUSABLE is lazy, so a discard that
   // wrongly covers a live block leaves its data intact until the kernel reclaims the page.
   mi_option_set(mi_option_purge_holes_eager_zero, 1);
+  // No waiting here for the free blocks of a large page, which stay for `purge_holes_min_interval` after the last allocation
+  // from it (`test-purge-holes-large.c` is about that): on a 32-bit target the 64 KiB blocks below are in one.
+  mi_option_set(mi_option_purge_holes_min_interval, 0);
   fprintf(stderr, "purge_holes is %s, os page size is %zu\n",
           (purging_enabled ? "ON" : "OFF"), (size_t)_mi_os_page_size());
 
@@ -1735,7 +1738,10 @@ int main(void) {
     CHECK("purging-actually-happened", purged_any);
     // the small size classes are what this rework unlocked: they must purge now
     CHECK("small-blocks-are-eligible", (ps[0] && ps[1] && ps[2] && ps[3]));
-    CHECK("medium-page-is-eligible", ps[7]);
+    // (without large pages, `MI_ENABLE_LARGE_PAGES=0`, a block of 64 KiB and its padding is a page of its own: nothing to purge in it)
+    if (MI_ENABLE_LARGE_PAGES || (65536 + MI_PADDING_SIZE) <= MI_MEDIUM_MAX_OBJ_SIZE) {
+      CHECK("medium-page-is-eligible", ps[7]);
+    }
   }
   else {
     CHECK("nothing-purged-when-off", !purged_any);

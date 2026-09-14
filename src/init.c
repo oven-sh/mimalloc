@@ -131,7 +131,8 @@ static mi_decl_cache_align mi_tld_t mi_tld_detached = {
   MI_ATOMIC_VAR_INIT(0),  // park_swept
   NULL,                   // subproc_next
   0, 0,                   // holes_sweep_seq / _last
-  false, false, 0, 0      // holes_sweeping / _full / _skipped / _visited
+  false, false, 0, 0,     // holes_sweeping / _full / _skipped / _visited
+  false, 0, 0             // holes_sweep_deferred / holes_sweep_epoch / holes_park_epoch
 };
 
 mi_decl_hidden mi_decl_cache_align const mi_theap_t _mi_theap_empty = {

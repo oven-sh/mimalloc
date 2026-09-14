@@ -420,6 +420,7 @@ void _mi_process_fork_child(void) {
   _mi_process_is_forked_child = true;
   _mi_scavenger_forked_child();   // the scavenger thread did not survive the fork; clear the state that says it did
   _mi_arenas_purge_guard_release();   // taken by the prepare handler: no purge pass was in progress, so each `purge_expire` is as a finished pass left it
+  _mi_page_purge_holes_forked_child();
   mi_lock_init(&mi_subprocs_lock);
   for (mi_subproc_t* sp = mi_subprocs; sp != NULL; sp = sp->next) {
     mi_lock_init(&sp->arena_reserve_lock);
@@ -434,6 +435,7 @@ void _mi_process_fork_child(void) {
       mi_atomic_store_relaxed(&t->park_reclaim, (uint32_t)0);
       mi_atomic_store_relaxed(&t->park_swept, (uint32_t)0);
       t->holes_sweeping = false;   // a sweep that was running at the fork (by the scavenger, or by a thread that is gone) does not continue here
+      t->holes_sweep_deferred = false;
     }
     for (mi_heap_t* h = sp->heaps; h != NULL; h = h->next) {
       mi_lock_init(&h->theaps_lock);

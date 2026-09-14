@@ -246,13 +246,14 @@ terms of the MIT license. A copy of the license can be found in the file
 #error maximum object size may be too small to hold local thread data
 #endif
 
-// Hole purging: a bitmap of the OS pages inside a mimalloc page whose memory has been
-// discarded. It is indexed by OS page (not by block), so its size does not depend on the
-// size class: a page needs `page_size/os_page_size` bits (plus one for the partial OS page
-// that holds the page header). 256 bits covers every small (64 KiB) and medium (512 KiB)
-// page on every OS page size, and a large (4 MiB) page when the OS page is 16 KiB. A large
-// page on a 4 KiB OS page needs 1025 bits and stays ineligible -- the capacity check is at
-// runtime (see `mi_page_can_purge_holes` and the "Page hole purging" section in page.c).
+// Hole purging: a bitmap of the purge units inside a mimalloc page whose memory has been
+// discarded. It is indexed by unit (not by block), so its size does not depend on the size
+// class. The unit is the OS page wherever the block area of the page then fits the bitmap:
+// every small (64 KiB) and medium (512 KiB) page on every OS page size, and a large (4 MiB)
+// page when the OS page is 16 KiB or more. A page that needs more bits than that (a large page
+// on a 4 KiB OS page would need 1024) uses the smallest power-of-two multiple of the OS page
+// that fits: 16 KiB for that page (see `mi_page_purge_unit` and the "Page hole purging"
+// section in page.c).
 #define MI_PAGE_PURGE_BITS                (256)
 #define MI_PAGE_PURGE_WORDS               (MI_PAGE_PURGE_BITS / 64)
 
@@ -536,7 +537,9 @@ typedef struct mi_page_s {
   // The `(capacity,used)` the last hole sweep left this page in, packed as `(capacity<<32)|used`.
   // A sweep that finds it unchanged skips the page without walking its free list at all: nothing
   // was allocated or freed in it since, so the sweep has nothing new to discard (see
-  // `_mi_page_purge_holes`). `MI_PAGE_SWEPT_NONE` means "unknown". Cold, like `purged` above.
+  // `_mi_page_purge_holes`). `MI_PAGE_SWEPT_NONE` means "unknown". In a large page an allocation
+  // puts the epoch of the sweep here instead (bit 62 set, bit 63 clear; `mi_page_sweep_state_set_alloc`
+  // in page.c). Cold, like `purged` above.
   uint64_t                  swept_state;
 } mi_page_t;
 
@@ -806,6 +809,15 @@ typedef int64_t  mi_msecs_t;
 #define MI_PARK_PARKED    (1)
 #define MI_PARK_SWEEPING  (2)
 
+// How far the sweep of the current park is (`tld->park_swept`). A sweep leaves the free blocks of a large page that was
+// allocated from in the current epoch of the sweep or the one before (`_mi_page_purge_holes`); a park where that happened
+// is swept again `purge_holes_min_interval` later, which is when the epoch moves on, until the epoch is two on from the
+// first sweep of the park (`_mi_theap_sweep_parked`): `MI_PARK_SWEPT_SMALL + k` after sweep `k+1`, which is not the last.
+#define MI_PARK_SWEPT_NONE   (0)
+#define MI_PARK_SWEPT_DONE   (1)
+#define MI_PARK_SWEPT_SMALL  (2)   // but for large pages that were in use a moment ago: come back for those if the thread stays parked
+#define MI_PARK_SWEEPS_MAX   (6)   // sweeps of one park at the most (two or three unless a sweeper that moves the epoch is held up)
+
 struct mi_tld_s {
   mi_threadid_t         thread_id;            // thread id of this thread
   size_t                thread_seq;           // thread sequence id (linear count of created threads)
@@ -823,7 +835,7 @@ struct mi_tld_s {
   _Atomic(uint32_t)     park_state;           // MI_PARK_*: whether another thread may sweep our theaps right now
   _Atomic(uint32_t)     park_reclaim;         // set by the owner to get its theaps back; the sweep stops at the next page
   mi_theap_t*           park_theap0;          // default theap, captured at the park (the scavenger has no TLS to find it)
-  _Atomic(uint32_t)     park_swept;           // this park's sweep is done: don't claim it again until the thread re-parks
+  _Atomic(uint32_t)     park_swept;           // MI_PARK_SWEPT_*: how far this park's sweep is; back to 0 when the thread parks again
   mi_tld_t*             subproc_next;         // list of tlds in the subproc, so the scavenger can find parked threads
   size_t                holes_sweep_seq;      // idle sweeps run over THIS tld's heaps (paces `purge_holes_full_every`)
   mi_msecs_t            holes_sweep_last;     // when this tld's heaps were last swept (paces `purge_holes_min_interval`)
@@ -837,6 +849,9 @@ struct mi_tld_s {
   bool                  holes_sweep_full;     // this sweep ignores `page->swept_state` (see `_mi_page_purge_holes`)
   size_t                holes_sweep_skipped;  // per-sweep counters, folded into the process-wide ones in `_mi_page_purge_holes_end`
   size_t                holes_sweep_visited;
+  bool                  holes_sweep_deferred; // this sweep left the free blocks of a large page that was just in use (see `_mi_page_purge_holes`)
+  uint32_t              holes_sweep_epoch;    // the epoch of the sweep (`page.c`) when the current sweep began: its pages were compared with that one or a later one
+  uint32_t              holes_park_epoch;     // ..and that of the first sweep of the current park: what the thread left when it parked is from that epoch or an earlier one
 };
 
 

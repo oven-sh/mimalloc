@@ -205,7 +205,23 @@ mi_decl_export void mi_collect(bool force)      mi_attr_noexcept;
 // Owner-thread rules make each thread's own idle point the ONLY safe place to sweep
 // its heaps -- no other thread can do it for us. Safe on any thread; on a thread that
 // never allocated it is a no-op. purge_delay still applies to the arena drain.
+// The free blocks of a large page (blocks of 96 KiB and up) stay while the page is in use: a
+// thread parks more often than it is idle, and a busy one takes those buffers again at once.
+// "In use" is told without a clock on the allocating side: the sweep counts epochs, each
+// `purge_holes_min_interval` long at least, an allocation from a large page leaves the current
+// one in the page, and the free blocks go when that is two epochs ago. So they stay for good
+// in a page that is allocated from all the time, and go one to two intervals after the last
+// allocation where something sweeps that often. That holds for this call as well (it is made
+// from loops that are busy, too). A sweep ends one epoch at the most, so ONE call does not take
+// the free blocks of a large page that the thread allocated from since the sweep before it,
+// however long ago that was, and nothing comes back for what it leaves:
+// `mi_on_thread_idle_pending` is true then, and a caller that is about to block for good calls
+// this again while that is true, each time `purge_holes_min_interval` after the call before
+// RETURNED, and three more times at the most: two will do as a rule, and what is left after
+// those are pages that other threads are using, for which it can stay true as long as they
+// do. The `_start`/`_end` pair below does all of that by itself.
 mi_decl_export void mi_on_thread_idle(void)     mi_attr_noexcept;
+mi_decl_export bool mi_on_thread_idle_pending(void) mi_attr_noexcept;  // did the last sweep of this thread's heaps (its `mi_on_thread_idle`, or the scavenger's during a park) leave free blocks of a large page that was just in use? Not to be called between `_start` and `_end`.
 mi_decl_export bool mi_on_thread_idle_start(void) mi_attr_noexcept;  // about to block: hand the theaps to the scavenger. false = nothing handed off, no _end needed
 mi_decl_export void mi_on_thread_idle_end(void)   mi_attr_noexcept;  // awake again: take them back (pairs with a true from _start)
 mi_decl_export void mi_scavenger_stop(void)      mi_attr_noexcept;  // stop and join the background scavenger thread; a no-op if it is not running
@@ -221,8 +237,8 @@ typedef struct mi_purge_holes_stats_s {
   size_t discard_calls;       // discard syscalls (madvise/MEM_RESET)
   size_t reuse_calls;         // reuse syscalls made when handing a hole back
   size_t pages_freed;         // pages the sweep found completely free and gave back to the arena
-  // What hole punching cannot reach: the pages the sweep found ineligible (a huge page, a
-  // large page whose OS pages do not fit the bitmap, pinned memory, a custom-commit arena).
+  // What hole punching cannot reach: the pages the sweep found ineligible (a huge page,
+  // pinned memory, a custom-commit arena).
   // Gauges over the last idle sweep (`mi_on_thread_idle`), which resets them.
   size_t ineligible_pages;
   size_t ineligible_bytes;      // total size of those pages
@@ -599,7 +615,7 @@ typedef enum mi_option_e {
   mi_option_scavenger,                  // run a background scavenger thread that purges freed arena memory when due (=1)
   mi_option_purge_holes,                // discard the memory of free blocks inside a still-used page (=1)
   mi_option_purge_holes_eager_zero,     // zero a hole before discarding it, so that an over-discard destroys data even on an OS that reclaims lazily (=0; for testing -- always on when MI_DEBUG>1)
-  mi_option_purge_holes_min_interval,  // min milliseconds between idle sweeps of one thread's heaps (=100, 0=every park). See `_mi_theap_sweep_parked`.
+  mi_option_purge_holes_min_interval,  // min milliseconds between idle sweeps of one thread's heaps (=100, 0=every park). Also the least length of an epoch of the sweep: the free blocks of a large page stay until the page was not allocated from for a whole epoch, which is one to two intervals after the last allocation (0=they go at the next sweep). See `_mi_theap_sweep_parked`, `_mi_page_purge_holes`.
   mi_option_purge_holes_full_every,     // every N'th idle sweep walks every page instead of skipping the unchanged ones (=64, 0=never). See `_mi_page_purge_holes`.
   _mi_option_last,
   // legacy option names
