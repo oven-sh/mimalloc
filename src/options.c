@@ -188,13 +188,16 @@ static mi_option_desc_t mi_options[_mi_option_last] =
   { 0,   MI_OPTION_UNINIT, MI_OPTION(purge_holes_eager_zero) },   // zero a hole before discarding it (=0; for testing)
   { 100, MI_OPTION_UNINIT, MI_OPTION(purge_holes_min_interval) },  // min msecs between idle sweeps of one thread's heaps (=100); and the least length of an epoch of the sweep: the free blocks of a large page stay until a whole epoch passed without an allocation from it (that part holds for every sweep, also one that nothing rate-limits)
   { 64,  MI_OPTION_UNINIT, MI_OPTION(purge_holes_full_every) },   // every N'th sweep walks every page, not just the changed ones (=64, 0=never)
+  { 4096, MI_OPTION_UNINIT, MI_OPTION(purge_holes_large_floor) }, // KiB of large pages that idle sweeps leave alone, process-wide (=4 MiB, 0=none; in the environment a bare number is bytes: write 4MiB)
+  { 256, MI_OPTION_UNINIT, MI_OPTION(purge_holes_large_floor_epochs) }, // ..while their page was allocated from in the last so many epochs of the sweep (=256)
 };
 
 static void mi_option_init(mi_option_desc_t* desc);
 
 static bool mi_option_has_size_in_kib(mi_option_t option) {
   return (option == mi_option_reserve_os_memory || option == mi_option_arena_reserve ||
-          option == mi_option_minimal_purge_size || option == mi_option_arena_max_object_size);
+          option == mi_option_minimal_purge_size || option == mi_option_arena_max_object_size ||
+          option == mi_option_purge_holes_large_floor);
 }
 
 void _mi_options_init(void) {

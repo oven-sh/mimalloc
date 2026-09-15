@@ -132,7 +132,9 @@ static mi_decl_cache_align mi_tld_t mi_tld_detached = {
   NULL,                   // subproc_next
   0, 0,                   // holes_sweep_seq / _last
   false, false, 0, 0,     // holes_sweeping / _full / _skipped / _visited
-  false, 0, 0             // holes_sweep_deferred / holes_sweep_epoch / holes_park_epoch
+  false, 0, 0,            // holes_sweep_deferred / holes_sweep_epoch / holes_park_epoch
+  0,                      // holes_floor_kept
+  NULL                    // holes_floor_list
 };
 
 mi_decl_hidden mi_decl_cache_align const mi_theap_t _mi_theap_empty = {
@@ -316,6 +318,7 @@ static void mi_tld_register(mi_tld_t* tld) {
 static void mi_tld_unregister(mi_tld_t* tld) {
   if (tld == NULL) return;
   mi_assert_internal(mi_atomic_load_acquire(&tld->park_state) != MI_PARK_SWEEPING);
+  _mi_page_purge_holes_floor_release(tld);
   mi_subproc_t* const subproc = tld->subproc;
   mi_lock(&subproc->tlds_lock) {
     mi_tld_t** prev = &subproc->tlds;
