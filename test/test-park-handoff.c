@@ -569,6 +569,44 @@ static void test_exit_while_swept_with_dyn_tls(void) {
 }
 
 // ---------------------------------------------------------------------------
+// What a sweep leaves under `purge_holes_large_floor` goes when its page was not allocated from for a while. A thread
+// that stays parked is swept once more for that: nothing is kept in a program that has gone quiet.
+// ---------------------------------------------------------------------------
+static size_t purged_now(void) {
+  mi_purge_holes_stats_t h; mi_purge_holes_stats_get(&h); return h.purged_bytes;
+}
+
+static void test_park_floor_decays(void) {
+  enum { BLOCKS = 12, BLOCK = 300 * 1024 };
+  const long old_interval = mi_option_get(mi_option_purge_holes_min_interval);
+  const long old_floor = mi_option_get(mi_option_purge_holes_large_floor);
+  mi_option_set(mi_option_purge_holes_min_interval, 2);          // what stays under the floor goes 512 intervals later: a second
+  mi_option_set(mi_option_purge_holes_large_floor, 8 * 1024);    // KiB
+  void* p[BLOCKS];
+  for (int i = 0; i < BLOCKS; i++) { p[i] = mi_malloc(BLOCK); if (p[i] != NULL) memset(p[i], 5, BLOCK); }
+  size_t freed = 0;
+  for (int i = 0; i < BLOCKS; i++) { if ((i % 3) != 0 && p[i] != NULL) { mi_free(p[i]); p[i] = NULL; freed++; } }
+  const size_t before = purged_now();
+  const bool parked = mi_on_thread_idle_start();
+  if (parked) {
+    usleep(300 * 1000);   // the sweeps of the hold are over: the blocks are out of it and under the floor
+    const size_t held = purged_now();
+    size_t gone = held;
+    for (int i = 0; i < 4000 && gone < before + freed * (BLOCK - 16 * 1024); i++) { usleep(1000); gone = purged_now(); }
+    mi_on_thread_idle_end();
+    fprintf(stderr, "  %zu blocks of %d KiB freed in large pages: %zu KiB of them purged 300 ms into the park, %zu KiB in the end\n", freed, BLOCK / 1024, (held - before) / 1024, (gone - before) / 1024);
+    check("free blocks of large pages stay under the floor at first", held - before < 2 * (size_t)BLOCK);
+    check("a thread that stays parked ends with nothing kept under the floor", gone >= before + freed * (BLOCK - 16 * 1024));
+  }
+  else {
+    mi_on_thread_idle_end();
+  }
+  for (int i = 0; i < BLOCKS; i++) { if (p[i] != NULL) mi_free(p[i]); }
+  mi_option_set(mi_option_purge_holes_min_interval, old_interval);
+  mi_option_set(mi_option_purge_holes_large_floor, old_floor);
+}
+
+// ---------------------------------------------------------------------------
 // Stopping the scavenger joins the thread: a park after it has nobody to hand off to and reports
 // false, and the process stays fully usable. Runs last, since it takes the scavenger away.
 // ---------------------------------------------------------------------------
@@ -584,6 +622,7 @@ static void test_scavenger_stop(void) {
 
 int main(void) {
   test_lazy_start_and_signals();   // first: nothing may have started the scavenger yet
+  test_park_floor_decays();        // (before the others leave free blocks of their own to be purged)
   test_handoff_sweeps();
   test_survivors_intact();
   test_unbalanced();
