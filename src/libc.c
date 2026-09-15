@@ -155,6 +155,28 @@ mi_decl_noinline bool _mi_pthread_key_create(pthread_key_t* pkey, void (*destruc
   mi_assert_internal(pthread_getspecific(*pkey)==init);
   return true;
 }
+
+// For a key that is created when it is first set (`internal.h:mi_pthread_key_set`). Several threads can get here for
+// one key at once: the key of the thread local slots (`threadlocal.c`) is first set when a heap besides the main one
+// is first used, which a program can do on many threads at the same time. One key wins; a thread that stored its value
+// under a key of its own, which the next one replaced, would not find it again.
+mi_decl_noinline bool _mi_pthread_key_create_once(pthread_key_t* pkey, void* init) {
+  pthread_key_t key;
+  const int err = pthread_key_create(&key,NULL);
+  if mi_unlikely(err!=0) {
+    _mi_error_message(ENOMEM,"unable to allocate a thread local variable (error %d)\n", err);
+    return false;
+  }
+  mi_assert_internal(key != MI_PTHREAD_KEY_INVALID);
+  pthread_key_t expected = MI_PTHREAD_KEY_INVALID;
+  if (!mi_atomic_cas_strong_acq_rel((_Atomic(pthread_key_t)*)pkey, &expected, key)) {
+    pthread_key_delete(key);   // another thread was first
+    key = expected;
+  }
+  pthread_setspecific(key,init);
+  mi_assert_internal(pthread_getspecific(key)==init);
+  return true;
+}
 #endif
 
 // --------------------------------------------------------

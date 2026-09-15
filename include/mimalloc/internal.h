@@ -521,6 +521,7 @@ static inline void __mi_stat_counter_decrease(mi_stat_counter_t* stat, uint64_t 
 #endif
 
 mi_decl_noinline bool _mi_pthread_key_create(pthread_key_t* pkey, void (*destruct)(void*), void* init);
+mi_decl_noinline bool _mi_pthread_key_create_once(pthread_key_t* pkey, void* init);
 
 static inline void* mi_pthread_key_get(pthread_key_t key) {
   #if !MI_PTHREADS_GET_INVALID_KEY_IS_NULL
@@ -531,7 +532,7 @@ static inline void* mi_pthread_key_get(pthread_key_t key) {
 
 static inline bool mi_pthread_key_set(pthread_key_t* pkey, void* val) {
   if mi_likely(*pkey!=MI_PTHREAD_KEY_INVALID) { pthread_setspecific(*pkey,val); return true; }
-  else if (val!=NULL) { return _mi_pthread_key_create(pkey,NULL,val); }
+  else if (val!=NULL) { return _mi_pthread_key_create_once(pkey,val); }
   else return true;
 }
 
