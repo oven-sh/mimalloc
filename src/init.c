@@ -133,7 +133,8 @@ static mi_decl_cache_align mi_tld_t mi_tld_detached = {
   0, 0,                   // holes_sweep_seq / _last
   false, false, 0, 0,     // holes_sweeping / _full / _skipped / _visited
   false, 0, 0,            // holes_sweep_deferred / holes_sweep_epoch / holes_park_epoch
-  0                       // holes_floor_kept
+  0,                      // holes_floor_kept
+  0, 0, NULL              // holes_sweep_ticks / holes_floor_due / holes_floor_list
 };
 
 mi_decl_hidden mi_decl_cache_align const mi_theap_t _mi_theap_empty = {

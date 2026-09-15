@@ -1063,6 +1063,19 @@ void          _mi_page_purge_holes_end(mi_tld_t* tld);
 void          _mi_page_purge_holes_sweep_begin(mi_tld_t* tld);   // once per idle sweep, before its passes
 void          _mi_page_purge_holes_forked_child(void);
 void          _mi_page_purge_holes_floor_release(mi_tld_t* tld);  // a tld that goes away gives its share of `purge_holes_large_floor` back
+void          _mi_page_purge_holes_floor_resolve(mi_tld_t* tld);  // once per idle sweep, after the pages of the thread's own theaps: which of them stay under the floor
+mi_msecs_t    _mi_page_purge_holes_floor_decay(void);             // how long free blocks stay under the floor after their page was last allocated from
+#define MI_HOLES_FLOOR_LIST_MAX   (64)
+#define MI_HOLES_FLOOR_DUE_SLACK  (256)   // msecs on top of the decay, so that the sweep that comes back finds the last of it old enough
+typedef struct mi_holes_floor_item_s {
+  mi_page_t* page;
+  uint64_t   recency;   // `(ticks << 32) | epoch of the allocation`: larger is more recent
+  size_t     bytes;
+} mi_holes_floor_item_t;
+typedef struct mi_holes_floor_list_s {
+  size_t count;
+  mi_holes_floor_item_t items[MI_HOLES_FLOOR_LIST_MAX];
+} mi_holes_floor_list_t;
 size_t        _mi_page_purge_holes_floor_kept(void);             // (for `test-purge-holes-large.c`)
 void          _mi_page_purge_holes_epoch_advance(void);          // ..by this, which every idle sweep begins with
 uint32_t      _mi_page_purge_holes_epoch(void);                  // the epoch of the sweep: moved on by an idle sweep, once in `purge_holes_min_interval` at the most (`page.c`)
