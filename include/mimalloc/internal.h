@@ -1064,6 +1064,7 @@ void          _mi_page_purge_holes_sweep_begin(mi_tld_t* tld);   // once per idl
 void          _mi_page_purge_holes_forked_child(void);
 void          _mi_page_purge_holes_floor_release(mi_tld_t* tld);  // a tld that goes away gives its share of `purge_holes_large_floor` back
 void          _mi_page_purge_holes_floor_resolve(mi_tld_t* tld);  // once per idle sweep, after the pages of the thread's own theaps: which of them stay under the floor
+bool          _mi_page_purge_holes_free_page_stays(mi_page_t* page, mi_tld_t* tld, bool in_sweep);   // a large page with no block in use: is it left as it is for now?
 mi_msecs_t    _mi_page_purge_holes_floor_decay(void);             // how long free blocks stay under the floor after their page was last allocated from
 #define MI_HOLES_FLOOR_LIST_MAX   (64)
 #define MI_HOLES_FLOOR_DUE_SLACK  (256)   // msecs on top of the decay, so that the sweep that comes back finds the last of it old enough

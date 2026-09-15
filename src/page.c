@@ -1198,6 +1198,28 @@ static bool mi_page_holes_floor_keep(mi_page_t* page, mi_tld_t* tld) {
   return true;
 }
 
+// A large page all of whose blocks are free (the sweep found it so after it collected what other threads freed) is
+// what its free blocks are: the buffers of a thread that takes them again at its next request. It stays as the free
+// blocks of a page with a block in use would: while it was allocated from in this epoch or the one before, and then
+// under the floor while that lasts. Else the caller frees it, as it did every such page before.
+// Also asked by a collect that is not forced and when the last block of a page is freed (`in_sweep` false): those
+// leave the page to the sweep if it may stay, and only for a thread that is swept at all.
+bool _mi_page_purge_holes_free_page_stays(mi_page_t* page, mi_tld_t* tld, bool in_sweep) {
+  if (mi_page_block_size(page) <= MI_MEDIUM_MAX_OBJ_SIZE || page->reserved <= 1) return false;
+  if (!mi_option_is_enabled(mi_option_purge_holes) || mi_option_get(mi_option_purge_delay) < 0) return false;
+  if (tld == NULL || !mi_page_holes_madvisable(page)) return false;
+  uint32_t stamp;
+  if (!in_sweep) {
+    if (tld->holes_sweep_seq == 0) return false;   // nothing sweeps this thread
+    return (mi_page_sweep_state_is_alloc(page, &stamp) || mi_page_sweep_state_is_kept(page, &stamp));   // the next sweep decides
+  }
+  if (mi_page_sweep_state_is_alloc(page, &stamp) && mi_page_sweep_state_alloc_age(stamp) < 2 && mi_option_get(mi_option_purge_holes_min_interval) > 0) {
+    tld->holes_sweep_deferred = true;
+    return true;
+  }
+  return mi_page_holes_floor_keep(page, tld);
+}
+
 // The end of the pass over the thread's own pages: the most recently used first, while they fit.
 void _mi_page_purge_holes_floor_resolve(mi_tld_t* tld) {
   mi_holes_floor_list_t* const list = tld->holes_floor_list;
@@ -1213,6 +1235,7 @@ void _mi_page_purge_holes_floor_resolve(mi_tld_t* tld) {
   for (size_t i = 0; i < list->count; i++) {
     mi_holes_floor_item_t* const item = &list->items[i];
     if (mi_holes_floor_take(tld, item->bytes)) { mi_page_holes_floor_stays(item->page, item->recency); }
+    else if (mi_page_all_free(item->page)) { _mi_page_holes_count_page_freed(); _mi_page_free(item->page, mi_page_queue_of(item->page)); }   // (see `_mi_page_purge_holes_free_page_stays`)
     else { mi_page_purge_holes_now(item->page, tld); }
   }
 }
@@ -1925,6 +1948,11 @@ void _mi_page_retire(mi_page_t* page) mi_attr_noexcept {
   // how to check this efficiently though...
   // for now, we don't retire if it is the only page left of this size class.
   mi_page_queue_t* pq = mi_page_queue_of(page);
+  // a large page that was just allocated from is for the idle sweep to free (`_mi_page_purge_holes_free_page_stays`)
+  if (mi_page_block_size(page) > MI_MEDIUM_MAX_OBJ_SIZE && !mi_page_queue_is_special(pq)) {
+    mi_theap_t* const rtheap = mi_page_theap(page);
+    if (rtheap != NULL && _mi_page_purge_holes_free_page_stays(page, rtheap->tld, false)) return;
+  }
   #if MI_RETIRE_CYCLES > 0
   const size_t bsize = mi_page_block_size(page);
   if mi_likely( pq->count <= MI_RETIRE_MAX_PAGES && !mi_page_queue_is_special(pq)) {  // not full or huge queue?
