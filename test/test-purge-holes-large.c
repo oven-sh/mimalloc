@@ -1011,6 +1011,306 @@ static bool test_concurrent_sweepers(void) {
 
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// the floor: the first `purge_holes_large_floor` bytes of free blocks in large pages stay, the rest goes
+// ---------------------------------------------------------------------------
+
+static void*  fl_ptrs[MAXB];
+static void*  fl_freed[MAXB];
+static size_t fl_usable;
+
+static size_t fl_count_purged(size_t n, size_t bsize) {
+  size_t npurged = 0;
+  for (size_t i = 0; i < n; i++) {
+    if (fl_freed[i] == NULL) continue;
+    const mi_page_t* const page = freed_block_page(fl_freed[i], bsize);
+    if (page != NULL && mi_page_block_is_purged(page, fl_freed[i])) { npurged++; }
+  }
+  return npurged;
+}
+
+// sweeps an interval apart until the pages that were allocated from before the first of them are out of the hold
+static void fd_sweeps_past_the_hold(long interval_ms) {
+  for (int i = 0; i < 4; i++) { sweep(); sleep_ms((unsigned)interval_ms + 3); }
+  sweep();
+}
+
+#define FL_INTERVAL_MS  (2)
+
+static bool fl_worker(void) {
+  // takes all of the floor on a thread that goes away: its share is to come back
+  void* p[24];
+  const size_t size = large_size(1);
+  for (size_t i = 0; i < 24; i++) { p[i] = mi_malloc(size); if (p[i] == NULL) return false; memset(p[i], 1, size); }
+  for (size_t i = 0; i < 24; i++) { if ((i % 3) != 0) { mi_free(p[i]); p[i] = NULL; } }
+  fd_sweeps_past_the_hold(FL_INTERVAL_MS);
+  const bool took = (_mi_page_purge_holes_floor_kept() > 0);
+  for (size_t i = 0; i < 24; i++) { mi_free(p[i]); }
+  return took;
+}
+
+static size_t fl_kept_expected;
+
+static bool fl_second_sweeper(void) {
+  // another thread sweeps the same heap: the abandoned pages that the first one counts are not counted again
+  void* q = mi_malloc(64);
+  fd_sweeps_past_the_hold(FL_INTERVAL_MS);
+  const bool same = (_mi_page_purge_holes_floor_kept() == fl_kept_expected);
+  if (!same) { fprintf(stderr, "\n  %zu bytes are counted under the floor after another thread swept the heap, %zu before\n", _mi_page_purge_holes_floor_kept(), fl_kept_expected); }
+  mi_free(q);
+  return same;
+}
+
+static bool test_floor(void) {
+  if (!purging_enabled) return true;
+  bool ok_all = true;
+  const size_t size = large_size(1);
+  const size_t n = 60;
+  memset(fl_ptrs, 0, sizeof(fl_ptrs)); memset(fl_freed, 0, sizeof(fl_freed));
+  if (!alloc_filled(fl_ptrs, n, size, &fl_usable)) { free_all(fl_ptrs, n); return false; }
+  if (!is_large_page(_mi_ptr_page(fl_ptrs[0]))) { fprintf(stderr, "(not in a large page here) "); free_all(fl_ptrs, n); return true; }
+  const size_t bsize = _mi_ptr_page(fl_ptrs[0])->block_size;
+  size_t nfreed = 0;
+  for (size_t i = 0; i < n; i++) {
+    if ((i % 3) != 0) { fl_freed[i] = fl_ptrs[i]; mi_free(fl_ptrs[i]); fl_ptrs[i] = NULL; nfreed++; }
+  }
+  // a quarter of what is freed, whatever a large page and its blocks are here (4 MiB and 320 KiB, or 1 MiB and 80 KiB):
+  // more than the free blocks of one page and less than all of them
+  const size_t floor = _mi_align_up((nfreed * bsize) / 4, MI_KiB);
+  if (nfreed * bsize <= 2 * floor) { fprintf(stderr, "\n  the case frees too little: %zu bytes\n", nfreed * bsize); ok_all = false; }
+
+  // (there is a floor only where there is an epoch to count in: an interval, and then the hold comes first)
+  const long old_interval = mi_option_get(mi_option_purge_holes_min_interval);
+  mi_option_set(mi_option_purge_holes_min_interval, FL_INTERVAL_MS);
+  mi_option_set(mi_option_purge_holes_large_floor, (long)(floor / MI_KiB));
+  fd_sweeps_past_the_hold(FL_INTERVAL_MS);
+  const size_t kept1 = _mi_page_purge_holes_floor_kept();
+  const size_t purged1 = fl_count_purged(n, bsize);
+  if (kept1 == 0 || kept1 > floor) {
+    fprintf(stderr, "\n  %zu bytes are kept under a floor of %zu\n", kept1, floor);
+    ok_all = false;
+  }
+  if (purged1 == 0 || purged1 == nfreed || (nfreed - purged1) * bsize > floor) {
+    fprintf(stderr, "\n  %zu of %zu free blocks of %zu bytes are purged with a floor of %zu\n", purged1, nfreed, bsize, floor);
+    ok_all = false;
+  }
+  // the same again: what stayed is decided anew and comes out the same, nothing adds up
+  sweep();
+  const size_t kept2 = _mi_page_purge_holes_floor_kept();
+  const size_t purged2 = fl_count_purged(n, bsize);
+  if (kept2 != kept1 || purged2 != purged1) {
+    fprintf(stderr, "\n  a second sweep: %zu bytes kept and %zu blocks purged, %zu and %zu after the first\n", kept2, purged2, kept1, purged1);
+    ok_all = false;
+  }
+  if (!survivors_intact(fl_ptrs, n, fl_usable, "floor")) { ok_all = false; }
+  fl_kept_expected = kept2;
+  if (!mi_run_on_thread(&fl_second_sweeper)) { ok_all = false; }
+  if (fl_count_purged(n, bsize) != purged1) { fprintf(stderr, "\n  %zu blocks are purged after another thread swept the heap, %zu before\n", fl_count_purged(n, bsize), purged1); ok_all = false; }
+
+  // without the floor the rest goes as well
+  mi_option_set(mi_option_purge_holes_large_floor, 0);
+  sweep();
+  const size_t kept3 = _mi_page_purge_holes_floor_kept();
+  const size_t purged3 = fl_count_purged(n, bsize);
+  if (kept3 != 0 || purged3 <= purged1) {
+    fprintf(stderr, "\n  no floor: %zu bytes kept, %zu blocks purged (%zu with the floor)\n", kept3, purged3, purged1);
+    ok_all = false;
+  }
+  if (!survivors_intact(fl_ptrs, n, fl_usable, "floor, none")) { ok_all = false; }
+
+  // a thread that ends gives its share back
+  mi_option_set(mi_option_purge_holes_large_floor, (long)(floor / MI_KiB));
+  if (!mi_run_on_thread(&fl_worker)) { fprintf(stderr, "\n  the other thread kept nothing under the floor\n"); ok_all = false; }
+  if (_mi_page_purge_holes_floor_kept() != 0) {
+    fprintf(stderr, "\n  %zu bytes are still counted under the floor after the thread that kept them ended\n", _mi_page_purge_holes_floor_kept());
+    ok_all = false;
+  }
+  mi_option_set(mi_option_purge_holes_large_floor, 0);
+  mi_option_set(mi_option_purge_holes_min_interval, old_interval);
+  fprintf(stderr, "(%zu of %zu free blocks of %zu bytes purged under a floor of %zu KiB, %zu KiB kept; %zu without) ",
+          purged1, nfreed, bsize, floor / MI_KiB, kept1 / MI_KiB, purged3);
+  free_all(fl_ptrs, n);
+  mi_collect(true);
+  return ok_all;
+}
+
+// ---------------------------------------------------------------------------
+// what stays under the floor goes when its page was not allocated from for a while, and it is the pages that were
+// used last that stay
+// ---------------------------------------------------------------------------
+
+static void*  fd_ptrs[2][MAXB];
+static void*  fd_freed[2][MAXB];
+static size_t fd_usable[2];
+
+static size_t fd_count_purged(int g, size_t n, size_t bsize) {
+  size_t npurged = 0;
+  for (size_t i = 0; i < n; i++) {
+    if (fd_freed[g][i] == NULL) continue;
+    const mi_page_t* const page = freed_block_page(fd_freed[g][i], bsize);
+    if (page != NULL && mi_page_block_is_purged(page, fd_freed[g][i])) { npurged++; }
+  }
+  return npurged;
+}
+
+static size_t fd_fill(int g, size_t n, size_t size, size_t* bsize) {   // two of three blocks freed; returns how many
+  if (!alloc_filled(fd_ptrs[g], n, size, &fd_usable[g])) return 0;
+  *bsize = _mi_ptr_page(fd_ptrs[g][0])->block_size;
+  size_t nfreed = 0;
+  for (size_t i = 0; i < n; i++) {
+    if ((i % 3) != 0) { fd_freed[g][i] = fd_ptrs[g][i]; mi_free(fd_ptrs[g][i]); fd_ptrs[g][i] = NULL; nfreed++; }
+  }
+  return nfreed;
+}
+
+static bool test_floor_decay(void) {
+  if (!purging_enabled) return true;
+  bool ok_all = true;
+  const long interval_ms = 2;
+  const long old_interval = mi_option_get(mi_option_purge_holes_min_interval);
+  memset(fd_ptrs, 0, sizeof(fd_ptrs)); memset(fd_freed, 0, sizeof(fd_freed));
+  mi_option_set(mi_option_purge_holes_min_interval, interval_ms);
+  const long old_epochs = mi_option_get(mi_option_purge_holes_large_floor_epochs);
+  const long epochs = 64;
+  mi_option_set(mi_option_purge_holes_large_floor_epochs, epochs);
+  const size_t n = 24;
+  size_t bsize0 = 0, bsize1 = 0;
+  const size_t nfreed0 = fd_fill(0, n, large_size(1), &bsize0);
+  if (nfreed0 == 0) { mi_option_set(mi_option_purge_holes_min_interval, old_interval); mi_option_set(mi_option_purge_holes_large_floor_epochs, old_epochs); return false; }
+  if (!is_large_page(_mi_ptr_page(fd_ptrs[0][0]))) { fprintf(stderr, "(not in a large page here) "); free_all(fd_ptrs[0], n); mi_option_set(mi_option_purge_holes_min_interval, old_interval); mi_option_set(mi_option_purge_holes_large_floor_epochs, old_epochs); return true; }
+  // room for all of the first group, and not for both
+  const size_t floor = _mi_align_up(nfreed0 * bsize0 + bsize0, MI_KiB);
+  mi_option_set(mi_option_purge_holes_large_floor, (long)(floor / MI_KiB));
+
+  // 1. out of the hold, the free blocks stay under the floor, sweep after sweep
+  fd_sweeps_past_the_hold(interval_ms);
+  const size_t kept1 = _mi_page_purge_holes_floor_kept();
+  const size_t purged1 = fd_count_purged(0, n, bsize0);
+  sweep();
+  const size_t kept1b = _mi_page_purge_holes_floor_kept();
+  if (kept1 != nfreed0 * bsize0 || purged1 != 0 || kept1b != kept1) {
+    fprintf(stderr, "\n  after the hold %zu bytes are kept (%zu at the next sweep) and %zu blocks purged: %zu free blocks of %zu bytes under a floor of %zu\n", kept1, kept1b, purged1, nfreed0, bsize0, floor);
+    ok_all = false;
+  }
+
+  // 2. pages that are used later take the floor from the ones that were used before
+  const size_t nfreed1 = fd_fill(1, n, large_size(0), &bsize1);
+  if (nfreed1 == 0 || nfreed1 * bsize1 > floor || (nfreed0 * bsize0) + (nfreed1 * bsize1) <= floor) {
+    fprintf(stderr, "\n  the second group does not fit the case: %zu blocks of %zu bytes\n", nfreed1, bsize1);
+    ok_all = false;
+  }
+  fd_sweeps_past_the_hold(interval_ms);
+  const size_t purged2_old = fd_count_purged(0, n, bsize0);
+  const size_t purged2_new = fd_count_purged(1, n, bsize1);
+  if (purged2_new != 0 || purged2_old == 0) {
+    fprintf(stderr, "\n  with both groups out of the hold: %zu of %zu blocks of the pages that were used last are purged, %zu of %zu of the ones before\n", purged2_new, nfreed1, purged2_old, nfreed0);
+    ok_all = false;
+  }
+
+  // 3. time alone takes nothing: only the epochs of the sweep count, and only a sweep moves them
+  const uint32_t epoch3 = _mi_page_purge_holes_epoch();
+  const size_t kept2 = _mi_page_purge_holes_floor_kept();
+  sleep_ms((unsigned)(epochs * interval_ms) + 100);
+  const size_t kept3a = _mi_page_purge_holes_floor_kept();
+  if (kept2 < nfreed1 * bsize1 || kept3a != kept2 || _mi_page_purge_holes_epoch() != epoch3 || fd_count_purged(1, n, bsize1) != 0 || fd_count_purged(0, n, bsize0) != purged2_old) {
+    fprintf(stderr, "\n  with nothing swept for %ld ms: %zu bytes kept (%zu before), epoch %u (%u before)\n", epochs * interval_ms + 100, kept3a, kept2, _mi_page_purge_holes_epoch(), epoch3);
+    ok_all = false;
+  }
+  // ..and nothing stays once the pages were not allocated from for that many epochs
+  for (long i = 0; i < epochs + 8; i++) { sweep(); sleep_ms((unsigned)interval_ms + 1); }
+  sweep();
+  const size_t kept3 = _mi_page_purge_holes_floor_kept();
+  const size_t purged3 = fd_count_purged(0, n, bsize0) + fd_count_purged(1, n, bsize1);
+  if (kept3 != 0 || purged3 != nfreed0 + nfreed1) {
+    fprintf(stderr, "\n  %u epochs after the last allocation %zu bytes are still kept, %zu of %zu free blocks purged\n", _mi_page_purge_holes_epoch() - epoch3, kept3, purged3, nfreed0 + nfreed1);
+    ok_all = false;
+  }
+  if (!survivors_intact(fd_ptrs[0], n, fd_usable[0], "floor decay, first group")) { ok_all = false; }
+  if (!survivors_intact(fd_ptrs[1], n, fd_usable[1], "floor decay, second group")) { ok_all = false; }
+  fprintf(stderr, "(%zu KiB kept after the hold; then %zu of %zu blocks of the older pages purged and %zu of %zu of the newer; nothing kept %ld epochs later) ",
+          kept1 / MI_KiB, purged2_old, nfreed0, purged2_new, nfreed1, epochs);
+  mi_option_set(mi_option_purge_holes_large_floor_epochs, old_epochs);
+  mi_option_set(mi_option_purge_holes_large_floor, 0);
+  mi_option_set(mi_option_purge_holes_min_interval, old_interval);
+  free_all(fd_ptrs[0], n); free_all(fd_ptrs[1], n);
+  mi_collect(true);
+  return ok_all;
+}
+
+// ---------------------------------------------------------------------------
+// a large page with no block in use stays by the same rule; and there is no floor without an interval to count in
+// ---------------------------------------------------------------------------
+static size_t pages_freed_by_sweeps(void) {
+  mi_purge_holes_stats_t s; mi_purge_holes_stats_get(&s); return s.pages_freed;
+}
+
+static bool test_floor_free_page(void) {
+  if (!purging_enabled) return true;
+  bool ok_all = true;
+  const long interval_ms = 2;
+  const long epochs = 32;
+  const long old_interval = mi_option_get(mi_option_purge_holes_min_interval);
+  const long old_epochs = mi_option_get(mi_option_purge_holes_large_floor_epochs);
+  mi_option_set(mi_option_purge_holes_min_interval, interval_ms);
+  mi_option_set(mi_option_purge_holes_large_floor_epochs, epochs);
+  mi_option_set(mi_option_purge_holes_large_floor, 8 * 1024);
+  sweep();   // (this thread is one that is swept)
+  const size_t size = (MI_LARGE_MAX_OBJ_SIZE / 2) + (MI_LARGE_MAX_OBJ_SIZE / 8);   // a size class of its own in this test
+  void* p[3];
+  size_t usable = 0;
+  if (!alloc_filled(p, 3, size, &usable)) { free_all(p, 3); mi_option_set(mi_option_purge_holes_large_floor, 0); mi_option_set(mi_option_purge_holes_large_floor_epochs, old_epochs); mi_option_set(mi_option_purge_holes_min_interval, old_interval); return false; }
+  const mi_page_t* const page = _mi_ptr_page(p[0]);
+  if (!is_large_page(page) || _mi_ptr_page(p[1]) != page || _mi_ptr_page(p[2]) != page) {
+    fprintf(stderr, "(the blocks are not in one large page here) ");
+    free_all(p, 3);
+  }
+  else {
+    const size_t freed0 = pages_freed_by_sweeps();
+    free_all(p, 3);   // the last block of the page is freed: it waits for the sweep
+    fd_sweeps_past_the_hold(interval_ms);
+    const size_t kept1 = _mi_page_purge_holes_floor_kept();
+    void* const q = mi_malloc(size);   // and the next allocation of that size takes it
+    const bool same = (q != NULL && _mi_ptr_page(q) == page);
+    if (kept1 == 0 || pages_freed_by_sweeps() != freed0 || !same) {
+      fprintf(stderr, "\n  out of the hold: %zu bytes kept, %zu pages freed by the sweeps, the next block %s from that page\n", kept1, pages_freed_by_sweeps() - freed0, (same ? "is" : "is not"));
+      ok_all = false;
+    }
+    mi_free(q);
+    // ..until it was not allocated from for that many epochs
+    for (long i = 0; i < epochs + 8; i++) { sweep(); sleep_ms((unsigned)interval_ms + 1); }
+    sweep();
+    const size_t kept2 = _mi_page_purge_holes_floor_kept();
+    if (kept2 != 0 || pages_freed_by_sweeps() == freed0) {
+      fprintf(stderr, "\n  %ld epochs later: %zu bytes kept, %zu pages freed by the sweeps\n", epochs + 8, kept2, pages_freed_by_sweeps() - freed0);
+      ok_all = false;
+    }
+    fprintf(stderr, "(%zu KiB of a page with no block in use kept, and taken again; freed %ld epochs later) ", kept1 / MI_KiB, epochs + 8);
+  }
+
+  // no interval, no epochs: no floor. Free blocks go at the next sweep, as `purge_holes_min_interval` 0 says.
+  mi_option_set(mi_option_purge_holes_min_interval, 0);
+  void* r[6];
+  if (!alloc_filled(r, 6, size, &usable)) { free_all(r, 6); mi_option_set(mi_option_purge_holes_large_floor, 0); mi_option_set(mi_option_purge_holes_large_floor_epochs, old_epochs); mi_option_set(mi_option_purge_holes_min_interval, old_interval); return false; }
+  {
+  const size_t bsize = _mi_ptr_page(r[0])->block_size;
+  const int64_t before = hole_stats().bytes_now;
+  for (size_t i = 1; i < 5; i++) { mi_free(r[i]); r[i] = NULL; }
+  sweep();
+  const int64_t gone = hole_stats().bytes_now - before;
+  if (_mi_page_purge_holes_floor_kept() != 0 || gone < (int64_t)(4 * (bsize - 2 * _mi_os_page_size()))) {
+    fprintf(stderr, "\n  without an interval: %zu bytes kept, %lld bytes of 4 free blocks of %zu discarded by one sweep\n", _mi_page_purge_holes_floor_kept(), (long long)gone, bsize);
+    ok_all = false;
+  }
+  if (!survivors_intact(r, 6, usable, "floor, no interval")) { ok_all = false; }
+  free_all(r, 6);
+  }
+  mi_option_set(mi_option_purge_holes_large_floor, 0);
+  mi_option_set(mi_option_purge_holes_large_floor_epochs, old_epochs);
+  mi_option_set(mi_option_purge_holes_min_interval, old_interval);
+  mi_collect(true);
+  return ok_all;
+}
+
 int main(void) {
   mi_version();
   purging_enabled = mi_option_is_enabled(mi_option_purge_holes);
@@ -1018,6 +1318,8 @@ int main(void) {
   mi_option_set(mi_option_purge_holes_eager_zero, 1);
   // no waiting for the free blocks of a large page (the cases that are about that set their own interval)
   mi_option_set(mi_option_purge_holes_min_interval, 0);
+  // and nothing stays under the floor (`test_floor` sets its own)
+  mi_option_set(mi_option_purge_holes_large_floor, 0);
   fprintf(stderr, "purge_holes is %s, os page size is %zu, large pages are %zu KiB for blocks over %zu up to %zu bytes\n",
           (purging_enabled ? "ON" : "OFF"), (size_t)_mi_os_page_size(), (size_t)(MI_LARGE_PAGE_SIZE / MI_KiB),
           (size_t)MI_MEDIUM_MAX_OBJ_SIZE, (size_t)MI_LARGE_MAX_OBJ_SIZE);
@@ -1039,6 +1341,9 @@ int main(void) {
   CHECK("recent-allocation", test_recent_allocation());
   CHECK("abandoned-young", test_abandoned_young());
   CHECK("sweepers-at-the-same-time", test_concurrent_sweepers());
+  CHECK("floor", test_floor());
+  CHECK("floor-decay", test_floor_decay());
+  CHECK("floor-free-page", test_floor_free_page());
 
   // everything above is freed by now, so every hole must have been handed back
   mi_collect(true);
