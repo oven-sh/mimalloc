@@ -180,9 +180,11 @@ static void mi_holes_floor_release(mi_tld_t* tld) {
 
 // A thread that goes away gives its share back (`mi_tld_unregister`).
 void _mi_page_purge_holes_floor_release(mi_tld_t* tld) {
-  if (tld == NULL || mi_atomic_load_relaxed(&tld->holes_floor_kept) == 0) return;
+  if (tld == NULL || tld->holes_sweep_seq == 0) return;   // never swept: no share, and no page says that this thread counts it
   mi_holes_floor_release(tld);
-  mi_atomic_increment_relaxed(&mi_holes_keepers_gone);   // (see `MI_PAGE_SWEPT_KEPT`)
+  // (see `MI_PAGE_SWEPT_KEPT`. Also without a share right now: a sweep that its owner cut short after it gave the share
+  //  back has not counted its abandoned pages again, and they still say that this thread does.)
+  mi_atomic_increment_relaxed(&mi_holes_keepers_gone);
 }
 
 size_t _mi_page_purge_holes_floor_kept(void) {
