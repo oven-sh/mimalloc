@@ -1712,6 +1712,7 @@ int main(void) {
   // No waiting here for the free blocks of a large page, which stay for `purge_holes_min_interval` after the last allocation
   // from it (`test-purge-holes-large.c` is about that): on a 32-bit target the 64 KiB blocks below are in one.
   mi_option_set(mi_option_purge_holes_min_interval, 0);
+  mi_option_set(mi_option_purge_holes_large_floor, 0);   // and none of them stay under the floor (`test-purge-holes-large.c` has the case for that)
   fprintf(stderr, "purge_holes is %s, os page size is %zu\n",
           (purging_enabled ? "ON" : "OFF"), (size_t)_mi_os_page_size());
 

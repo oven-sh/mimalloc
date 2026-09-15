@@ -617,6 +617,7 @@ typedef enum mi_option_e {
   mi_option_purge_holes_eager_zero,     // zero a hole before discarding it, so that an over-discard destroys data even on an OS that reclaims lazily (=0; for testing -- always on when MI_DEBUG>1)
   mi_option_purge_holes_min_interval,  // min milliseconds between idle sweeps of one thread's heaps (=100, 0=every park). Also the least length of an epoch of the sweep: the free blocks of a large page stay until the page was not allocated from for a whole epoch, which is one to two intervals after the last allocation (0=they go at the next sweep). See `_mi_theap_sweep_parked`, `_mi_page_purge_holes`.
   mi_option_purge_holes_full_every,     // every N'th idle sweep walks every page instead of skipping the unchanged ones (=64, 0=never). See `_mi_page_purge_holes`.
+  mi_option_purge_holes_large_floor,    // KiB of free blocks in large pages that the idle sweeps of all threads together leave resident (=8192, 0=none). See `_mi_page_purge_holes`.
   _mi_option_last,
   // legacy option names
   mi_option_large_os_pages = mi_option_allow_large_os_pages,

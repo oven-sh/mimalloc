@@ -143,8 +143,35 @@ uint32_t _mi_page_purge_holes_epoch(void) {
   return (uint32_t)mi_atomic_load_acquire(&mi_holes_epoch);
 }
 
+// Bytes that the last sweeps of all threads left under `purge_holes_large_floor` (`_mi_page_purge_holes`). A tld gives
+// its share (`holes_floor_kept`) back when its next sweep begins or when it goes away; stale only on the high side.
+static _Atomic(size_t) mi_holes_floor_kept;
+
+void _mi_page_purge_holes_floor_release(mi_tld_t* tld) {
+  if (tld == NULL || tld->holes_floor_kept == 0) return;
+  mi_atomic_sub_relaxed(&mi_holes_floor_kept, tld->holes_floor_kept);
+  tld->holes_floor_kept = 0;
+}
+
+size_t _mi_page_purge_holes_floor_kept(void) {
+  return mi_atomic_load_relaxed(&mi_holes_floor_kept);
+}
+
+static bool mi_holes_floor_take(mi_tld_t* tld, size_t bytes) {
+  const size_t floor = mi_option_get_size(mi_option_purge_holes_large_floor);
+  if (bytes == 0 || bytes > floor) return false;
+  const size_t before = mi_atomic_add_relaxed(&mi_holes_floor_kept, bytes);
+  if (before > floor - bytes) {
+    mi_atomic_sub_relaxed(&mi_holes_floor_kept, bytes);
+    return false;
+  }
+  tld->holes_floor_kept += bytes;
+  return true;
+}
+
 // A `fork` can land between the two stores above, in a thread that is not there in the child.
 void _mi_page_purge_holes_forked_child(void) {
+  mi_atomic_store_relaxed(&mi_holes_floor_kept, (size_t)0);   // the shares are zeroed with the tlds (`subproc.c`)
   if (mi_atomic_loadi64_relaxed(&mi_holes_epoch_start) == MI_HOLES_EPOCH_MOVING) {
     mi_atomic_storei64_release(&mi_holes_epoch_start, (int64_t)_mi_clock_now());
   }
@@ -817,6 +844,7 @@ void _mi_page_purge_holes_sweep_begin(mi_tld_t* tld) {
   const size_t seq = ++tld->holes_sweep_seq;
   tld->holes_sweep_full = (every > 0 && (seq % (size_t)every) == 0);
   if (tld->holes_sweep_full) { mi_atomic_addi64_relaxed(&mi_holes_full_sweeps, 1); }
+  _mi_page_purge_holes_floor_release(tld);   // this sweep decides again what stays under the floor
   tld->holes_sweep_epoch = _mi_page_purge_holes_epoch();   // the sweep owns the time that large pages are held by (see `_mi_page_purge_holes`): no page of this sweep is compared with an older epoch than this
 }
 
@@ -1091,6 +1119,15 @@ static bool mi_page_purge_holes_walk(mi_page_t* page, mi_tld_t* tld) {
   return complete;
 }
 
+// What a sweep could give back of a large page: its free list (some forty blocks at the most) and its unformed tail.
+static size_t mi_page_large_resident_free(const mi_page_t* page) {
+  size_t nfree = 0;
+  for (mi_block_t* b = page->free; b != NULL; b = mi_block_next(page, b)) { nfree++; }
+  uintptr_t lo, dlo, hi;
+  const size_t tail = (mi_page_unformed_tail_todo(page, &lo, &dlo, &hi) ? (size_t)(hi - dlo) : 0);
+  return (nfree * mi_page_block_size(page)) + tail;
+}
+
 // Discard the memory of the free blocks in a still-used page.
 //
 // The free blocks a sweep leaves behind are the ones it could NOT discard (their OS page still
@@ -1143,6 +1180,12 @@ void _mi_page_purge_holes(mi_page_t* page, mi_tld_t* tld) {
       if (page->free != NULL || mi_page_unformed_tail_pending(page)) { tld->holes_sweep_deferred = true; }
       return;
     }
+  }
+  // The floor: once the hold above is over, the first `purge_holes_large_floor` bytes of free blocks in large pages still
+  // stay, process-wide and a whole page at a time. A server with a request now and then would fault its buffers in again
+  // on every request otherwise. Nothing comes back for such a page: every sweep that gets here decides again.
+  if (mi_page_block_size(page) > MI_MEDIUM_MAX_OBJ_SIZE && page->reserved > 1 && mi_page_holes_madvisable(page)) {
+    if (mi_holes_floor_take(tld, mi_page_large_resident_free(page))) return;
   }
   mi_page_purge_unformed_tail(page);                      // the blocks that are not formed yet: resident, but never handed out
   if (!mi_page_can_purge_holes(page)) { _mi_page_holes_count_ineligible(page); return; }

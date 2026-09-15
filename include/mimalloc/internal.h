@@ -1062,6 +1062,8 @@ void          _mi_page_purge_holes_begin(mi_tld_t* tld);         // around each 
 void          _mi_page_purge_holes_end(mi_tld_t* tld);
 void          _mi_page_purge_holes_sweep_begin(mi_tld_t* tld);   // once per idle sweep, before its passes
 void          _mi_page_purge_holes_forked_child(void);
+void          _mi_page_purge_holes_floor_release(mi_tld_t* tld);  // a tld that goes away gives its share of `purge_holes_large_floor` back
+size_t        _mi_page_purge_holes_floor_kept(void);             // (for `test-purge-holes-large.c`)
 void          _mi_page_purge_holes_epoch_advance(void);          // ..by this, which every idle sweep begins with
 uint32_t      _mi_page_purge_holes_epoch(void);                  // the epoch of the sweep: moved on by an idle sweep, once in `purge_holes_min_interval` at the most (`page.c`)
 
