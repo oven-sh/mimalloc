@@ -2395,6 +2395,9 @@ bool _mi_theap_profiling_is_stale(const mi_theap_t* theap, size_t prof_state) {
 // Start a profile period of `prof_state` from the beginning: with the initial rate, nothing of it used up and nothing
 // requested yet.
 void _mi_theap_start_profile_period(mi_theap_t* theap, const mi_profiler_t* prof, size_t prof_state) {
+  #if MI_SAMPLE==1
+  const bool was_sampling = (theap->sample_rate!=0);
+  #endif
   _mi_theap_set_profile_sample_rate(theap, mi_max(1,prof->initial_sample_rate));
   // with a full period (with guarded sampling on, the first sample point would be a profile sample otherwise, with what
   // was requested since the theap was made; in a new theap the countdowns are 0, and the first allocation would be a
@@ -2404,7 +2407,9 @@ void _mi_theap_start_profile_period(mi_theap_t* theap, const mi_profiler_t* prof
   theap->sample_requested = 0;
   theap->profile_sample_epoch = mi_profiler_state_epoch(prof_state);
   #if MI_SAMPLE==1
-  _mi_theap_sync_sample_counts(theap);   // what its pages handed out up to here is not of this period
+  // what its pages handed out up to here is not of this period (a theap that was not sampling has synced already,
+  // in `_mi_theap_update_sample_rate`)
+  if (was_sampling) { _mi_theap_sync_sample_counts(theap); }
   #endif
 }
 
