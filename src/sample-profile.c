@@ -354,13 +354,13 @@ bool mi_profiler_start(mi_profiler_t* profiler ) {
   if (was_running) return true;
   mi_profiler_request_look(_mi_subproc(),profiler);
   if (_mi_subproc() != _mi_subproc_main()) { mi_profiler_request_look(_mi_subproc_main(),profiler); }
-  // for the main heap, if this is the profiler, start the theap more aggressively
-  // otherwise it will be picked up when theaps take the slow generic malloc path.
+  // for the main heap, if this is the profiler, start the theap of this thread right away
+  // (the others pick it up when they take the slow generic malloc path)
   mi_heap_t* heap = mi_heap_main();
   if (mi_heap_profiler(heap)==profiler) {
     mi_theap_t* theap = _mi_heap_theap_peek(heap);
     if (theap!=NULL) {
-      _mi_theap_set_profile_sample_rate(theap,1);
+      _mi_theap_update_profiling(theap);
     }
   }
   return false;
@@ -368,5 +368,13 @@ bool mi_profiler_start(mi_profiler_t* profiler ) {
 
 bool mi_profiler_stop(mi_profiler_t* profiler) {
   if (profiler==NULL) return true;
-  return mi_profiler_set_enabled(profiler,false);
+  const bool was_running = mi_profiler_set_enabled(profiler,false);
+  // Have the theaps that sample look, so they stop counting what they hand out at their next generic allocation and not
+  // at their next sample or 1000 of them later. (Not after a fork: the theaps of the threads that are gone are
+  // not to be touched, and the one thread there is finds out by itself.)
+  if (was_running && !_mi_process_is_forked_child) {
+    mi_profiler_request_look(_mi_subproc(),profiler);
+    if (_mi_subproc() != _mi_subproc_main()) { mi_profiler_request_look(_mi_subproc_main(),profiler); }
+  }
+  return was_running;
 }

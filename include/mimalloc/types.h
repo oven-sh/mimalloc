@@ -670,6 +670,7 @@ struct mi_theap_s {
   uint64_t              sample_requested;                    // total allocated/requested bytes since the last sample
   size_t                profile_sample_rate;                 // sampling rate in requested bytes for profiling
   size_t                profile_sample_countdown;            // countdown in requested bytes for profiling
+  size_t                profile_sample_epoch;                // which `mi_profiler_start` the profile rate and countdowns belong to (see `internal.h:mi_profiler_state`)
   size_t                guarded_sample_rate;                 // sampling rate in requested bytes for guarded objects
   size_t                guarded_sample_countdown;            // countdown in requested bytes for guarded objects
   size_t                guarded_size_min;                    // minimal size for guarded objects

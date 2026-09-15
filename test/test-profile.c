@@ -611,6 +611,113 @@ bool test_profiler_start_with_running_threads(void) {
 }
 
 
+// A thread that was sampled before a stop, and that allocates nothing between the stop and the next start, starts
+// over with that start: it does not run out the period it was in (at the rate it had then), and its first sample does
+// not report what it requested before the start.
+#define RESTART_BLOCK       (64*1024)
+#define RESTART_LONG_RATE   ((size_t)256*1024*1024)
+#define RESTART_SHORT_RATE  ((size_t)64*1024)
+#define RESTART_EVEN_RATE   ((size_t)1024*1024)
+static _Atomic(size_t) restart_phase;       // the worker does phase 1, 3, 5, 7 when it sees that number; the other thread does the even ones
+static _Atomic(size_t) restart_rate;        // what `on_alloc` returns
+static _Atomic(size_t) restart_samples;     // of the worker, since the last start
+static _Atomic(size_t) restart_bytes;       // sum of their `bytes_since_last_sample`
+static _Atomic(size_t) restart_first;       // `bytes_since_last_sample` of the first one
+static _Atomic(size_t) restart_first_after; // what the worker had requested since the start when it came
+static mi_decl_thread size_t restart_requested;
+static mi_decl_thread bool   restart_is_worker;
+
+static size_t mi_cdecl restart_on_alloc(mi_profiler_t* profiler, mi_profiler_sample_data_t* data, void* ptr, size_t requested_size, size_t threshold, uint64_t bytes_since_last_sample, const mi_heap_t* heap) {
+  MI_UNUSED(profiler); MI_UNUSED(data); MI_UNUSED(ptr); MI_UNUSED(threshold); MI_UNUSED(heap);
+  if (restart_is_worker) {
+    if (mi_atomic_increment_relaxed(&restart_samples) == 0) {
+      mi_atomic_store_relaxed(&restart_first, (size_t)bytes_since_last_sample);
+      mi_atomic_store_relaxed(&restart_first_after, restart_requested + requested_size);
+    }
+    mi_atomic_add_relaxed(&restart_bytes, (size_t)bytes_since_last_sample);
+  }
+  return mi_atomic_load_relaxed(&restart_rate);
+}
+
+static mi_profiler_t restart_profiler = { NULL, 0, RESTART_EVEN_RATE, &restart_on_alloc, NULL, NULL };
+
+static void restart_wait(size_t phase) {
+  while (mi_atomic_load_acquire(&restart_phase) != phase) { mi_atomic_pause(); }
+}
+
+static void restart_allocate(size_t total) {
+  restart_requested = 0;
+  while (restart_requested < total) {
+    mi_free(mi_malloc(RESTART_BLOCK));   // (through the generic path each time)
+    restart_requested += RESTART_BLOCK;
+  }
+}
+
+static void restart_begin(size_t rate) {
+  mi_atomic_store_relaxed(&restart_rate, rate);
+  mi_atomic_store_relaxed(&restart_samples, (size_t)0);
+  mi_atomic_store_relaxed(&restart_bytes, (size_t)0);
+  mi_atomic_store_relaxed(&restart_first, (size_t)0);
+  mi_atomic_store_relaxed(&restart_first_after, (size_t)0);
+  mi_profiler_start(&restart_profiler);
+}
+
+static size_t restart_short_bytes, restart_even_first, restart_even_first_after;
+
+static void restart_thread(intptr_t tid) {
+  if (tid == 0) {
+    restart_is_worker = true;
+    restart_wait(1); restart_allocate(RESTART_EVEN_RATE*3/2);      // ends half way into a period
+    mi_atomic_store_release(&restart_phase, (size_t)2);
+    restart_wait(3); restart_allocate(RESTART_EVEN_RATE*4);
+    mi_atomic_store_release(&restart_phase, (size_t)4);
+    restart_wait(5); restart_allocate(32*1024*1024);               // one sample, which sets the long rate
+    mi_atomic_store_release(&restart_phase, (size_t)6);
+    restart_wait(7); restart_allocate(32*1024*1024);               // at the short rate: all of it is sampled
+    mi_atomic_store_release(&restart_phase, (size_t)8);
+    restart_is_worker = false;
+  }
+  else {
+    restart_begin(RESTART_EVEN_RATE);
+    mi_atomic_store_release(&restart_phase, (size_t)1);
+    restart_wait(2);
+    mi_profiler_stop(&restart_profiler);
+    restart_begin(RESTART_EVEN_RATE);
+    mi_atomic_store_release(&restart_phase, (size_t)3);
+    restart_wait(4);
+    mi_profiler_stop(&restart_profiler);
+    restart_even_first = mi_atomic_load_relaxed(&restart_first);
+    restart_even_first_after = mi_atomic_load_relaxed(&restart_first_after);
+    restart_begin(RESTART_LONG_RATE);
+    mi_atomic_store_release(&restart_phase, (size_t)5);
+    restart_wait(6);
+    mi_profiler_stop(&restart_profiler);
+    restart_begin(RESTART_SHORT_RATE);
+    mi_atomic_store_release(&restart_phase, (size_t)7);
+    restart_wait(8);
+    mi_profiler_stop(&restart_profiler);
+    restart_short_bytes = mi_atomic_load_relaxed(&restart_bytes);
+  }
+}
+
+bool test_profiler_restart(void) {
+  CHECK_BODY("profiler: a thread starts over when the profiler is started again") {
+    mi_profiler_stop(&my_profiler.profiler);
+    mi_profile(NULL);
+    mi_profile(&restart_profiler);
+    run_os_threads(2, &restart_thread);
+    mi_profile(NULL);
+    mi_profile(&my_profiler.profiler);
+    mi_profiler_start(&my_profiler.profiler);
+    fprintf(stderr, "  (after a stop half way into a period: the first sample reports %zu bytes, %zu requested since the start; after a period at a rate of %zu, at a rate of %zu: %zu of %d bytes sampled)\n",
+      restart_even_first, restart_even_first_after, RESTART_LONG_RATE, RESTART_SHORT_RATE, restart_short_bytes, 32*1024*1024);
+    result = (restart_short_bytes >= 31*1024*1024 && restart_short_bytes <= 33*1024*1024 &&
+              restart_even_first != 0 && restart_even_first <= restart_even_first_after);
+  }
+  return true;
+}
+
+
 // ---------------------------------------------------------------------------
 // main
 // ---------------------------------------------------------------------------
@@ -634,6 +741,7 @@ int main(void) {
   test_profiler_stop_while_sampling();
   test_profiler_aligned_late_start();
   test_profiler_start_with_running_threads();
+  test_profiler_restart();
 
   mi_profiler_stop(&my_profiler.profiler);
 
