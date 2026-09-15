@@ -358,6 +358,7 @@ extern "C" {
 #endif
 extern mi_decl_export _Atomic(uintptr_t) mi_debug_stall_in_thread_theaps_done;
 extern mi_decl_export _Atomic(uintptr_t) mi_debug_stall_in_heap_delete_claim;
+extern mi_decl_export _Atomic(uintptr_t) mi_debug_stall_in_pthread_key_create;
 extern mi_decl_export _Atomic(uintptr_t) mi_debug_abandoned_maps_allocated;
 extern mi_decl_export volatile long      mi_debug_fail_os_commit_after;
 #ifdef __cplusplus
@@ -521,7 +522,7 @@ static inline void __mi_stat_counter_decrease(mi_stat_counter_t* stat, uint64_t 
 #endif
 
 mi_decl_noinline bool _mi_pthread_key_create(pthread_key_t* pkey, void (*destruct)(void*), void* init);
-mi_decl_noinline bool _mi_pthread_key_create_once(pthread_key_t* pkey, void* init);
+mi_decl_noinline bool _mi_pthread_key_create_once(_Atomic(pthread_key_t)* pkey, void* init);
 
 static inline void* mi_pthread_key_get(pthread_key_t key) {
   #if !MI_PTHREADS_GET_INVALID_KEY_IS_NULL
@@ -530,16 +531,17 @@ static inline void* mi_pthread_key_get(pthread_key_t key) {
   return pthread_getspecific(key);
 }
 
-static inline bool mi_pthread_key_set(pthread_key_t* pkey, void* val) {
-  if mi_likely(*pkey!=MI_PTHREAD_KEY_INVALID) { pthread_setspecific(*pkey,val); return true; }
+// A key that is created when a value is first set (by any thread: `pkey` is shared).
+static inline bool mi_pthread_key_set(_Atomic(pthread_key_t)* pkey, void* val) {
+  const pthread_key_t key = mi_atomic_load_relaxed(pkey);
+  if mi_likely(key!=MI_PTHREAD_KEY_INVALID) { pthread_setspecific(key,val); return true; }
   else if (val!=NULL) { return _mi_pthread_key_create_once(pkey,val); }
   else return true;
 }
 
-static inline void mi_pthread_key_delete(pthread_key_t* pkey) {
-  const pthread_key_t key = *pkey;
+static inline void mi_pthread_key_delete(_Atomic(pthread_key_t)* pkey) {
+  const pthread_key_t key = mi_atomic_exchange_relaxed(pkey, MI_PTHREAD_KEY_INVALID);
   if (key!=MI_PTHREAD_KEY_INVALID) {
-    *pkey = MI_PTHREAD_KEY_INVALID;
     pthread_key_delete(key);
   }
 }

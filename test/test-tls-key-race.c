@@ -11,10 +11,12 @@ terms of the MIT license.
    replaced does not find its slots again (and makes a second theap for its heap; a debug build asserts in
    `heap.c:mi_heap_init_theap`).
 
-   There is one first time in a process, so every round is a child process: its threads make their heaps, wait
-   for each other, and then allocate from them at the same moment.
+   There is one first time in a process. A debug build has a hook that holds the first thread that creates the
+   key until a second one is there too (`libc.c:mi_debug_stall_in_pthread_key_create`), which makes that one
+   time the race; without it the threads make their heaps, wait for each other, and allocate from them at once.
+   Where thread locals are not pthread keys this only checks that it works.
 
-   > mimalloc-test-tls-key-race [ROUNDS]
+   > mimalloc-test-tls-key-race
 */
 
 #include <stdio.h>
@@ -25,13 +27,16 @@ terms of the MIT license.
 #include "mimalloc.h"
 
 #if defined(_WIN32) || defined(__EMSCRIPTEN__)
-int main(void) { printf("skipped (no fork)\n"); return 0; }
+int main(void) { printf("skipped (no pthreads)\n"); return 0; }
 #else
 
 #include <pthread.h>
+#include <sched.h>
 #include <stdatomic.h>
-#include <sys/wait.h>
-#include <unistd.h>
+
+#if MI_DEBUG > 0
+extern _Atomic(uintptr_t) mi_debug_stall_in_pthread_key_create;
+#endif
 
 #define THREADS 8
 
@@ -41,7 +46,7 @@ static void* worker(void* arg) {
   (void)arg;
   mi_heap_t* const heap = mi_heap_new();   // (takes a lock: the threads do not get here together)
   atomic_fetch_add(&ready, 1);
-  while (!atomic_load(&go)) { }
+  while (!atomic_load(&go)) { sched_yield(); }
   void* const p = mi_heap_malloc(heap, 64);   // the first use of the thread local slots
   mi_theap_t* const theap = mi_heap_theap(heap);
   void* const q = mi_heap_malloc(heap, 64);
@@ -54,33 +59,26 @@ static void* worker(void* arg) {
   return NULL;
 }
 
-static int round_in_child(void) {
+int main(void) {
+  mi_free(mi_malloc(8));   // the main heap only
+  #if MI_DEBUG > 0
+  atomic_store(&mi_debug_stall_in_pthread_key_create, (uintptr_t)1);
+  #endif
   pthread_t threads[THREADS];
-  for (int i = 0; i < THREADS; i++) {
-    if (pthread_create(&threads[i], NULL, &worker, NULL) != 0) return 2;
+  int started = 0;
+  for (; started < THREADS; started++) {
+    if (pthread_create(&threads[started], NULL, &worker, NULL) != 0) break;
   }
-  while (atomic_load(&ready) < THREADS) { }
+  while (atomic_load(&ready) < started) { sched_yield(); }
   atomic_store(&go, 1);
-  for (int i = 0; i < THREADS; i++) { pthread_join(threads[i], NULL); }
-  return (atomic_load(&bad) == 0 ? 0 : 1);
-}
-
-int main(int argc, char** argv) {
-  int rounds = 200;
-  if (argc > 1) { rounds = atoi(argv[1]); }
-  mi_free(mi_malloc(8));   // the main heap only: no round has happened in this process yet
-  int failed = 0;
-  for (int r = 0; r < rounds; r++) {
-    const pid_t pid = fork();
-    if (pid == 0) { _exit(round_in_child()); }
-    int status = 0;
-    if (pid < 0 || waitpid(pid, &status, 0) < 0 || !WIFEXITED(status) || WEXITSTATUS(status) != 0) {
-      failed++;
-      if (failed == 1) { fprintf(stderr, "round %d: status 0x%x\n", r, (unsigned)status); }
-    }
-  }
-  printf("%d of %d rounds failed\n", failed, rounds);
-  return (failed == 0 ? 0 : 1);
+  for (int i = 0; i < started; i++) { pthread_join(threads[i], NULL); }
+  #if MI_DEBUG > 0
+  const uintptr_t arrived = atomic_exchange(&mi_debug_stall_in_pthread_key_create, (uintptr_t)0) - 1;
+  printf("%d threads, %d of them lost their thread local slots; %d created the key at the same time\n", started, atomic_load(&bad), (int)arrived);
+  #else
+  printf("%d threads, %d of them lost their thread local slots\n", started, atomic_load(&bad));
+  #endif
+  return (started >= 2 && atomic_load(&bad) == 0 ? 0 : 1);
 }
 
 #endif

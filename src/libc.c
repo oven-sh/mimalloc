@@ -160,18 +160,34 @@ mi_decl_noinline bool _mi_pthread_key_create(pthread_key_t* pkey, void (*destruc
 // one key at once: the key of the thread local slots (`threadlocal.c`) is first set when a heap besides the main one
 // is first used, which a program can do on many threads at the same time. One key wins; a thread that stored its value
 // under a key of its own, which the next one replaced, would not find it again.
-mi_decl_noinline bool _mi_pthread_key_create_once(pthread_key_t* pkey, void* init) {
+#if MI_DEBUG > 0
+mi_decl_export _Atomic(uintptr_t) mi_debug_stall_in_pthread_key_create;   // test hook (test-tls-key-race): 1 has the first thread here wait for a second one
+#endif
+
+mi_decl_noinline bool _mi_pthread_key_create_once(_Atomic(pthread_key_t)* pkey, void* init) {
+  #if MI_DEBUG > 0
+  if (mi_atomic_load_acquire(&mi_debug_stall_in_pthread_key_create) != 0) {
+    if (mi_atomic_increment_acq_rel(&mi_debug_stall_in_pthread_key_create) == 1) {   // the first: both have found no key then
+      for (int i = 0; i < 100000 && mi_atomic_load_acquire(&mi_debug_stall_in_pthread_key_create) == 2; i++) { _mi_prim_thread_yield(); }
+    }
+  }
+  #endif
   pthread_key_t key;
   const int err = pthread_key_create(&key,NULL);
   if mi_unlikely(err!=0) {
-    _mi_error_message(ENOMEM,"unable to allocate a thread local variable (error %d)\n", err);
-    return false;
+    key = mi_atomic_load_acquire(pkey);   // (another thread may have made it meanwhile)
+    if (key == MI_PTHREAD_KEY_INVALID) {
+      _mi_error_message(ENOMEM,"unable to allocate a thread local variable (error %d)\n", err);
+      return false;
+    }
   }
-  mi_assert_internal(key != MI_PTHREAD_KEY_INVALID);
-  pthread_key_t expected = MI_PTHREAD_KEY_INVALID;
-  if (!mi_atomic_cas_strong_acq_rel((_Atomic(pthread_key_t)*)pkey, &expected, key)) {
-    pthread_key_delete(key);   // another thread was first
-    key = expected;
+  else {
+    mi_assert_internal(key != MI_PTHREAD_KEY_INVALID);
+    pthread_key_t expected = MI_PTHREAD_KEY_INVALID;
+    if (!mi_atomic_cas_strong_acq_rel(pkey, &expected, key)) {
+      pthread_key_delete(key);   // another thread was first
+      key = expected;
+    }
   }
   pthread_setspecific(key,init);
   mi_assert_internal(pthread_getspecific(key)==init);

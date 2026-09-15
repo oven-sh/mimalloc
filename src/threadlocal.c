@@ -44,8 +44,8 @@ static mi_thread_locals_t mi_thread_locals_empty = mi_init_struct_zero;
 #if MI_TLS_MODEL_PTHREADS || defined(__APPLE__)   // macOS has fast pthreads
 // Use pthreads
 #define mi_define_thread_local(tp,name,initval) \
-  static pthread_key_t __##name##_key = MI_PTHREAD_KEY_INVALID; \
-  static inline tp   name##_peek(void)    { return (tp)mi_pthread_key_get(__##name##_key); } \
+  static _Atomic(pthread_key_t) __##name##_key = MI_ATOMIC_VAR_INIT(MI_PTHREAD_KEY_INVALID); \
+  static inline tp   name##_peek(void)    { return (tp)mi_pthread_key_get(mi_atomic_load_relaxed(&__##name##_key)); } \
   static inline tp   name##_get(void)     { tp result = name##_peek(); return (result!=NULL ? result : initval); } \
   static inline bool name##_set(tp val)   { return mi_pthread_key_set(&__##name##_key,val); } \
   static inline void name##_delete(void)  { mi_pthread_key_delete(&__##name##_key); }
