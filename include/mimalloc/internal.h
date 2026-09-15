@@ -307,7 +307,9 @@ void*         _mi_malloc_generic(mi_theap_t* theap, size_t size, size_t zero_hug
 #if MI_SAMPLE==1
 void          _mi_theap_sync_sample_counts(mi_theap_t* theap);
 #endif
+void          _mi_theap_start_profile_period(mi_theap_t* theap, const mi_profiler_t* prof, size_t prof_state);
 void          _mi_theap_update_profiling(mi_theap_t* theap);
+bool          _mi_theap_profiling_is_stale(const mi_theap_t* theap, size_t prof_state);
 void*         _mi_malloc_generic_no_sample(mi_theap_t* theap, size_t size, bool zero, mi_page_t** ppage)  mi_attr_noexcept mi_attr_malloc;
 
 void          _mi_page_retire(mi_page_t* page) mi_attr_noexcept;       // free the page if there are no other pages with many free blocks
@@ -1499,14 +1501,41 @@ static inline bool mi_block_ptr_is_sampled(const mi_block_t* block, const void* 
 #endif
 }
 
-static inline bool mi_profiler_is_enabled(const mi_profiler_t* prof) {
-  _Atomic(size_t)* penabled = (_Atomic(size_t)*)&prof->reserved;
-  return (mi_atomic_load_acquire(penabled) != 0);
+// `mi_profiler_t.reserved` is `(epoch << 1) | enabled`. Every start of a profiler that is not running takes a new
+// epoch from a counter of the process (so two profilers never have the same one): a theap keeps the epoch that its
+// profile rate and countdowns belong to, and state from before a stop is not taken into the next start
+// (see `page.c:_mi_theap_update_profiling`). One word, so enabled and epoch are read together.
+extern mi_decl_hidden _Atomic(size_t) _mi_profiler_epoch;   // sample-profile.c
+
+static inline size_t mi_profiler_state(const mi_profiler_t* prof) {
+  _Atomic(size_t)* pstate = (_Atomic(size_t)*)&prof->reserved;
+  return mi_atomic_load_acquire(pstate);
 }
 
+static inline bool mi_profiler_state_is_enabled(size_t state) {
+  return ((state & 1) != 0);
+}
+
+static inline size_t mi_profiler_state_epoch(size_t state) {
+  return (state >> 1);
+}
+
+static inline bool mi_profiler_is_enabled(const mi_profiler_t* prof) {
+  return mi_profiler_state_is_enabled(mi_profiler_state(prof));
+}
+
+// Returns whether it was enabled before.
 static inline bool mi_profiler_set_enabled(mi_profiler_t* prof, bool enable) {
-  _Atomic(size_t)* penabled = (_Atomic(size_t)*)&prof->reserved;
-  return (mi_atomic_exchange_release(penabled, (enable ? 1 : 0)) != 0);
+  _Atomic(size_t)* pstate = (_Atomic(size_t)*)&prof->reserved;
+  size_t state = mi_atomic_load_relaxed(pstate);
+  size_t epoch = 0;
+  size_t desired;
+  do {
+    if (mi_profiler_state_is_enabled(state) == enable) return enable;
+    if (enable && epoch==0) { epoch = mi_atomic_increment_relaxed(&_mi_profiler_epoch) + 1; }
+    desired = (enable ? ((epoch << 1) | 1) : (state & ~(size_t)1));
+  } while (!mi_atomic_cas_weak_acq_rel(pstate, &state, desired));
+  return !enable;
 }
 
 
