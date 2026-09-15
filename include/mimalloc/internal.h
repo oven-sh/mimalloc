@@ -533,7 +533,7 @@ static inline void* mi_pthread_key_get(pthread_key_t key) {
 
 // A key that is created when a value is first set (by any thread: `pkey` is shared).
 static inline bool mi_pthread_key_set(_Atomic(pthread_key_t)* pkey, void* val) {
-  const pthread_key_t key = mi_atomic_load_relaxed(pkey);
+  const pthread_key_t key = mi_atomic_load_acquire(pkey);   // (after the thread that created it; a thread sets a value about once)
   if mi_likely(key!=MI_PTHREAD_KEY_INVALID) { pthread_setspecific(key,val); return true; }
   else if (val!=NULL) { return _mi_pthread_key_create_once(pkey,val); }
   else return true;

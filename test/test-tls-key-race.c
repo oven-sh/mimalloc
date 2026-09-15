@@ -25,6 +25,7 @@ terms of the MIT license.
 #include <stdbool.h>
 
 #include "mimalloc.h"
+#include "mimalloc-stats.h"
 
 #if defined(_WIN32) || defined(__EMSCRIPTEN__)
 int main(void) { printf("skipped (no pthreads)\n"); return 0; }
@@ -41,6 +42,16 @@ extern _Atomic(uintptr_t) mi_debug_stall_in_pthread_key_create;
 #define THREADS 8
 
 static atomic_int ready, go, bad;
+
+// A thread that lost its slots does not notice: it makes new ones, and a second theap for its heap, and goes on
+// with those. The count of the theaps that were made tells.
+static size_t theaps_made(void) {
+  static mi_stats_t stats;
+  stats.size = sizeof(stats);
+  stats.version = MI_STAT_VERSION;
+  if (!mi_subproc_stats_get_exclusive(mi_subproc_main(), &stats)) return 0;
+  return (size_t)stats.theaps.total;
+}
 
 static void* worker(void* arg) {
   (void)arg;
@@ -64,6 +75,7 @@ int main(void) {
   #if MI_DEBUG > 0
   atomic_store(&mi_debug_stall_in_pthread_key_create, (uintptr_t)1);
   #endif
+  const size_t theaps_before = theaps_made();
   pthread_t threads[THREADS];
   int started = 0;
   for (; started < THREADS; started++) {
@@ -72,13 +84,20 @@ int main(void) {
   while (atomic_load(&ready) < started) { sched_yield(); }
   atomic_store(&go, 1);
   for (int i = 0; i < started; i++) { pthread_join(threads[i], NULL); }
+  // every thread makes a theap for the main heap (its heap is allocated there) and one for its own
+  const size_t made = theaps_made() - theaps_before;
+  const bool counted = (theaps_made() != 0);   // (not in a build without statistics)
+  bool ok = (started >= 2 && atomic_load(&bad) == 0 && (!counted || made == 2*(size_t)started));
+  printf("%d threads made %zu theaps, %d of them saw its heap change", started, made, atomic_load(&bad));
   #if MI_DEBUG > 0
   const uintptr_t arrived = atomic_exchange(&mi_debug_stall_in_pthread_key_create, (uintptr_t)0) - 1;
-  printf("%d threads, %d of them lost their thread local slots; %d created the key at the same time\n", started, atomic_load(&bad), (int)arrived);
-  #else
-  printf("%d threads, %d of them lost their thread local slots\n", started, atomic_load(&bad));
+  printf("; %d created the key at the same time", (int)arrived);
+  #if MI_TLS_MODEL_PTHREADS || defined(__APPLE__)
+  ok = ok && (arrived >= 2);   // or this was not the race
   #endif
-  return (started >= 2 && atomic_load(&bad) == 0 ? 0 : 1);
+  #endif
+  printf("\n");
+  return (ok ? 0 : 1);
 }
 
 #endif
