@@ -101,10 +101,12 @@ static inline bool mi_page_sweep_state_is_alloc(const mi_page_t* page, uint32_t*
   return true;
 }
 
-// An abandoned page that a sweep left under `purge_holes_large_floor` says so, with the thread that counts it: every
-// thread that sweeps the heap of the page passes it, and only that one is to count it (again, at its next sweep). The
+// A page that a sweep left under `purge_holes_large_floor` says so, with the thread that counts it. An abandoned one
+// because every thread that sweeps the heap of the page passes it, and only that one is to count it (again, at its next
+// sweep); one of the thread's own because a collect that is not forced is to tell it from a page that no sweep has
+// decided on (`_mi_page_purge_holes_large_page_is_kept`). The
 // third pattern of the top two bits (`MI_PAGE_SWEPT_NONE` has both set, a block state neither); still with the epoch
-// of the last allocation from the page, and an allocation from it (once it is reclaimed) writes its own stamp over this.
+// of the last allocation from the page, and an allocation from it writes its own stamp over this.
 // A thread that ends with a share of the floor does not count its pages any more: the 8 low bits of the keeper are how
 // many such threads there were when the page was kept, and a page from before the last one is anybody's again (that
 // frees the pages of the threads that are still there as well; the first to pass one counts it, and its old keeper
@@ -121,6 +123,14 @@ static inline bool mi_page_sweep_state_is_kept(const mi_page_t* page, uint32_t* 
   *epoch = (uint32_t)page->swept_state;
   *keeper = (page->swept_state & (MI_PAGE_SWEPT_KEEPER_MASK << 32));
   return true;
+}
+// A page that its thread abandons is anybody's to count: the mark of a sweep that kept it as one of the thread's own
+// goes, the epoch stays (`_mi_page_abandon`). So the mark on an abandoned page is always that of a sweep that passed it
+// as one.
+static inline void mi_page_sweep_state_unkeep(mi_page_t* page) {
+  uint32_t stamp;
+  uint64_t keeper;
+  if (mi_page_sweep_state_is_kept(page, &stamp, &keeper)) { page->swept_state = (MI_PAGE_SWEPT_ALLOC | (uint64_t)stamp); }
 }
 
 // How many epochs ago was the page allocated from, for a page that `mi_page_sweep_state_is_alloc`? In 32 bits: a page
@@ -1182,9 +1192,15 @@ static void mi_page_purge_holes_now(mi_page_t* page, mi_tld_t* tld);
 // what is there of the floor goes to the ones that were used last and not to the ones that the sweep came to first.
 // (The abandoned pages of its heaps come after that, one at a time as they are claimed, for what is left.)
 // (`mi_holes_floor_list_t` is in `internal.h`: it lives on the stack of `theap.c:mi_purge_holes_of`)
-static void mi_page_holes_floor_stays(mi_page_t* page) {
+static void mi_page_holes_floor_stays(mi_page_t* page, mi_tld_t* tld) {
   mi_page_purge_unformed_tail(page);   // (the blocks that were never formed are not what stays)
-  // `swept_state` stays the epoch of the page's last allocation: that is all the age there is
+  // `swept_state` stays the epoch of the page's last allocation, which is all the age there is, now under the mark of
+  // the thread that counts the page (`MI_PAGE_SWEPT_KEPT`)
+  uint32_t stamp;
+  uint64_t keeper;
+  if (mi_page_sweep_state_is_alloc(page, &stamp) || mi_page_sweep_state_is_kept(page, &stamp, &keeper)) {
+    page->swept_state = (MI_PAGE_SWEPT_KEPT | mi_page_sweep_state_keeper(tld) | stamp);
+  }
 }
 
 // Is this a large page that may stay under the floor: one that was allocated from in the last
@@ -1194,7 +1210,7 @@ static bool mi_page_holes_floor_keep(mi_page_t* page, mi_tld_t* tld) {
   if (mi_page_block_size(page) <= MI_MEDIUM_MAX_OBJ_SIZE || page->reserved <= 1) return false;
   uint32_t stamp;
   uint64_t keeper = 0;
-  const bool kept = mi_page_sweep_state_is_kept(page, &stamp, &keeper);   // (an abandoned page)
+  const bool kept = mi_page_sweep_state_is_kept(page, &stamp, &keeper);   // (left under the floor by a sweep before this one)
   if (!kept && !mi_page_sweep_state_is_alloc(page, &stamp)) return false;   // swept before, and not allocated from since
   if (!mi_holes_floor_is_on() || !mi_page_holes_madvisable(page)) return false;
   const uint32_t age = mi_page_sweep_state_alloc_age(stamp);
@@ -1210,8 +1226,7 @@ static bool mi_page_holes_floor_keep(mi_page_t* page, mi_tld_t* tld) {
     return true;
   }
   if (!mi_holes_floor_take(tld, bytes)) return false;
-  mi_page_holes_floor_stays(page);
-  if (mi_page_is_abandoned(page)) { page->swept_state = (MI_PAGE_SWEPT_KEPT | mi_page_sweep_state_keeper(tld) | stamp); }
+  mi_page_holes_floor_stays(page, tld);
   return true;
 }
 
@@ -1230,17 +1245,35 @@ bool _mi_page_purge_holes_free_page_stays(mi_page_t* page, mi_tld_t* tld) {
   return stays;
 }
 
-// Is this a large page with no block in use that is for the next sweep of its thread to decide on: one that was
-// allocated from since it was last swept, of a thread that is swept at all, with a floor to stay under?
+// Is this a large page with no block in use that is for the sweeps of its thread to decide on: one that was
+// allocated from since it was last swept or that a sweep left under the floor, of a thread that is swept at all, with
+// a floor to stay under?
 // Where its last block is freed (`_mi_page_retire`) such a page is retired like a small one instead of freed, so what
-// a thread that does not park any more holds that way is gone after `MI_RETIRE_CYCLES`; and the collect that an idle
-// thread does before it is swept (`_mi_thread_idle_work`) leaves it for that sweep.
+// a thread that does not park any more holds that way is gone after `MI_RETIRE_CYCLES`; the collect that an idle
+// thread does before it is swept (`_mi_thread_idle_work`) leaves it for that sweep; and any other collect that is not
+// forced (`theap.c:mi_theap_page_collect`) retires it as well, unless `_mi_page_purge_holes_large_page_is_kept`.
 bool _mi_page_purge_holes_large_page_waits(const mi_page_t* page, const mi_tld_t* tld) {
   if (mi_page_block_size(page) <= MI_MEDIUM_MAX_OBJ_SIZE || page->reserved <= 1) return false;
   if (tld == NULL || tld->holes_sweep_seq == 0) return false;   // nothing sweeps this thread
   uint32_t stamp;
-  if (!mi_page_sweep_state_is_alloc(page, &stamp)) return false;
+  uint64_t keeper;
+  if (!mi_page_sweep_state_is_alloc(page, &stamp) && !mi_page_sweep_state_is_kept(page, &stamp, &keeper)) return false;
   return (mi_holes_floor_is_on() && mi_page_holes_madvisable(page));
+}
+
+// ..and is it one that the last sweep of this thread left under the floor? That one is counted (`holes_floor_kept` of
+// `tld`, until its next sweep decides again), so all such pages of all threads are within `purge_holes_large_floor`,
+// and a collect that is not forced leaves it alone: the runtime above us does one at the end of a garbage collection
+// and `mi_malloc_generic_admin` one every `generic_collect` allocations, which is more often than a server gets a
+// request, and the rule is that only the sweeps (the epochs), a forced collect and the end of the thread take it.
+// (Not a page that another thread counts, which was reclaimed since: that share goes at the other thread's next sweep.
+//  The number of threads that have ended, which is in the mark for the abandoned pages, does not matter here.)
+bool _mi_page_purge_holes_large_page_is_kept(const mi_page_t* page, const mi_tld_t* tld) {
+  if (!_mi_page_purge_holes_large_page_waits(page, tld)) return false;
+  uint32_t stamp;
+  uint64_t keeper;
+  if (!mi_page_sweep_state_is_kept(page, &stamp, &keeper)) return false;
+  return ((keeper >> 40) == (mi_page_sweep_state_keeper(tld) >> 40));
 }
 
 // The end of the pass over the thread's own pages: the most recently used first, while they fit.
@@ -1270,7 +1303,7 @@ void _mi_page_purge_holes_floor_resolve(mi_tld_t* tld) {
     bool found = false;
     for (const mi_page_t* p = item->pq->first; p != NULL && !found; p = p->next) { found = (p == item->page); }
     if (!found) continue;
-    if (mi_holes_floor_take(tld, item->bytes)) { mi_page_holes_floor_stays(item->page); }
+    if (mi_holes_floor_take(tld, item->bytes)) { mi_page_holes_floor_stays(item->page, tld); }
     else if (mi_page_all_free(item->page)) { _mi_page_holes_count_page_freed(); _mi_page_free(item->page, item->pq); }   // (see `_mi_page_purge_holes_free_page_stays`)
     else { mi_page_purge_holes_now(item->page, tld); }
   }
@@ -1843,6 +1876,7 @@ void _mi_page_abandon(mi_page_t* page, mi_page_queue_t* pq) {
     mi_theap_t* theap = page->theap;
     mi_page_set_theap(page, NULL);
     page->theap = theap; // don't actually set theap to NULL so we can reclaim_on_free within the same theap
+    mi_page_sweep_state_unkeep(page);   // (before the page is anybody's)
     _mi_arenas_page_abandon(page, theap);
     // _mi_arenas_collect(false, false, theap->tld); // allow purging
   }

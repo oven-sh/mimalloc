@@ -1266,9 +1266,21 @@ static bool test_floor_free_page(void) {
   }
   else {
     const size_t freed0 = pages_freed_by_sweeps();
+    const size_t bsize = page->block_size;
+    void* const p0 = p[0];
     free_all(p, 3);   // the last block of the page is freed: it waits for the sweep
     fd_sweeps_past_the_hold(interval_ms);
     const size_t kept1 = _mi_page_purge_holes_floor_kept();
+    // A collect that is not forced is not a sweep, and leaves what the floor keeps: every `generic_collect` allocations
+    // do one, and a runtime does one at the end of a garbage collection, which is more often than a server gets a request.
+    for (int i = 0; i < 40; i++) { mi_collect(false); }
+    const bool there1 = (freed_block_page(p0, bsize) == page);
+    sweep();
+    const size_t kept1b = _mi_page_purge_holes_floor_kept();
+    if (!there1 || kept1b != kept1) {
+      fprintf(stderr, "\n  after collects that were not forced the page that the floor kept %s there: %zu bytes kept at the next sweep, %zu before\n", (there1 ? "is" : "is not"), kept1b, kept1);
+      ok_all = false;
+    }
     void* const q = mi_malloc(size);   // and the next allocation of that size takes it
     const bool same = (q != NULL && _mi_ptr_page(q) == page);
     if (kept1 == 0 || pages_freed_by_sweeps() != freed0 || !same) {
@@ -1276,6 +1288,47 @@ static bool test_floor_free_page(void) {
       ok_all = false;
     }
     mi_free(q);
+    // Nor does such a collect free the page in the hold, where the first sweep has passed it and a later one decides..
+    sweep();
+    mi_collect(false);
+    const bool there2 = (freed_block_page(p0, bsize) == page);
+    fd_sweeps_past_the_hold(interval_ms);
+    const size_t kept1c = _mi_page_purge_holes_floor_kept();
+    if (!there2 || kept1c != kept1) {
+      fprintf(stderr, "\n  after a collect that was not forced the page in the hold %s there: %zu bytes kept after the hold, %zu the time before\n", (there2 ? "is" : "is not"), kept1c, kept1);
+      ok_all = false;
+    }
+    // ..but it does not wait for a sweep that never comes: no sweep has counted that page, so it is retired, as where
+    // its last block is freed, and gone some collects later.
+    void* const q2 = mi_malloc(size);
+    const bool same2 = (q2 != NULL && _mi_ptr_page(q2) == page);
+    mi_free(q2);
+    sweep();
+    for (int i = 0; i < 40; i++) { mi_collect(false); }
+    if (!same2 || freed_block_page(p0, bsize) != NULL) {
+      fprintf(stderr, "\n  a page in the hold is still there after 40 collects and no sweep\n");
+      ok_all = false;
+    }
+    // A forced collect takes the one under the floor as well.
+    void* const q3 = mi_malloc(size);
+    const mi_page_t* const page3 = (q3 != NULL ? _mi_ptr_page(q3) : NULL);
+    mi_free(q3);
+    fd_sweeps_past_the_hold(interval_ms);
+    const size_t kept1d = _mi_page_purge_holes_floor_kept();
+    mi_collect(true);
+    if (kept1d == 0 || page3 == NULL || freed_block_page(q3, bsize) != NULL) {
+      fprintf(stderr, "\n  a forced collect left the page that the floor kept (%zu bytes)\n", kept1d);
+      ok_all = false;
+    }
+    // (the rest of the case is about the page of before: one more, out of the hold and under the floor)
+    void* const q4 = mi_malloc(size);
+    const mi_page_t* const page4 = (q4 != NULL ? _mi_ptr_page(q4) : NULL);
+    mi_free(q4);
+    fd_sweeps_past_the_hold(interval_ms);
+    if (page4 == NULL || _mi_page_purge_holes_floor_kept() == 0 || pages_freed_by_sweeps() != freed0) {
+      fprintf(stderr, "\n  a new page with no block in use is not kept: %zu bytes, %zu pages freed by the sweeps\n", _mi_page_purge_holes_floor_kept(), pages_freed_by_sweeps() - freed0);
+      ok_all = false;
+    }
     // ..until it was not allocated from for that many epochs
     for (long i = 0; i < epochs + 8; i++) { sweep(); sleep_ms((unsigned)interval_ms + 1); }
     sweep();
