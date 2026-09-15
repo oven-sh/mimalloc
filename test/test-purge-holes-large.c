@@ -1149,7 +1149,9 @@ static bool test_floor_decay(void) {
   const long old_interval = mi_option_get(mi_option_purge_holes_min_interval);
   memset(fd_ptrs, 0, sizeof(fd_ptrs)); memset(fd_freed, 0, sizeof(fd_freed));
   mi_option_set(mi_option_purge_holes_min_interval, interval_ms);
-  const mi_msecs_t decay = _mi_page_purge_holes_floor_decay();
+  const long old_epochs = mi_option_get(mi_option_purge_holes_large_floor_epochs);
+  const long epochs = 64;
+  mi_option_set(mi_option_purge_holes_large_floor_epochs, epochs);
   const size_t n = 24;
   size_t bsize0 = 0, bsize1 = 0;
   const size_t nfreed0 = fd_fill(0, n, large_size(1), &bsize0);
@@ -1171,7 +1173,6 @@ static bool test_floor_decay(void) {
   }
 
   // 2. pages that are used later take the floor from the ones that were used before
-  sleep_ms(300);   // (more than the unit of the clock that the pages are stamped with)
   const size_t nfreed1 = fd_fill(1, n, large_size(0), &bsize1);
   if (nfreed1 == 0 || nfreed1 * bsize1 > floor || (nfreed0 * bsize0) + (nfreed1 * bsize1) <= floor) {
     fprintf(stderr, "\n  the second group does not fit the case: %zu blocks of %zu bytes\n", nfreed1, bsize1);
@@ -1185,19 +1186,29 @@ static bool test_floor_decay(void) {
     ok_all = false;
   }
 
-  // 3. and nothing stays for good
-  sleep_ms((unsigned)decay + 400);
+  // 3. time alone takes nothing: only the epochs of the sweep count, and only a sweep moves them
+  const uint32_t epoch3 = _mi_page_purge_holes_epoch();
+  const size_t kept2 = _mi_page_purge_holes_floor_kept();
+  sleep_ms((unsigned)(epochs * interval_ms) + 100);
+  const size_t kept3a = _mi_page_purge_holes_floor_kept();
+  if (kept2 < nfreed1 * bsize1 || kept3a != kept2 || _mi_page_purge_holes_epoch() != epoch3 || fd_count_purged(1, n, bsize1) != 0 || fd_count_purged(0, n, bsize0) != purged2_old) {
+    fprintf(stderr, "\n  with nothing swept for %ld ms: %zu bytes kept (%zu before), epoch %u (%u before)\n", epochs * interval_ms + 100, kept3a, kept2, _mi_page_purge_holes_epoch(), epoch3);
+    ok_all = false;
+  }
+  // ..and nothing stays once the pages were not allocated from for that many epochs
+  for (long i = 0; i < epochs + 8; i++) { sweep(); sleep_ms((unsigned)interval_ms + 1); }
   sweep();
   const size_t kept3 = _mi_page_purge_holes_floor_kept();
   const size_t purged3 = fd_count_purged(0, n, bsize0) + fd_count_purged(1, n, bsize1);
   if (kept3 != 0 || purged3 != nfreed0 + nfreed1) {
-    fprintf(stderr, "\n  %lld ms after the last allocation %zu bytes are still kept, %zu of %zu free blocks purged\n", (long long)decay + 400, kept3, purged3, nfreed0 + nfreed1);
+    fprintf(stderr, "\n  %u epochs after the last allocation %zu bytes are still kept, %zu of %zu free blocks purged\n", _mi_page_purge_holes_epoch() - epoch3, kept3, purged3, nfreed0 + nfreed1);
     ok_all = false;
   }
   if (!survivors_intact(fd_ptrs[0], n, fd_usable[0], "floor decay, first group")) { ok_all = false; }
   if (!survivors_intact(fd_ptrs[1], n, fd_usable[1], "floor decay, second group")) { ok_all = false; }
-  fprintf(stderr, "(%zu KiB kept after the hold; then %zu of %zu blocks of the older pages purged and %zu of %zu of the newer; nothing kept %lld ms later) ",
-          kept1 / MI_KiB, purged2_old, nfreed0, purged2_new, nfreed1, (long long)decay + 400);
+  fprintf(stderr, "(%zu KiB kept after the hold; then %zu of %zu blocks of the older pages purged and %zu of %zu of the newer; nothing kept %ld epochs later) ",
+          kept1 / MI_KiB, purged2_old, nfreed0, purged2_new, nfreed1, epochs);
+  mi_option_set(mi_option_purge_holes_large_floor_epochs, old_epochs);
   mi_option_set(mi_option_purge_holes_large_floor, 0);
   mi_option_set(mi_option_purge_holes_min_interval, old_interval);
   free_all(fd_ptrs[0], n); free_all(fd_ptrs[1], n);

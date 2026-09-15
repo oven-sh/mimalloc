@@ -437,6 +437,7 @@ void _mi_process_fork_child(void) {
       t->holes_sweeping = false;   // a sweep that was running at the fork (by the scavenger, or by a thread that is gone) does not continue here
       t->holes_sweep_deferred = false;
       t->holes_floor_kept = 0;   // (`_mi_page_purge_holes_forked_child` zeroes the sum)
+      t->holes_free_held = 0;
       t->holes_floor_list = NULL;
     }
     for (mi_heap_t* h = sp->heaps; h != NULL; h = h->next) {

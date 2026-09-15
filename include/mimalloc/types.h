@@ -817,7 +817,6 @@ typedef int64_t  mi_msecs_t;
 #define MI_PARK_SWEPT_DONE   (1)
 #define MI_PARK_SWEPT_SMALL  (2)   // but for large pages that were in use a moment ago: come back for those if the thread stays parked
 #define MI_PARK_SWEEPS_MAX   (6)   // sweeps of one park at the most (two or three unless a sweeper that moves the epoch is held up)
-#define MI_PARK_SWEPT_FLOOR  (64)  // done, but for what stays under `purge_holes_large_floor`: that goes when it was not used for `MI_HOLES_FLOOR_DECAY_INTERVALS`, and a thread that stays parked is swept once more for it (at `tld->holes_floor_due`)
 
 struct mi_tld_s {
   mi_threadid_t         thread_id;            // thread id of this thread
@@ -854,8 +853,7 @@ struct mi_tld_s {
   uint32_t              holes_sweep_epoch;    // the epoch of the sweep (`page.c`) when the current sweep began: its pages were compared with that one or a later one
   uint32_t              holes_park_epoch;     // ..and that of the first sweep of the current park: what the thread left when it parked is from that epoch or an earlier one
   size_t                holes_floor_kept;     // bytes that the last sweep of this tld left under `purge_holes_large_floor` (its share of `mi_holes_floor_kept` in `page.c`)
-  uint32_t              holes_sweep_ticks;    // the clock when the current sweep began, in `MI_HOLES_TICK_MSECS` (what a page that stays under the floor is stamped with and compared to)
-  mi_msecs_t            holes_floor_due;      // when a park in `MI_PARK_SWEPT_FLOOR` is swept once more (`_mi_theap_sweep_parked`)
+  size_t                holes_free_held;      // bytes of large pages that were left to the next sweep when their last block was freed, since the last sweep (`_mi_page_purge_holes_free_page_stays`)
   struct mi_holes_floor_list_s* holes_floor_list;   // the pages of this thread that the current sweep has yet to decide on (`_mi_page_purge_holes_floor_resolve`); on the stack of `mi_purge_holes_of`
 };
 

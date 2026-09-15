@@ -111,31 +111,6 @@ static inline uint32_t mi_page_sweep_state_alloc_age(uint32_t epoch) {
   return (_mi_page_purge_holes_epoch() - epoch);
 }
 
-// A large page whose free blocks a sweep left under `purge_holes_large_floor` (`_mi_page_purge_holes`) says so in
-// `swept_state`, with the clock of the first sweep that did (in `MI_HOLES_TICK_MSECS`): the sweep has a clock, the
-// allocating side has not, and an allocation from the page writes its own stamp over this one. The third pattern of the
-// top two bits (`MI_PAGE_SWEPT_NONE` is all ones, a block state has both clear).
-#define MI_PAGE_SWEPT_KEPT        (((uint64_t)2) << 62)
-#define MI_HOLES_TICK_MSECS       (128)
-#define MI_HOLES_FLOOR_DECAY_INTERVALS  (512)   // 51 s with the interval of 100 ms
-
-static inline bool mi_page_sweep_state_is_kept(const mi_page_t* page, uint32_t* ticks) {
-  if (page->swept_state == MI_PAGE_SWEPT_NONE || (page->swept_state & MI_PAGE_SWEPT_ALLOC_MASK) != MI_PAGE_SWEPT_KEPT) return false;
-  *ticks = (uint32_t)page->swept_state;
-  return true;
-}
-
-static inline uint32_t mi_holes_ticks_now(void) {
-  return (uint32_t)(_mi_clock_now() / MI_HOLES_TICK_MSECS);
-}
-
-// Free blocks of a large page stay under the floor while the page was allocated from in the last so many intervals
-// (of the default length when there is none: the hold is off then, not the floor).
-mi_msecs_t _mi_page_purge_holes_floor_decay(void) {
-  const mi_msecs_t interval = (mi_msecs_t)mi_option_get_clamp(mi_option_purge_holes_min_interval, 0, 3600000);
-  return (mi_msecs_t)MI_HOLES_FLOOR_DECAY_INTERVALS * (interval > 0 ? interval : 100);
-}
-
 // Move the epoch on if the current one has lasted for `purge_holes_min_interval`. Called by every idle sweep as the first
 // thing it does (`_mi_thread_idle_work`: a caller that sweeps every interval by its own clock is to find the epoch that its
 // last call began as old as that); the clock is read here and nowhere on the allocating side.
@@ -870,7 +845,7 @@ void _mi_page_purge_holes_sweep_begin(mi_tld_t* tld) {
   tld->holes_sweep_full = (every > 0 && (seq % (size_t)every) == 0);
   if (tld->holes_sweep_full) { mi_atomic_addi64_relaxed(&mi_holes_full_sweeps, 1); }
   _mi_page_purge_holes_floor_release(tld);   // this sweep decides again what stays under the floor
-  tld->holes_sweep_ticks = mi_holes_ticks_now();
+  tld->holes_free_held = 0;                  // ..also for the pages that were left to it when their last block was freed
   tld->holes_sweep_epoch = _mi_page_purge_holes_epoch();   // the sweep owns the time that large pages are held by (see `_mi_page_purge_holes`): no page of this sweep is compared with an older epoch than this
 }
 
@@ -1161,57 +1136,58 @@ static void mi_page_purge_holes_now(mi_page_t* page, mi_tld_t* tld);
 // what is there of the floor goes to the ones that were used last and not to the ones that the sweep came to first.
 // (The abandoned pages of its heaps come after that, one at a time as they are claimed, for what is left.)
 // (`mi_holes_floor_list_t` is in `internal.h`: it lives on the stack of `theap.c:mi_purge_holes_of`)
-static void mi_page_holes_floor_stays(mi_page_t* page, uint64_t recency) {
+static void mi_page_holes_floor_stays(mi_page_t* page) {
   mi_page_purge_unformed_tail(page);   // (the blocks that were never formed are not what stays)
-  page->swept_state = (MI_PAGE_SWEPT_KEPT | (recency >> 32));
+  // `swept_state` stays the epoch of the page's last allocation: that is all the age there is
 }
 
-// Is this a large page whose free blocks may stay under the floor? Then either it is noted for the end of the pass
-// (true), or decided now: true if they stay.
+// Is this a large page that may stay under the floor: one that was allocated from in the last
+// `purge_holes_large_floor_epochs` epochs? Then either it is noted for the end of the pass (true), or decided now:
+// true if it stays.
 static bool mi_page_holes_floor_keep(mi_page_t* page, mi_tld_t* tld) {
   if (mi_page_block_size(page) <= MI_MEDIUM_MAX_OBJ_SIZE || page->reserved <= 1 || !mi_page_holes_madvisable(page)) return false;
   if (mi_option_get_size(mi_option_purge_holes_large_floor) == 0) return false;
-  const mi_msecs_t decay = _mi_page_purge_holes_floor_decay();
-  if (decay <= 0) return false;
-  uint64_t recency;
   uint32_t stamp;
-  if (mi_page_sweep_state_is_alloc(page, &stamp)) {
-    recency = (((uint64_t)tld->holes_sweep_ticks) << 32) | stamp;    // out of the hold just now
-  }
-  else if (mi_page_sweep_state_is_kept(page, &stamp)) {
-    if ((mi_msecs_t)((uint32_t)(tld->holes_sweep_ticks - stamp)) * MI_HOLES_TICK_MSECS >= decay) return false;   // not used for that long: it goes
-    recency = ((uint64_t)stamp) << 32;
-  }
-  else {
-    return false;   // swept before, and not allocated from since
-  }
+  if (!mi_page_sweep_state_is_alloc(page, &stamp)) return false;   // swept before, and not allocated from since
+  const uint32_t age = mi_page_sweep_state_alloc_age(stamp);
+  if ((long)age >= mi_option_get_clamp(mi_option_purge_holes_large_floor_epochs, 0, INT32_MAX)) return false;   // not used for that long: it goes
   const size_t bytes = mi_page_large_resident_free(page);   // (what is discarded already is not on the free list)
   if (bytes == 0) return false;
   mi_holes_floor_list_t* const list = tld->holes_floor_list;
   if (list != NULL && !mi_page_is_abandoned(page) && list->count < MI_HOLES_FLOOR_LIST_MAX) {
     mi_holes_floor_item_t* const item = &list->items[list->count++];
-    item->page = page; item->recency = recency; item->bytes = bytes;
+    item->page = page; item->age = age; item->bytes = bytes;
     return true;
   }
   if (!mi_holes_floor_take(tld, bytes)) return false;
-  mi_page_holes_floor_stays(page, recency);
+  mi_page_holes_floor_stays(page);
   return true;
 }
 
 // A large page all of whose blocks are free (the sweep found it so after it collected what other threads freed) is
-// what its free blocks are: the buffers of a thread that takes them again at its next request. It stays as the free
-// blocks of a page with a block in use would: while it was allocated from in this epoch or the one before, and then
-// under the floor while that lasts. Else the caller frees it, as it did every such page before.
-// Also asked by a collect that is not forced and when the last block of a page is freed (`in_sweep` false): those
-// leave the page to the sweep if it may stay, and only for a thread that is swept at all.
-bool _mi_page_purge_holes_free_page_stays(mi_page_t* page, mi_tld_t* tld, bool in_sweep) {
+// what its free blocks are: the buffers of a thread that takes them again at its next request, and where most of the
+// page faults of such a thread came from. It stays by the same rule as the free blocks of a page with a block in use
+// (`_mi_page_purge_holes`). Else the caller frees it, as it did every such page before.
+// Also asked when the last block of a page is freed (`MI_HOLES_ASKED_AT_FREE`) and by a collect that is not forced
+// (`MI_HOLES_ASKED_BY_COLLECT`): those leave a page that was allocated from since it was last swept to the next sweep,
+// for a thread that is swept at all. Between two sweeps a thread leaves `purge_holes_large_floor` bytes that way at the
+// most (`holes_free_held`): one that frees and does not park for a long time is not to sit on more than that.
+bool _mi_page_purge_holes_free_page_stays(mi_page_t* page, mi_tld_t* tld, int asked) {
   if (mi_page_block_size(page) <= MI_MEDIUM_MAX_OBJ_SIZE || page->reserved <= 1) return false;
   if (!mi_option_is_enabled(mi_option_purge_holes) || mi_option_get(mi_option_purge_delay) < 0) return false;
   if (tld == NULL || !mi_page_holes_madvisable(page)) return false;
+  const size_t floor = mi_option_get_size(mi_option_purge_holes_large_floor);
+  if (floor == 0) return false;   // (such a page is freed where it is found then, as it always was)
   uint32_t stamp;
-  if (!in_sweep) {
+  if (asked != MI_HOLES_ASKED_IN_SWEEP) {
     if (tld->holes_sweep_seq == 0) return false;   // nothing sweeps this thread
-    return (mi_page_sweep_state_is_alloc(page, &stamp) || mi_page_sweep_state_is_kept(page, &stamp));   // the next sweep decides
+    if (!mi_page_sweep_state_is_alloc(page, &stamp)) return false;
+    if (asked == MI_HOLES_ASKED_AT_FREE) {
+      const size_t bytes = (size_t)page->capacity * mi_page_block_size(page);   // (its blocks are on more than one list here; on the high side where some are discarded)
+      if (bytes > floor || tld->holes_free_held > floor - bytes) return false;
+      tld->holes_free_held += bytes;
+    }
+    return true;
   }
   if (mi_page_sweep_state_is_alloc(page, &stamp) && mi_page_sweep_state_alloc_age(stamp) < 2 && mi_option_get(mi_option_purge_holes_min_interval) > 0) {
     tld->holes_sweep_deferred = true;
@@ -1229,12 +1205,12 @@ void _mi_page_purge_holes_floor_resolve(mi_tld_t* tld) {
   for (size_t i = 1; i < list->count; i++) {   // (insertion sort: a few pages)
     const mi_holes_floor_item_t item = list->items[i];
     size_t j = i;
-    while (j > 0 && list->items[j-1].recency < item.recency) { list->items[j] = list->items[j-1]; j--; }
+    while (j > 0 && list->items[j-1].age > item.age) { list->items[j] = list->items[j-1]; j--; }
     list->items[j] = item;
   }
   for (size_t i = 0; i < list->count; i++) {
     mi_holes_floor_item_t* const item = &list->items[i];
-    if (mi_holes_floor_take(tld, item->bytes)) { mi_page_holes_floor_stays(item->page, item->recency); }
+    if (mi_holes_floor_take(tld, item->bytes)) { mi_page_holes_floor_stays(item->page); }
     else if (mi_page_all_free(item->page)) { _mi_page_holes_count_page_freed(); _mi_page_free(item->page, mi_page_queue_of(item->page)); }   // (see `_mi_page_purge_holes_free_page_stays`)
     else { mi_page_purge_holes_now(item->page, tld); }
   }
@@ -1293,11 +1269,13 @@ void _mi_page_purge_holes(mi_page_t* page, mi_tld_t* tld) {
       return;
     }
   }
-  // The floor: once the hold above is over, `purge_holes_large_floor` bytes of free blocks in large pages still stay,
-  // process-wide and a whole page at a time, in the pages that were allocated from last. A server with a request now and
-  // then would fault its buffers in again on every request otherwise. Not for good: `MI_HOLES_FLOOR_DECAY_INTERVALS`
-  // after the page was last allocated from they go like the rest (a program that has gone quiet is to end up with
-  // nothing kept), and whoever sweeps a thread that stays parked comes back for that once (`_mi_theap_sweep_parked`).
+  // The floor. The whole rule for a large page, its free blocks or all of it (`_mi_page_purge_holes_free_page_stays`):
+  //   it is left alone until it has not been allocated from for `purge_holes_large_floor_epochs` epochs, for up to
+  //   `purge_holes_large_floor` bytes process-wide (the pages that were used last first); past either, the two epochs
+  //   above are all it gets.
+  // A server with a request now and then would fault its buffers in again on every request otherwise. The only time
+  // there is is the epoch, which a sweep moves and nothing else: no clock is kept in the page and nothing is woken for
+  // this. A process in which no thread parks any more keeps those bytes until one does.
   if (mi_page_holes_floor_keep(page, tld)) return;
   mi_page_purge_holes_now(page, tld);
 }
@@ -1951,7 +1929,7 @@ void _mi_page_retire(mi_page_t* page) mi_attr_noexcept {
   // a large page that was just allocated from is for the idle sweep to free (`_mi_page_purge_holes_free_page_stays`)
   if (mi_page_block_size(page) > MI_MEDIUM_MAX_OBJ_SIZE && !mi_page_queue_is_special(pq)) {
     mi_theap_t* const rtheap = mi_page_theap(page);
-    if (rtheap != NULL && _mi_page_purge_holes_free_page_stays(page, rtheap->tld, false)) return;
+    if (rtheap != NULL && _mi_page_purge_holes_free_page_stays(page, rtheap->tld, MI_HOLES_ASKED_AT_FREE)) return;
   }
   #if MI_RETIRE_CYCLES > 0
   const size_t bsize = mi_page_block_size(page);

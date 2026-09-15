@@ -112,7 +112,7 @@ static bool mi_theap_page_collect(mi_theap_t* theap, mi_page_queue_t* pq, mi_pag
     if (collect >= MI_FORCE || page->retire_expire == 0) {  // either forced/abandon, or not already retired
       // note: this will potentially free retired pages as well.
       // (a large page that was just allocated from is for the idle sweep, which comes after the collect of an idle thread)
-      if (collect >= MI_FORCE || !_mi_page_purge_holes_free_page_stays(page, theap->tld, false)) {
+      if (collect >= MI_FORCE || !_mi_page_purge_holes_free_page_stays(page, theap->tld, MI_HOLES_ASKED_BY_COLLECT)) {
         _mi_page_free(page, pq);
       }
     }
@@ -204,7 +204,7 @@ static bool mi_theap_page_purge_holes(mi_theap_t* theap, mi_page_queue_t* pq, mi
   if (mi_page_all_free(page)) {
     // the forced collect emptied the page: hand it back instead of leaving it resident
     // (but for a large page that was just in use, or that stays under the floor)
-    if (_mi_page_purge_holes_free_page_stays(page, tld, true)) return true;
+    if (_mi_page_purge_holes_free_page_stays(page, tld, MI_HOLES_ASKED_IN_SWEEP)) return true;
     _mi_page_holes_count_page_freed();
     _mi_page_free(page, pq);
     return true;
@@ -407,15 +407,7 @@ mi_msecs_t _mi_theap_sweep_parked(mi_subproc_t* subproc) {
       const mi_msecs_t now = _mi_clock_now();
       const mi_msecs_t interval = (mi_msecs_t)mi_option_get_clamp(mi_option_purge_holes_min_interval, 0, 3600000);
       for (mi_tld_t* tld = subproc->tlds; tld != NULL; tld = tld->subproc_next) {
-        const uint32_t tld_swept = mi_atomic_load_acquire(&tld->park_swept);
-        if (tld_swept == MI_PARK_SWEPT_DONE) continue;   // already done for this park
-        if (tld_swept == MI_PARK_SWEPT_FLOOR && now < tld->holes_floor_due) {   // done but for what stays under the floor: once more when that is over
-          if (mi_atomic_load_relaxed(&tld->park_state) == MI_PARK_PARKED) {
-            const mi_msecs_t due = tld->holes_floor_due - now;
-            if (due_in == 0 || due < due_in) { due_in = due; }
-          }
-          continue;
-        }
+        if (mi_atomic_load_acquire(&tld->park_swept) == MI_PARK_SWEPT_DONE) continue;   // already done for this park
         if (interval > 0 && tld->holes_sweep_last != 0 && now - tld->holes_sweep_last < interval) {
           if (mi_atomic_load_relaxed(&tld->park_state) == MI_PARK_PARKED) {
             const mi_msecs_t due = interval - (now - tld->holes_sweep_last);
@@ -454,18 +446,11 @@ mi_msecs_t _mi_theap_sweep_parked(mi_subproc_t* subproc) {
     // early on `park_reclaim`, the owner is leaving the park anyway, so the rest is its next park's.
     uint32_t next = MI_PARK_SWEPT_DONE;
     if (swept == MI_PARK_SWEPT_NONE) { claimed->holes_park_epoch = claimed->holes_sweep_epoch; }
-    if (claimed->holes_sweep_deferred && swept != MI_PARK_SWEPT_FLOOR) {
+    if (claimed->holes_sweep_deferred) {
       const uint32_t sweeps = (swept == MI_PARK_SWEPT_NONE ? 1 : (swept - MI_PARK_SWEPT_SMALL) + 2);   // this one included
       if ((uint32_t)(claimed->holes_sweep_epoch - claimed->holes_park_epoch) < 2 && sweeps < MI_PARK_SWEEPS_MAX) {
         next = MI_PARK_SWEPT_SMALL + (sweeps - 1);
       }
-    }
-    // What this sweep left under `purge_holes_large_floor` goes when it was not used for a while
-    // (`_mi_page_purge_holes`): if the thread is still in this park then, it is swept once more, which leaves nothing
-    // (or what other threads used in the pages that they share with this one since; then once more again).
-    if (next == MI_PARK_SWEPT_DONE && claimed->holes_floor_kept > 0 && mi_atomic_load_relaxed(&claimed->park_reclaim) == 0) {
-      next = MI_PARK_SWEPT_FLOOR;
-      claimed->holes_floor_due = claimed->holes_sweep_last + _mi_page_purge_holes_floor_decay() + MI_HOLES_FLOOR_DUE_SLACK;
     }
     mi_atomic_store_release(&claimed->park_swept, next);
     // Back to PARKED, not RUNNING: the owner is still blocked and still owns the transition out.
