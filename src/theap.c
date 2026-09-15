@@ -604,12 +604,7 @@ void _mi_theap_init(mi_theap_t* theap, mi_heap_t* heap, mi_tld_t* tld)
     mi_profiler_t* const prof = mi_atomic_load_ptr_acquire(mi_profiler_t,&heap->profiler);
     const size_t prof_state = (prof!=NULL ? mi_profiler_state(prof) : 0);
     if (mi_profiler_state_is_enabled(prof_state) && prof->on_alloc!=NULL) {
-      theap->profile_sample_epoch = mi_profiler_state_epoch(prof_state);
-      _mi_theap_set_profile_sample_rate(theap, (prof->initial_sample_rate==0 ? 1 : prof->initial_sample_rate));
-      // and start with a full period: the countdowns are 0 here, and with that the first allocation would be
-      // a sample that reports a whole period of bytes that nobody requested.
-      theap->profile_sample_countdown = theap->profile_sample_rate;
-      theap->sample_countdown = theap->sample_rate;
+      _mi_theap_start_profile_period(theap,prof,prof_state);
     }
   }
   #endif
@@ -629,13 +624,11 @@ void _mi_theap_init(mi_theap_t* theap, mi_heap_t* heap, mi_tld_t* tld)
     heap->theaps = theap;
   }
   #if MI_PROFILE && MI_SAMPLE
-  // `mi_profiler_start` leaves a request to look at the profiler with the theaps on that list: if it ran between
-  // our look above and here, it has missed this one.
+  // `mi_profiler_start` and `mi_profiler_stop` leave a request to look at the profiler with the theaps on that list:
+  // one that ran between our look above and here has missed this one.
   if (!theap->is_detached) {
     mi_profiler_t* const prof = mi_atomic_load_ptr_acquire(mi_profiler_t,&heap->profiler);
-    const size_t prof_state = (prof!=NULL ? mi_profiler_state(prof) : 0);
-    if (mi_profiler_state_is_enabled(prof_state) && 
-        (theap->profile_sample_rate==0 || theap->profile_sample_epoch != mi_profiler_state_epoch(prof_state))) {
+    if (_mi_theap_profiling_is_stale(theap, (prof!=NULL ? mi_profiler_state(prof) : 0))) {
       mi_atomic_store_release(&theap->generic_fast_limit, (intptr_t)(-1));
     }
   }

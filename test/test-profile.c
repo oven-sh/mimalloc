@@ -611,92 +611,131 @@ bool test_profiler_start_with_running_threads(void) {
 }
 
 
-// A thread that was sampled before a stop, and that allocates nothing between the stop and the next start, starts
-// over with that start: it does not run out the period it was in (at the rate it had then), and its first sample does
-// not report what it requested before the start.
+// A thread that was sampled before a stop, and that does not get to look at the profiler between the stop and the
+// next start, starts over with that start: it does not run out the period it was in (at the rate it had then), and its
+// first sample does not report what it got before the start.
 #define RESTART_BLOCK       (64*1024)
+#define RESTART_SMALL       64
 #define RESTART_LONG_RATE   ((size_t)256*1024*1024)
 #define RESTART_SHORT_RATE  ((size_t)64*1024)
 #define RESTART_EVEN_RATE   ((size_t)1024*1024)
-static _Atomic(size_t) restart_phase;       // the worker does phase 1, 3, 5, 7 when it sees that number; the other thread does the even ones
+static _Atomic(size_t) restart_phase;       // the worker does the odd phases when it sees their number, the other thread the even ones
 static _Atomic(size_t) restart_rate;        // what `on_alloc` returns
 static _Atomic(size_t) restart_samples;     // of the worker, since the last start
 static _Atomic(size_t) restart_bytes;       // sum of their `bytes_since_last_sample`
 static _Atomic(size_t) restart_first;       // `bytes_since_last_sample` of the first one
-static _Atomic(size_t) restart_first_after; // what the worker had requested since the start when it came
-static mi_decl_thread size_t restart_requested;
+static _Atomic(size_t) restart_first_after; // what the worker had got since the start when it came, in bytes of blocks
+static mi_decl_thread size_t restart_got;   // (a block can be larger than what was requested, and a build that counts the
+                                            //  blocks of a page when it is refilled counts the size of the blocks)
 static mi_decl_thread bool   restart_is_worker;
+static void* restart_small[4096];
 
 static size_t mi_cdecl restart_on_alloc(mi_profiler_t* profiler, mi_profiler_sample_data_t* data, void* ptr, size_t requested_size, size_t threshold, uint64_t bytes_since_last_sample, const mi_heap_t* heap) {
   MI_UNUSED(profiler); MI_UNUSED(data); MI_UNUSED(ptr); MI_UNUSED(threshold); MI_UNUSED(heap);
   if (restart_is_worker) {
     if (mi_atomic_increment_relaxed(&restart_samples) == 0) {
       mi_atomic_store_relaxed(&restart_first, (size_t)bytes_since_last_sample);
-      mi_atomic_store_relaxed(&restart_first_after, restart_requested + requested_size);
+      mi_atomic_store_relaxed(&restart_first_after, restart_got + mi_good_size(requested_size));
     }
     mi_atomic_add_relaxed(&restart_bytes, (size_t)bytes_since_last_sample);
   }
   return mi_atomic_load_relaxed(&restart_rate);
 }
 
-static mi_profiler_t restart_profiler = { NULL, 0, RESTART_EVEN_RATE, &restart_on_alloc, NULL, NULL };
+static mi_profiler_t restart_profiler  = { NULL, 0, RESTART_EVEN_RATE, &restart_on_alloc, NULL, NULL };
+static mi_profiler_t restart_profiler2 = { NULL, 0, RESTART_EVEN_RATE, &restart_on_alloc, NULL, NULL };
+static mi_profiler_t restart_profiler3 = { NULL, 0, 1, &restart_on_alloc, NULL, NULL };
 
 static void restart_wait(size_t phase) {
   while (mi_atomic_load_acquire(&restart_phase) != phase) { mi_atomic_pause(); }
 }
 
-static void restart_allocate(size_t total) {
-  restart_requested = 0;
-  while (restart_requested < total) {
-    mi_free(mi_malloc(RESTART_BLOCK));   // (through the generic path each time)
-    restart_requested += RESTART_BLOCK;
+static void restart_next(size_t phase) {
+  mi_atomic_store_release(&restart_phase, phase);
+}
+
+static void restart_allocate(size_t total) {   // blocks that go through the generic path each time
+  for (size_t requested = 0; requested < total; requested += RESTART_BLOCK) {
+    mi_free(mi_malloc(RESTART_BLOCK));
+    restart_got += mi_good_size(RESTART_BLOCK);
   }
 }
 
-static void restart_begin(size_t rate) {
+static void restart_allocate_small(size_t from, size_t to) {   // blocks that mostly come from the free list of a page
+  for (size_t i = from; i < to; i++) {
+    restart_small[i] = mi_malloc(RESTART_SMALL);
+    restart_got += mi_good_size(RESTART_SMALL);
+  }
+}
+
+static void restart_begin(mi_profiler_t* profiler, size_t rate) {
   mi_atomic_store_relaxed(&restart_rate, rate);
   mi_atomic_store_relaxed(&restart_samples, (size_t)0);
   mi_atomic_store_relaxed(&restart_bytes, (size_t)0);
   mi_atomic_store_relaxed(&restart_first, (size_t)0);
   mi_atomic_store_relaxed(&restart_first_after, (size_t)0);
-  mi_profiler_start(&restart_profiler);
+  mi_profiler_start(profiler);
 }
 
-static size_t restart_short_bytes, restart_even_first, restart_even_first_after;
+static size_t restart_short_bytes, restart_short_got, restart_even_first, restart_even_first_after, restart_every_before, restart_every_samples;
 
 static void restart_thread(intptr_t tid) {
   if (tid == 0) {
     restart_is_worker = true;
-    restart_wait(1); restart_allocate(RESTART_EVEN_RATE*3/2);      // ends half way into a period
-    mi_atomic_store_release(&restart_phase, (size_t)2);
-    restart_wait(3); restart_allocate(RESTART_EVEN_RATE*4);
-    mi_atomic_store_release(&restart_phase, (size_t)4);
-    restart_wait(5); restart_allocate(32*1024*1024);               // one sample, which sets the long rate
-    mi_atomic_store_release(&restart_phase, (size_t)6);
-    restart_wait(7); restart_allocate(32*1024*1024);               // at the short rate: all of it is sampled
-    mi_atomic_store_release(&restart_phase, (size_t)8);
+    // 1. a period at a long rate, then a short rate (of another profiler, that is started for the first time as well)
+    restart_wait(1); restart_allocate(32*1024*1024);               // one sample, which sets the long rate
+    restart_next(2);
+    restart_wait(3); restart_got = 0; restart_allocate(32*1024*1024);   // at the short rate: all of it is sampled
+    restart_short_got = restart_got;
+    restart_next(4);
+    // 2. a stop half way into a period, with blocks that a page handed out and that are not counted yet
+    restart_wait(5); restart_allocate(RESTART_EVEN_RATE*3/2); restart_allocate_small(0,900);
+    restart_next(6);
+    restart_wait(7); restart_got = 0; restart_allocate_small(900,1100); restart_allocate(RESTART_EVEN_RATE*4);
+    restart_next(8);
+    for (size_t i = 0; i < 1100; i++) { mi_free(restart_small[i]); }
+    // 3. a rate at which every allocation is a sample, then one at which none of these is
+    restart_wait(9); restart_allocate_small(0,1990);
+    restart_next(10);
+    restart_wait(11); restart_allocate_small(1990,3990);
+    restart_next(12);
+    for (size_t i = 0; i < 3990; i++) { mi_free(restart_small[i]); }
     restart_is_worker = false;
   }
   else {
-    restart_begin(RESTART_EVEN_RATE);
-    mi_atomic_store_release(&restart_phase, (size_t)1);
-    restart_wait(2);
+    restart_begin(&restart_profiler, RESTART_LONG_RATE);
+    restart_next(1); restart_wait(2);
     mi_profiler_stop(&restart_profiler);
-    restart_begin(RESTART_EVEN_RATE);
-    mi_atomic_store_release(&restart_phase, (size_t)3);
-    restart_wait(4);
+    mi_profile(NULL);
+    mi_profile(&restart_profiler2);
+    restart_begin(&restart_profiler2, RESTART_SHORT_RATE);
+    restart_next(3); restart_wait(4);
+    mi_profiler_stop(&restart_profiler2);
+    restart_short_bytes = mi_atomic_load_relaxed(&restart_bytes);
+    mi_profile(NULL);
+    mi_profile(&restart_profiler);
+
+    restart_begin(&restart_profiler, RESTART_EVEN_RATE);
+    restart_next(5); restart_wait(6);
+    mi_profiler_stop(&restart_profiler);
+    restart_begin(&restart_profiler, RESTART_EVEN_RATE);
+    restart_next(7); restart_wait(8);
     mi_profiler_stop(&restart_profiler);
     restart_even_first = mi_atomic_load_relaxed(&restart_first);
     restart_even_first_after = mi_atomic_load_relaxed(&restart_first_after);
-    restart_begin(RESTART_LONG_RATE);
-    mi_atomic_store_release(&restart_phase, (size_t)5);
-    restart_wait(6);
+
+    mi_profile(NULL);
+    mi_profile(&restart_profiler3);
+    restart_begin(&restart_profiler3, RESTART_SMALL/2);
+    restart_next(9); restart_wait(10);
+    mi_profiler_stop(&restart_profiler3);
+    restart_every_before = mi_atomic_load_relaxed(&restart_samples);
+    mi_profile(NULL);
+    mi_profile(&restart_profiler);
+    restart_begin(&restart_profiler, RESTART_EVEN_RATE);
+    restart_next(11); restart_wait(12);
     mi_profiler_stop(&restart_profiler);
-    restart_begin(RESTART_SHORT_RATE);
-    mi_atomic_store_release(&restart_phase, (size_t)7);
-    restart_wait(8);
-    mi_profiler_stop(&restart_profiler);
-    restart_short_bytes = mi_atomic_load_relaxed(&restart_bytes);
+    restart_every_samples = mi_atomic_load_relaxed(&restart_samples);
   }
 }
 
@@ -709,10 +748,12 @@ bool test_profiler_restart(void) {
     mi_profile(NULL);
     mi_profile(&my_profiler.profiler);
     mi_profiler_start(&my_profiler.profiler);
-    fprintf(stderr, "  (after a stop half way into a period: the first sample reports %zu bytes, %zu requested since the start; after a period at a rate of %zu, at a rate of %zu: %zu of %d bytes sampled)\n",
-      restart_even_first, restart_even_first_after, RESTART_LONG_RATE, RESTART_SHORT_RATE, restart_short_bytes, 32*1024*1024);
-    result = (restart_short_bytes >= 31*1024*1024 && restart_short_bytes <= 33*1024*1024 &&
-              restart_even_first != 0 && restart_even_first <= restart_even_first_after);
+    fprintf(stderr, "  (after a period at a rate of %zu, at a rate of %zu: %zu bytes sampled of %d requested in blocks of %zu; after a stop half way into a period: the first sample reports %zu bytes, the thread got %zu since the start; after %zu samples at a rate of %d, %zu samples of 2000 blocks of %d bytes at a rate of %zu)\n",
+      RESTART_LONG_RATE, RESTART_SHORT_RATE, restart_short_bytes, 32*1024*1024, restart_short_got, 
+      restart_even_first, restart_even_first_after, restart_every_before, RESTART_SMALL/2, restart_every_samples, RESTART_SMALL, RESTART_EVEN_RATE);
+    result = (restart_short_bytes >= 31*1024*1024 && restart_short_bytes <= restart_short_got &&
+              restart_even_first != 0 && restart_even_first <= restart_even_first_after &&
+              restart_every_before >= 1 && restart_every_samples == 0);
   }
   return true;
 }

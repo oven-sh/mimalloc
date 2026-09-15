@@ -75,7 +75,7 @@ mi_decl_export bool mi_profile(mi_profiler_t* profiler);
 mi_decl_export bool mi_profiler_start(mi_profiler_t* profiler);
 
 // end sampling (a thread that is taking a sample right now may still call `on_alloc` after this returns)
-// Takes the same locks as `mi_profiler_start`, with the same restrictions (it takes none in the child of a fork).
+// Waits for no lock: it can be called from an `on_alloc` or `on_free` callback and from a visitor of the heaps.
 mi_decl_export bool mi_profiler_stop(mi_profiler_t* profiler);
 
 #ifdef __cplusplus

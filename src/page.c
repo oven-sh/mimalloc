@@ -2384,6 +2384,30 @@ static mi_theap_t* mi_theap_init(mi_theap_t* theap) {
   return theap;
 }
 
+// Whether a theap has to start or stop profiling, or start over: the profiler in `prof_state` is not the one, or not
+// the start of it, that its rate and countdowns are from.
+bool _mi_theap_profiling_is_stale(const mi_theap_t* theap, size_t prof_state) {
+  const bool prof_enabled = mi_profiler_state_is_enabled(prof_state);
+  return (prof_enabled != (theap->profile_sample_rate!=0) ||
+          (prof_enabled && theap->profile_sample_epoch != mi_profiler_state_epoch(prof_state)));
+}
+
+// Start a profile period of `prof_state` from the beginning: with the initial rate, nothing of it used up and nothing
+// requested yet.
+void _mi_theap_start_profile_period(mi_theap_t* theap, const mi_profiler_t* prof, size_t prof_state) {
+  _mi_theap_set_profile_sample_rate(theap, mi_max(1,prof->initial_sample_rate));
+  // with a full period (with guarded sampling on, the first sample point would be a profile sample otherwise, with what
+  // was requested since the theap was made; in a new theap the countdowns are 0, and the first allocation would be a
+  // sample that reports a whole period of bytes that nobody requested)
+  theap->profile_sample_countdown = theap->profile_sample_rate;
+  theap->sample_countdown = theap->sample_rate;
+  theap->sample_requested = 0;
+  theap->profile_sample_epoch = mi_profiler_state_epoch(prof_state);
+  #if MI_SAMPLE==1
+  _mi_theap_sync_sample_counts(theap);   // what its pages handed out up to here is not of this period
+  #endif
+}
+
 // Start or stop profiling for a theap if its profiler was started or stopped, or stopped and started again: what the
 // theap has from before that stop (the rate that `on_alloc` gave it, how far it is into that period, what was requested
 // since its last sample) is not for this start. A theap that saw neither the stop nor the start would otherwise take
@@ -2398,9 +2422,7 @@ void _mi_theap_update_profiling(mi_theap_t* theap) {
   mi_heap_t* const heap = _mi_theap_heap(theap);
   mi_profiler_t* prof = mi_atomic_load_ptr_acquire(mi_profiler_t, &heap->profiler);
   const size_t prof_state = (prof!=NULL ? mi_profiler_state(prof) : 0);
-  const bool prof_enabled = mi_profiler_state_is_enabled(prof_state);
-  if (prof_enabled != (theap->profile_sample_rate!=0) || 
-      (prof_enabled && theap->profile_sample_epoch != mi_profiler_state_epoch(prof_state))) {
+  if (_mi_theap_profiling_is_stale(theap,prof_state)) {
     if (theap->sample_rate==0 && (theap->profile_sample_rate!=0 || theap->guarded_sample_rate!=0)) {
       // not inside `_mi_malloc_generic_no_sample`, which has set the sample rate aside and puts it back: at the next
       // generic allocation. (If every one is a sample, `mi_malloc_generic_admin` can get here inside of it every time.)
@@ -2409,14 +2431,8 @@ void _mi_theap_update_profiling(mi_theap_t* theap) {
       #endif
       return;
     }
-    if (prof_enabled) {
-      _mi_theap_set_profile_sample_rate(theap,mi_max(1,prof->initial_sample_rate)); // start profiling
-      // with a full period, as in `theap.c:_mi_theap_init` (with guarded sampling on, the first sample point would be a
-      // profile sample, with what was requested since the theap was made)
-      theap->profile_sample_countdown = theap->profile_sample_rate;
-      theap->sample_countdown = theap->sample_rate;
-      theap->sample_requested = 0;
-      theap->profile_sample_epoch = mi_profiler_state_epoch(prof_state);
+    if (mi_profiler_state_is_enabled(prof_state)) {
+      _mi_theap_start_profile_period(theap,prof,prof_state);
     }
     else {
       _mi_theap_set_profile_sample_rate(theap,0); // stop profiling

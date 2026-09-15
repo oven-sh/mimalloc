@@ -164,9 +164,11 @@ mi_decl_noinline mi_decl_restrict void* _mi_theap_malloc_profiled(mi_theap_t* th
   const size_t req_size = size - MI_PADDING_SIZE;
   mi_assert_internal(req_size<=requested_since_last_sample);
   mi_profiler_t* const prof = mi_theap_get_enabled_profiler(theap);
-  if (prof == NULL) {
-    // the profiler was stopped: no need to wait for `mi_malloc_generic_admin` to see that (when every allocation is a
-    // sample, all other generic allocations are inside `_mi_malloc_generic_no_sample`, where it does not look)
+  if (prof == NULL || theap->profile_sample_epoch != mi_profiler_state_epoch(mi_profiler_state(prof))) {
+    // the profiler was stopped, or stopped and started again (this sample is of the period before then): no need to
+    // wait for `mi_malloc_generic_admin` to see that (when every allocation is a sample, all other generic allocations
+    // are inside `_mi_malloc_generic_no_sample`, where it does not look; and with MI_SAMPLE==2 a sample that comes due
+    // in `alloc.c` does not pass `mi_malloc_generic_fallback`)
     _mi_theap_update_profiling(theap);
     return _mi_malloc_generic_no_sample(theap,size,zero,ppage);
   }
@@ -299,7 +301,7 @@ static bool mi_heap_set_profiler(mi_heap_t* heap, mi_profiler_t* profiler) {
 }
 
 mi_decl_export bool mi_heap_profile(mi_heap_t* heap, mi_profiler_t* profiler) {
-  mi_profiler_stop(profiler);
+  if (profiler!=NULL) { mi_profiler_set_enabled(profiler,false); }   // (not `mi_profiler_stop`: no locks here)
   return mi_heap_set_profiler(heap,profiler);
 }
 
@@ -312,7 +314,7 @@ mi_decl_export void mi_heap_profile_disable(mi_heap_t* heap) {
 mi_decl_export bool mi_subproc_profile(mi_subproc_id_t subproc_id, mi_profiler_t* profiler) {
   mi_subproc_t* subproc = _mi_subproc_from_id(subproc_id);
   if (subproc==NULL) return false;   
-  mi_profiler_stop(profiler);  
+  if (profiler!=NULL) { mi_profiler_set_enabled(profiler,false); }
   mi_profiler_t* previous = (profiler==NULL ? mi_atomic_load_ptr_acquire(mi_profiler_t,&subproc->profiler) : NULL); // don't overwrite unless it is NULL
   if (!mi_atomic_cas_ptr_strong_acq_rel(mi_profiler_t,&subproc->profiler, &previous, profiler)) { return false; }  
   mi_lock(&subproc->heaps_lock) {
@@ -327,33 +329,43 @@ mi_decl_export bool mi_profile( mi_profiler_t* profiler) {
   return mi_subproc_profile(mi_subproc_main(),profiler);
 }
 
+_Atomic(size_t) _mi_profiler_epoch;   // = 0 (see `internal.h:mi_profiler_set_enabled`)
+
 // Ask the theaps of the heaps of a sub-process that have this profiler to look at it at their next generic
 // allocation: without this they only do so every `MI_GENERIC_FAST_LIMIT` generic allocations, which is many
 // megabytes of small blocks. (The theaps belong to other threads: we only leave the request.)
-static void mi_profiler_request_look(mi_subproc_t* subproc, mi_profiler_t* profiler) {
+// With `wait` false a lock that is taken is not waited for, and what is behind it is left out.
+static void mi_profiler_request_look_in(mi_subproc_t* subproc, mi_profiler_t* profiler, bool wait) {
   #if MI_SAMPLE
-  mi_lock(&subproc->heaps_lock) {
-    for (mi_heap_t* heap = subproc->heaps; heap!=NULL; heap = heap->next) {
-      if (mi_heap_profiler(heap)!=profiler) continue;
-      mi_lock(&heap->theaps_lock) {
-        for (mi_theap_t* theap = heap->theaps; theap!=NULL; theap = theap->hnext) {
-          if (theap->is_detached) continue;  // (meta data is not sampled)
-          mi_atomic_store_release(&theap->generic_fast_limit, (intptr_t)(-1));
-        }
-      }
+  if (wait) { mi_lock_acquire(&subproc->heaps_lock); }
+  else if (!mi_lock_try_acquire(&subproc->heaps_lock)) { return; }
+  for (mi_heap_t* heap = subproc->heaps; heap!=NULL; heap = heap->next) {
+    if (mi_heap_profiler(heap)!=profiler) continue;
+    if (wait) { mi_lock_acquire(&heap->theaps_lock); }
+    else if (!mi_lock_try_acquire(&heap->theaps_lock)) { continue; }
+    for (mi_theap_t* theap = heap->theaps; theap!=NULL; theap = theap->hnext) {
+      if (theap->is_detached) continue;  // (meta data is not sampled)
+      mi_atomic_store_release(&theap->generic_fast_limit, (intptr_t)(-1));
     }
+    mi_lock_release(&heap->theaps_lock);
   }
+  mi_lock_release(&subproc->heaps_lock);
   #else
-  MI_UNUSED(subproc); MI_UNUSED(profiler);
+  MI_UNUSED(subproc); MI_UNUSED(profiler); MI_UNUSED(wait);
   #endif
+}
+
+// in the current and in the main sub-process (the theaps of another one find out within `MI_GENERIC_FAST_LIMIT`)
+static void mi_profiler_request_look(mi_profiler_t* profiler, bool wait) {
+  mi_profiler_request_look_in(_mi_subproc(),profiler,wait);
+  if (_mi_subproc() != _mi_subproc_main()) { mi_profiler_request_look_in(_mi_subproc_main(),profiler,wait); }
 }
 
 bool mi_profiler_start(mi_profiler_t* profiler ) {
   if (profiler==NULL) return false;
   const bool was_running = mi_profiler_set_enabled(profiler,true);  
   if (was_running) return true;
-  mi_profiler_request_look(_mi_subproc(),profiler);
-  if (_mi_subproc() != _mi_subproc_main()) { mi_profiler_request_look(_mi_subproc_main(),profiler); }
+  mi_profiler_request_look(profiler,true);
   // for the main heap, if this is the profiler, start the theap of this thread right away
   // (the others pick it up when they take the slow generic malloc path)
   mi_heap_t* heap = mi_heap_main();
@@ -370,11 +382,11 @@ bool mi_profiler_stop(mi_profiler_t* profiler) {
   if (profiler==NULL) return true;
   const bool was_running = mi_profiler_set_enabled(profiler,false);
   // Have the theaps that sample look, so they stop counting what they hand out at their next generic allocation and not
-  // at their next sample or 1000 of them later. (Not after a fork: the theaps of the threads that are gone are
-  // not to be touched, and the one thread there is finds out by itself.)
-  if (was_running && !_mi_process_is_forked_child) {
-    mi_profiler_request_look(_mi_subproc(),profiler);
-    if (_mi_subproc() != _mi_subproc_main()) { mi_profiler_request_look(_mi_subproc_main(),profiler); }
+  // at their next sample or `MI_GENERIC_FAST_LIMIT` of them later. Only a courtesy (a theap finds out by itself, and it
+  // is the epoch that keeps its state out of the next start): this can be called from `on_alloc`, from a visitor of the
+  // heaps or late in the exit of the process, so no lock is waited for.
+  if (was_running && !_mi_preloading()) {
+    mi_profiler_request_look(profiler,false);
   }
   return was_running;
 }
