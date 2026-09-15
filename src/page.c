@@ -1964,6 +1964,27 @@ void _mi_page_free(mi_page_t* page, mi_page_queue_t* pq) {
 #define MI_RETIRE_CYCLES      (16)      /* keep a retired page around for about 16 "admin cycles" before free'ing it */
 #define MI_RETIRE_MAX_PAGES   (3)       /* keep at most N pages per size bin as retired */
 
+// Where `_mi_page_retire` would free the page: a large page that the next sweep of its thread is to decide on
+// (`_mi_page_purge_holes_large_page_waits`) is retired like a small one instead. At the front of its queue, where the
+// next allocation of its size finds it and `_mi_theap_collect_retired` looks. (Out of line: nothing of this is on the
+// way of a page that is retired or freed as it always was.)
+static mi_decl_noinline void mi_page_free_unless_it_waits(mi_page_t* page, mi_page_queue_t* pq) {
+  #if MI_RETIRE_CYCLES > 0
+  mi_theap_t* const theap = mi_page_theap(page);
+  if (mi_page_block_size(page) > MI_MEDIUM_MAX_OBJ_SIZE && pq->count <= MI_RETIRE_MAX_PAGES && !mi_page_queue_is_special(pq) &&
+      theap->tld->holes_sweep_seq != 0 && _mi_page_purge_holes_large_page_waits(page, theap->tld)) {
+    mi_theap_stat_counter_increase(theap, pages_retire, 1);
+    page->retire_expire = MI_RETIRE_CYCLES;
+    mi_page_queue_move_to_front(theap, pq, page);
+    const size_t index = pq - theap->pages;
+    if (index < theap->page_retired_min) theap->page_retired_min = index;
+    if (index > theap->page_retired_max) theap->page_retired_max = index;
+    return;
+  }
+  #endif
+  _mi_page_free(page, pq);
+}
+
 // Retire a page with no more used blocks
 // Important to not retire too quickly though as new
 // allocations might coming.
@@ -1989,14 +2010,10 @@ void _mi_page_retire(mi_page_t* page) mi_attr_noexcept {
   #if MI_RETIRE_CYCLES > 0
   const size_t bsize = mi_page_block_size(page);
   if mi_likely( pq->count <= MI_RETIRE_MAX_PAGES && !mi_page_queue_is_special(pq)) {  // not full or huge queue?
-    // (also a large page that the next sweep of this thread is to decide on: `_mi_page_purge_holes_large_page_waits`.
-    //  At the front, where the next allocation of its size finds it and `_mi_theap_collect_retired` looks.)
-    const bool waits = (bsize > MI_MEDIUM_MAX_OBJ_SIZE && _mi_page_purge_holes_large_page_waits(page, mi_page_theap(page)->tld));
-    if (pq->count==1 || bsize < MI_SMALL_SIZE_MAX || waits) {
+    if (pq->count==1 || bsize < MI_SMALL_SIZE_MAX) {
       mi_theap_t* theap = mi_page_theap(page);
       mi_theap_stat_counter_increase(theap, pages_retire, 1);
-      page->retire_expire = (bsize <= MI_SMALL_MAX_OBJ_SIZE || waits ? MI_RETIRE_CYCLES : MI_RETIRE_CYCLES/4);
-      if (waits && pq->first != page) { mi_page_queue_move_to_front(theap, pq, page); }
+      page->retire_expire = (bsize <= MI_SMALL_MAX_OBJ_SIZE ? MI_RETIRE_CYCLES : MI_RETIRE_CYCLES/4);
       mi_assert_internal(pq >= theap->pages);
       const size_t index = pq - theap->pages;
       mi_assert_internal(index < MI_BIN_FULL && index < MI_BIN_HUGE);
@@ -2007,7 +2024,7 @@ void _mi_page_retire(mi_page_t* page) mi_attr_noexcept {
     }  
   }
   #endif
-  _mi_page_free(page, pq);
+  mi_page_free_unless_it_waits(page, pq);
 }
 
 
