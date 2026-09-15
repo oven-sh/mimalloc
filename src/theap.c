@@ -91,6 +91,7 @@ static bool mi_theap_is_valid(mi_theap_t* theap) {
 
 typedef enum mi_collect_e {
   MI_NORMAL,
+  MI_IDLE,      // as `MI_NORMAL`, by a thread that is swept right after (`_mi_thread_idle_work`)
   MI_FORCE,
   MI_ABANDON
 } mi_collect_t;
@@ -111,7 +112,10 @@ static bool mi_theap_page_collect(mi_theap_t* theap, mi_page_queue_t* pq, mi_pag
     // no more used blocks, possibly free the page.
     if (collect >= MI_FORCE || page->retire_expire == 0) {  // either forced/abandon, or not already retired
       // note: this will potentially free retired pages as well.
-      _mi_page_free(page, pq);
+      // (but a large page that the sweep right after this collect is to decide on)
+      if (collect != MI_IDLE || !_mi_page_purge_holes_large_page_waits(page, theap->tld)) {
+        _mi_page_free(page, pq);
+      }
     }
   }
   else if (collect == MI_ABANDON) {
@@ -142,7 +146,7 @@ static void mi_theap_collect_ex(mi_theap_t* theap, mi_collect_t collect)
   _mi_theap_collect_retired(theap, force); 
 
   // collect all pages owned by this thread
-  mi_theap_visit_pages(theap, &mi_theap_page_collect, (collect!=MI_NORMAL), &collect, NULL);  // dont normally visit full pages, see issue #1220
+  mi_theap_visit_pages(theap, &mi_theap_page_collect, (collect>=MI_FORCE), &collect, NULL);  // dont normally visit full pages, see issue #1220
 
   // collect arenas (this is program wide so don't force purges on abandonment of threads).
   // Not from a claimed parked sweep though: a woken owner spins in `_mi_park_leave` for the
@@ -200,6 +204,8 @@ static bool mi_theap_page_purge_holes(mi_theap_t* theap, mi_page_queue_t* pq, mi
   _mi_page_free_collect_no_unpurge(page, true);
   if (mi_page_all_free(page)) {
     // the forced collect emptied the page: hand it back instead of leaving it resident
+    // (but for a large page that was just in use, or that stays under the floor)
+    if (_mi_page_purge_holes_free_page_stays(page, tld)) return true;
     _mi_page_holes_count_page_freed();
     _mi_page_free(page, pq);
     return true;
@@ -243,6 +249,11 @@ static void mi_purge_holes_of(mi_tld_t* tld) mi_attr_noexcept {
 
   mi_heap_t* heaps[MI_PURGE_HOLES_MAX_HEAPS];
   size_t heap_count = 0;
+  // the pages of this thread that are up for `purge_holes_large_floor` are decided once all of them are known
+  // (`_mi_page_purge_holes_floor_resolve`)
+  mi_holes_floor_list_t floor_list;
+  floor_list.count = 0;
+  tld->holes_floor_list = &floor_list;
 
   // Hold `tld->theaps_lock` for the whole sweep, including the abandoned-page pass below:
   //  - another thread can unlink a theap from this list in `_mi_heap_detach_theaps`, and
@@ -260,11 +271,15 @@ static void mi_purge_holes_of(mi_tld_t* tld) mi_attr_noexcept {
         if (!seen) { heaps[heap_count++] = heap; }
       }
     }
+    _mi_page_purge_holes_begin(tld);
+    _mi_page_purge_holes_floor_resolve(tld);   // (also takes the list off the tld)
+    _mi_page_purge_holes_end(tld);
     for (size_t i = 0; i < heap_count; i++) {
       if (mi_atomic_load_relaxed(&tld->park_reclaim) != 0) break;
       _mi_arenas_purge_abandoned_holes(heaps[i], tld);
     }
   }
+  tld->holes_floor_list = NULL;   // (it is on this stack)
 }
 
 // Fold in pending frees, discard the holes in still-used pages, drain the arena purge queue.
@@ -276,7 +291,7 @@ void _mi_thread_idle_work(mi_tld_t* tld, mi_theap_t* theap0) mi_attr_noexcept {
   if (mi_atomic_load_relaxed(&tld->park_reclaim) != 0) return;
   _mi_page_purge_holes_epoch_advance();   // first of all: see there
   if (theap0 != NULL && mi_theap_is_initialized(theap0)) {
-    mi_theap_collect(theap0, false /* not forced */);
+    mi_theap_collect_ex(theap0, MI_IDLE);
   }
   if (mi_atomic_load_relaxed(&tld->park_reclaim) != 0) return;
   mi_purge_holes_of(tld);   // every theap of this thread + the abandoned pages
@@ -393,8 +408,13 @@ mi_msecs_t _mi_theap_sweep_parked(mi_subproc_t* subproc) {
       const mi_msecs_t now = _mi_clock_now();
       const mi_msecs_t interval = (mi_msecs_t)mi_option_get_clamp(mi_option_purge_holes_min_interval, 0, 3600000);
       for (mi_tld_t* tld = subproc->tlds; tld != NULL; tld = tld->subproc_next) {
-        if (mi_atomic_load_acquire(&tld->park_swept) == MI_PARK_SWEPT_DONE) continue;   // already done for this park
-        if (interval > 0 && tld->holes_sweep_last != 0 && now - tld->holes_sweep_last < interval) {
+        // Done for this park? But for what it left under `purge_holes_large_floor`: that is looked at again once it is old
+        // enough to go, which is when the sweeps of OTHER threads have moved the epoch that far (nothing is woken for it:
+        // we are here because some thread parked). A thread that stays parked is not to hold the floor against the ones
+        // that run. (Its fields are read once it is claimed: its owner writes them when it sweeps itself.)
+        const bool done = (mi_atomic_load_acquire(&tld->park_swept) == MI_PARK_SWEPT_DONE);
+        if (done && (mi_atomic_load_relaxed(&tld->holes_floor_kept) == 0 || mi_atomic_load_relaxed(&tld->park_reclaim) != 0)) continue;   // (most: nothing kept. Or its owner is on the way out)
+        if (!done && interval > 0 && tld->holes_sweep_last != 0 && now - tld->holes_sweep_last < interval) {
           if (mi_atomic_load_relaxed(&tld->park_state) == MI_PARK_PARKED) {
             const mi_msecs_t due = interval - (now - tld->holes_sweep_last);
             if (due_in == 0 || due < due_in) { due_in = due; }
@@ -403,6 +423,7 @@ mi_msecs_t _mi_theap_sweep_parked(mi_subproc_t* subproc) {
         }
         uint32_t expected = MI_PARK_PARKED;
         if (mi_atomic_cas_strong_acq_rel(&tld->park_state, &expected, MI_PARK_SWEEPING)) {
+          if (done && (!_mi_page_purge_holes_floor_is_due(tld) || mi_atomic_load_relaxed(&tld->park_reclaim) != 0)) { mi_atomic_store_release(&tld->park_state, MI_PARK_PARKED); continue; }
           claimed = tld; theap0 = tld->park_theap0; break;
         }
       }

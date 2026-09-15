@@ -853,6 +853,8 @@ struct mi_tld_s {
   bool                  holes_sweep_deferred; // this sweep left the free blocks of a large page that was just in use (see `_mi_page_purge_holes`)
   uint32_t              holes_sweep_epoch;    // the epoch of the sweep (`page.c`) when the current sweep began: its pages were compared with that one or a later one
   uint32_t              holes_park_epoch;     // ..and that of the first sweep of the current park: what the thread left when it parked is from that epoch or an earlier one
+  _Atomic(size_t)       holes_floor_kept;     // bytes that the last sweep of this tld left under `purge_holes_large_floor` (its share of `mi_holes_floor_kept` in `page.c`)
+  struct mi_holes_floor_list_s* holes_floor_list;   // the pages of this thread that the current sweep has yet to decide on (`_mi_page_purge_holes_floor_resolve`); on the stack of `mi_purge_holes_of`
 };
 
 
