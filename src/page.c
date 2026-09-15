@@ -1213,6 +1213,34 @@ static bool mi_page_holes_floor_keep(mi_page_t* page, mi_tld_t* tld) {
   return true;
 }
 
+// A large page all of whose blocks are free is what its free blocks are: the buffers of a thread that takes them again
+// at its next request, and where most of the page faults of such a thread came from (the sweep found it so after it
+// collected what other threads freed, or it waited for the sweep: below). It stays by the same rule as the free blocks of
+// a page with a block in use (`_mi_page_purge_holes`), as a page in its queue that nothing has retired. Else the
+// caller frees it, as it did every such page before.
+bool _mi_page_purge_holes_free_page_stays(mi_page_t* page, mi_tld_t* tld) {
+  if (!_mi_page_purge_holes_large_page_waits(page, tld)) return false;
+  uint32_t stamp;
+  bool stays = false;
+  if (mi_page_sweep_state_is_alloc(page, &stamp) && mi_page_sweep_state_alloc_age(stamp) < 2) { tld->holes_sweep_deferred = true; stays = true; }
+  else { stays = mi_page_holes_floor_keep(page, tld); }
+  if (stays) { page->retire_expire = 0; }   // (not `_mi_theap_collect_retired`: the sweeps decide from here on)
+  return stays;
+}
+
+// Is this a large page with no block in use that is for the next sweep of its thread to decide on: one that was
+// allocated from since it was last swept, of a thread that is swept at all, with a floor to stay under?
+// Where its last block is freed (`_mi_page_retire`) such a page is retired like a small one instead of freed, so what
+// a thread that does not park any more holds that way is gone after `MI_RETIRE_CYCLES`; and the collect that an idle
+// thread does before it is swept (`_mi_thread_idle_work`) leaves it for that sweep.
+bool _mi_page_purge_holes_large_page_waits(const mi_page_t* page, const mi_tld_t* tld) {
+  if (mi_page_block_size(page) <= MI_MEDIUM_MAX_OBJ_SIZE || page->reserved <= 1) return false;
+  if (tld == NULL || tld->holes_sweep_seq == 0) return false;   // nothing sweeps this thread
+  uint32_t stamp;
+  if (!mi_page_sweep_state_is_alloc(page, &stamp)) return false;
+  return (mi_holes_floor_is_on() && mi_page_holes_madvisable(page));
+}
+
 // The end of the pass over the thread's own pages: the most recently used first, while they fit.
 void _mi_page_purge_holes_floor_resolve(mi_tld_t* tld) {
   mi_holes_floor_list_t* const list = tld->holes_floor_list;
@@ -1241,6 +1269,7 @@ void _mi_page_purge_holes_floor_resolve(mi_tld_t* tld) {
     for (const mi_page_t* p = item->pq->first; p != NULL && !found; p = p->next) { found = (p == item->page); }
     if (!found) continue;
     if (mi_holes_floor_take(tld, item->bytes)) { mi_page_holes_floor_stays(item->page); }
+    else if (mi_page_all_free(item->page)) { _mi_page_holes_count_page_freed(); _mi_page_free(item->page, item->pq); }   // (see `_mi_page_purge_holes_free_page_stays`)
     else { mi_page_purge_holes_now(item->page, tld); }
   }
 }
@@ -1298,10 +1327,10 @@ void _mi_page_purge_holes(mi_page_t* page, mi_tld_t* tld) {
       return;
     }
   }
-  // The floor. The whole rule for the free blocks of a large page:
-  //   they are left alone until their page has not been allocated from for `purge_holes_large_floor_epochs` epochs,
-  //   for up to `purge_holes_large_floor` bytes process-wide (the pages that were used last first); past either, the
-  //   two epochs above are all they get.
+  // The floor. The whole rule for a large page, its free blocks or all of it (`_mi_page_purge_holes_free_page_stays`):
+  //   it is left alone until it has not been allocated from for `purge_holes_large_floor_epochs` epochs, for up to
+  //   `purge_holes_large_floor` bytes process-wide (the pages that were used last first); past either, the two epochs
+  //   above are all it gets.
   // A server with a request now and then would fault its buffers in again on every request otherwise. The only time
   // there is is the epoch, which a sweep moves and nothing else: no clock is kept in the page and nothing is woken for
   // this. A process in which no thread parks any more keeps those bytes until one does.
@@ -1958,10 +1987,14 @@ void _mi_page_retire(mi_page_t* page) mi_attr_noexcept {
   #if MI_RETIRE_CYCLES > 0
   const size_t bsize = mi_page_block_size(page);
   if mi_likely( pq->count <= MI_RETIRE_MAX_PAGES && !mi_page_queue_is_special(pq)) {  // not full or huge queue?
-    if (pq->count==1 || bsize < MI_SMALL_SIZE_MAX) {
+    // (also a large page that the next sweep of this thread is to decide on: `_mi_page_purge_holes_large_page_waits`.
+    //  At the front, where the next allocation of its size finds it and `_mi_theap_collect_retired` looks.)
+    const bool waits = (bsize > MI_MEDIUM_MAX_OBJ_SIZE && _mi_page_purge_holes_large_page_waits(page, mi_page_theap(page)->tld));
+    if (pq->count==1 || bsize < MI_SMALL_SIZE_MAX || waits) {
       mi_theap_t* theap = mi_page_theap(page);
       mi_theap_stat_counter_increase(theap, pages_retire, 1);
-      page->retire_expire = (bsize <= MI_SMALL_MAX_OBJ_SIZE ? MI_RETIRE_CYCLES : MI_RETIRE_CYCLES/4);
+      page->retire_expire = (bsize <= MI_SMALL_MAX_OBJ_SIZE || waits ? MI_RETIRE_CYCLES : MI_RETIRE_CYCLES/4);
+      if (waits && pq->first != page) { mi_page_queue_move_to_front(theap, pq, page); }
       mi_assert_internal(pq >= theap->pages);
       const size_t index = pq - theap->pages;
       mi_assert_internal(index < MI_BIN_FULL && index < MI_BIN_HUGE);

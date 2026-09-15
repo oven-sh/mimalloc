@@ -91,6 +91,7 @@ static bool mi_theap_is_valid(mi_theap_t* theap) {
 
 typedef enum mi_collect_e {
   MI_NORMAL,
+  MI_IDLE,      // as `MI_NORMAL`, by a thread that is swept right after (`_mi_thread_idle_work`)
   MI_FORCE,
   MI_ABANDON
 } mi_collect_t;
@@ -111,7 +112,10 @@ static bool mi_theap_page_collect(mi_theap_t* theap, mi_page_queue_t* pq, mi_pag
     // no more used blocks, possibly free the page.
     if (collect >= MI_FORCE || page->retire_expire == 0) {  // either forced/abandon, or not already retired
       // note: this will potentially free retired pages as well.
-      _mi_page_free(page, pq);
+      // (but a large page that the sweep right after this collect is to decide on)
+      if (collect != MI_IDLE || !_mi_page_purge_holes_large_page_waits(page, theap->tld)) {
+        _mi_page_free(page, pq);
+      }
     }
   }
   else if (collect == MI_ABANDON) {
@@ -142,7 +146,7 @@ static void mi_theap_collect_ex(mi_theap_t* theap, mi_collect_t collect)
   _mi_theap_collect_retired(theap, force); 
 
   // collect all pages owned by this thread
-  mi_theap_visit_pages(theap, &mi_theap_page_collect, (collect!=MI_NORMAL), &collect, NULL);  // dont normally visit full pages, see issue #1220
+  mi_theap_visit_pages(theap, &mi_theap_page_collect, (collect>=MI_FORCE), &collect, NULL);  // dont normally visit full pages, see issue #1220
 
   // collect arenas (this is program wide so don't force purges on abandonment of threads).
   // Not from a claimed parked sweep though: a woken owner spins in `_mi_park_leave` for the
@@ -200,6 +204,8 @@ static bool mi_theap_page_purge_holes(mi_theap_t* theap, mi_page_queue_t* pq, mi
   _mi_page_free_collect_no_unpurge(page, true);
   if (mi_page_all_free(page)) {
     // the forced collect emptied the page: hand it back instead of leaving it resident
+    // (but for a large page that was just in use, or that stays under the floor)
+    if (_mi_page_purge_holes_free_page_stays(page, tld)) return true;
     _mi_page_holes_count_page_freed();
     _mi_page_free(page, pq);
     return true;
@@ -285,7 +291,7 @@ void _mi_thread_idle_work(mi_tld_t* tld, mi_theap_t* theap0) mi_attr_noexcept {
   if (mi_atomic_load_relaxed(&tld->park_reclaim) != 0) return;
   _mi_page_purge_holes_epoch_advance();   // first of all: see there
   if (theap0 != NULL && mi_theap_is_initialized(theap0)) {
-    mi_theap_collect(theap0, false /* not forced */);
+    mi_theap_collect_ex(theap0, MI_IDLE);
   }
   if (mi_atomic_load_relaxed(&tld->park_reclaim) != 0) return;
   mi_purge_holes_of(tld);   // every theap of this thread + the abandoned pages
