@@ -1150,7 +1150,7 @@ static bool mi_page_holes_floor_keep(mi_page_t* page, mi_tld_t* tld) {
   uint32_t stamp;
   if (!mi_page_sweep_state_is_alloc(page, &stamp)) return false;   // swept before, and not allocated from since
   const uint32_t age = mi_page_sweep_state_alloc_age(stamp);
-  if ((long)age >= mi_option_get_clamp(mi_option_purge_holes_large_floor_epochs, 0, INT32_MAX)) return false;   // not used for that long: it goes
+  if (age >= (uint32_t)mi_option_get_clamp(mi_option_purge_holes_large_floor_epochs, 0, INT32_MAX)) return false;   // not used for that long: it goes
   const size_t bytes = mi_page_large_resident_free(page);   // (what is discarded already is not on the free list)
   if (bytes == 0) return false;
   mi_holes_floor_list_t* const list = tld->holes_floor_list;
