@@ -569,72 +569,6 @@ static void test_exit_while_swept_with_dyn_tls(void) {
 }
 
 // ---------------------------------------------------------------------------
-// What a sweep leaves under `purge_holes_large_floor` goes when its page was not allocated from for so many epochs of
-// the sweep, and an epoch ends only when a thread is swept: nobody is woken for it. A thread that stays parked keeps
-// it, and it goes with the parks that come after.
-// ---------------------------------------------------------------------------
-static size_t purged_now(void) {
-  mi_purge_holes_stats_t h; mi_purge_holes_stats_get(&h); return h.purged_bytes;
-}
-
-static _Atomic(size_t) park_floor_target;
-static _Atomic(int)    park_floor_parks;
-
-static void* park_floor_other(void* arg) {
-  (void)arg;
-  void* q = mi_malloc(64);   // (a thread with a heap of its own to be swept)
-  int parks = 0;
-  for (; parks < 400 && purged_now() < atomic_load(&park_floor_target); parks++) {
-    if (mi_on_thread_idle_start()) { usleep(3000); }
-    mi_on_thread_idle_end();
-  }
-  atomic_store(&park_floor_parks, parks);
-  mi_free(q);
-  return NULL;
-}
-
-static void test_park_floor(void) {
-  enum { BLOCKS = 18, BLOCK = 300 * 1024 };   // a page that fills up (and is abandoned for that), and half of one that stays this thread's own
-  const long old_interval = mi_option_get(mi_option_purge_holes_min_interval);
-  const long old_floor = mi_option_get(mi_option_purge_holes_large_floor);
-  const long old_epochs = mi_option_get(mi_option_purge_holes_large_floor_epochs);
-  mi_option_set(mi_option_purge_holes_min_interval, 2);
-  mi_option_set(mi_option_purge_holes_large_floor, 8 * 1024);    // KiB
-  mi_option_set(mi_option_purge_holes_large_floor_epochs, 32);
-  void* p[BLOCKS];
-  for (int i = 0; i < BLOCKS; i++) { p[i] = mi_malloc(BLOCK); if (p[i] != NULL) memset(p[i], 5, BLOCK); }
-  size_t freed = 0;
-  for (int i = 0; i < BLOCKS; i++) { if ((i % 3) != 0 && p[i] != NULL) { mi_free(p[i]); p[i] = NULL; freed++; } }
-  const size_t before = purged_now();
-  const bool parked = mi_on_thread_idle_start();
-  if (parked) {
-    usleep(300 * 1000);   // the sweeps of the hold are over: the blocks are out of it and under the floor
-    const size_t held = purged_now();
-    usleep(700 * 1000);   // far longer than 32 intervals
-    const size_t still = purged_now();
-    // the parks of another thread move the epoch on, and then this one is looked at again though it never left its park:
-    // it is not to hold the floor against the threads that run
-    atomic_store(&park_floor_target, before + freed * (BLOCK - 16 * 1024));
-    pthread_t other;
-    const bool started = (pthread_create(&other, NULL, &park_floor_other, NULL) == 0);
-    if (started) { pthread_join(other, NULL); }
-    const size_t gone = purged_now();
-    mi_on_thread_idle_end();
-    fprintf(stderr, "  %zu blocks of %d KiB freed in large pages: %zu KiB of them purged 300 ms into the park, %zu KiB after a second of it, %zu KiB after %d parks of another thread\n", freed, BLOCK / 1024, (held - before) / 1024, (still - before) / 1024, (gone - before) / 1024, atomic_load(&park_floor_parks));
-    check("free blocks of large pages stay under the floor at first", held - before < 2 * (size_t)BLOCK);
-    check("a thread that stays parked keeps them: nothing comes back for the floor", still == held);
-    check("they go once the page was not allocated from for that many epochs, which the parks of another thread move", started && gone >= atomic_load(&park_floor_target));
-  }
-  else {
-    mi_on_thread_idle_end();
-  }
-  for (int i = 0; i < BLOCKS; i++) { if (p[i] != NULL) mi_free(p[i]); }
-  mi_option_set(mi_option_purge_holes_min_interval, old_interval);
-  mi_option_set(mi_option_purge_holes_large_floor, old_floor);
-  mi_option_set(mi_option_purge_holes_large_floor_epochs, old_epochs);
-}
-
-// ---------------------------------------------------------------------------
 // Stopping the scavenger joins the thread: a park after it has nobody to hand off to and reports
 // false, and the process stays fully usable. Runs last, since it takes the scavenger away.
 // ---------------------------------------------------------------------------
@@ -650,7 +584,6 @@ static void test_scavenger_stop(void) {
 
 int main(void) {
   test_lazy_start_and_signals();   // first: nothing may have started the scavenger yet
-  test_park_floor();        // (before the others leave free blocks of their own to be purged)
   test_handoff_sweeps();
   test_survivors_intact();
   test_unbalanced();

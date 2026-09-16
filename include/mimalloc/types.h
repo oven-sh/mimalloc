@@ -854,6 +854,7 @@ struct mi_tld_s {
   uint32_t              holes_sweep_epoch;    // the epoch of the sweep (`page.c`) when the current sweep began: its pages were compared with that one or a later one
   uint32_t              holes_park_epoch;     // ..and that of the first sweep of the current park: what the thread left when it parked is from that epoch or an earlier one
   _Atomic(size_t)       holes_floor_kept;     // bytes that the last sweep of this tld left under `purge_holes_large_floor` (its share of `mi_holes_floor_kept` in `page.c`)
+  mi_msecs_t            holes_floor_kept_at;  // ..and the clock at the end of that sweep (0: it left nothing; `MI_HOLES_FLOOR_EXPIRED` during a sweep that comes so long after it that nothing stays)
   struct mi_holes_floor_list_s* holes_floor_list;   // the pages of this thread that the current sweep has yet to decide on (`_mi_page_purge_holes_floor_resolve`); on the stack of `mi_purge_holes_of`
 };
 

@@ -1068,7 +1068,8 @@ void          _mi_page_purge_holes_end(mi_tld_t* tld);
 void          _mi_page_purge_holes_sweep_begin(mi_tld_t* tld);   // once per idle sweep, before its passes
 void          _mi_page_purge_holes_forked_child(void);
 void          _mi_page_purge_holes_floor_release(mi_tld_t* tld);  // a tld that goes away gives its share of `purge_holes_large_floor` back
-bool          _mi_page_purge_holes_floor_is_due(const mi_tld_t* tld);   // what its last sweep left under the floor is old enough to go by now
+mi_msecs_t    _mi_page_purge_holes_floor_due_in(const mi_tld_t* tld);   // in how many msecs is what its last sweep left under the floor to go (0: now; negative: it left nothing)
+void          _mi_page_purge_holes_sweep_end(mi_tld_t* tld);     // once per idle sweep, after its passes
 void          _mi_page_purge_holes_floor_resolve(mi_tld_t* tld);  // once per idle sweep, after the pages of the thread's own theaps: which of them stay under the floor
 bool          _mi_page_purge_holes_free_page_stays(mi_page_t* page, mi_tld_t* tld);   // in a sweep: is this large page with no block in use left as it is for now?
 bool          _mi_page_purge_holes_large_page_waits(const mi_page_t* page, const mi_tld_t* tld);   // ..and outside of one: is it for the sweeps to decide on?
