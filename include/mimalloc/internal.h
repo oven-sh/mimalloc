@@ -270,6 +270,7 @@ void          _mi_arenas_purge_guard_acquire(void); // fork: wait for the purge 
 void          _mi_arenas_purge_guard_release(void); // (also on behalf of a holder that is gone: process exit on Windows)
 void          _mi_arenas_unsafe_destroy_all(mi_subproc_t* subproc);
 
+mi_page_t*    _mi_arenas_page_try_reclaim_abandoned(mi_theap_t* theap, size_t block_size);   // (large pages only)
 mi_page_t*    _mi_arenas_page_alloc(mi_theap_t* theap, size_t block_size, size_t page_alignment);
 void          _mi_arenas_page_free(mi_page_t* page, mi_theap_t* current_theapx /* can be NULL */);
 void          _mi_arenas_abandoned_page_free(mi_page_t* page, mi_theap_t* current_theapx);

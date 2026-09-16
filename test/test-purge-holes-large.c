@@ -1364,6 +1364,65 @@ static bool test_floor_free_page(void) {
   return ok_all;
 }
 
+// ---------------------------------------------------------------------------
+// a large page is abandoned when it is full; what is freed in it after that is taken before the next page is
+// extended into memory that was never touched (`page.c:mi_page_queue_find_free_ex`)
+// ---------------------------------------------------------------------------
+static bool test_take_back(void) {
+  bool ok_all = true;
+  const size_t size = (MI_LARGE_MAX_OBJ_SIZE / 2) + (MI_LARGE_MAX_OBJ_SIZE / 4);   // a size class of its own in this test
+  void* first[MAXB]; void* more[MAXB]; void* again[MAXB];
+  memset(first, 0, sizeof(first)); memset(more, 0, sizeof(more)); memset(again, 0, sizeof(again));
+  size_t usable = 0;
+  first[0] = mi_malloc(size);
+  if (first[0] == NULL) return false;
+  const mi_page_t* const page1 = _mi_ptr_page(first[0]);
+  if (!is_large_page(page1) || page1->reserved < 4 || page1->reserved > MAXB) {
+    fprintf(stderr, "(not in a large page of 4 blocks or more here) ");
+    mi_free(first[0]);
+    return true;
+  }
+  const size_t n = page1->reserved;
+  mi_free(first[0]);
+  // fill the page: it is abandoned with its last block
+  if (!alloc_filled(first, n, size, &usable)) { free_all(first, n); return false; }
+  for (size_t i = 0; i < n; i++) { if (_mi_ptr_page(first[i]) != page1) { fprintf(stderr, "\n  block %zu of the first %zu is not in the first page\n", i, n); ok_all = false; } }
+  // the thread goes on in a second page, until every block that is formed there is in use and the next one is yet to
+  // be formed (that is after one block, or after eight in a build that forms that many at once: MI_SECURE)
+  if (!alloc_filled(more, 1, size, &usable)) { free_all(first, n); return false; }
+  size_t nmore = 1;
+  const mi_page_t* const page2 = _mi_ptr_page(more[0]);
+  if (page2 == page1) { fprintf(stderr, "\n  the first page was not full after %zu blocks\n", n); ok_all = false; }
+  while (nmore < MAXB && mi_page_used(page2) < page2->capacity) {
+    more[nmore] = mi_malloc(size);
+    if (more[nmore] == NULL) { free_all(first, n); free_all(more, nmore); return false; }
+    pattern_fill(more[nmore], usable, nmore);
+    nmore++;
+  }
+  // most of the first page is freed (by this thread, into a page that it does not own any more)
+  const size_t nfreed = n - 1;
+  for (size_t i = 0; i < nfreed; i++) { mi_free(first[i]); first[i] = NULL; }
+  // and the next allocations take those blocks, not new ones in the second page
+  size_t from_first = 0, from_second = 0;
+  for (size_t i = 0; i < nfreed; i++) {
+    again[i] = mi_malloc(size);
+    if (again[i] == NULL) { ok_all = false; break; }
+    memset(again[i], 0x5a, 64);
+    const mi_page_t* const page = _mi_ptr_page(again[i]);
+    if (page == page1) from_first++; else if (page == page2) from_second++;
+  }
+  if (from_first != nfreed) {
+    fprintf(stderr, "\n  of %zu allocations after %zu blocks of the full page were freed, %zu came from that page and %zu from the one after it\n", nfreed, nfreed, from_first, from_second);
+    ok_all = false;
+  }
+  if (!survivors_intact(first, n, usable, "take-back, the block that stayed")) { ok_all = false; }
+  if (!survivors_intact(more, nmore, usable, "take-back, the second page")) { ok_all = false; }
+  fprintf(stderr, "(%zu of %zu allocations took the blocks that were freed in the full page) ", from_first, nfreed);
+  free_all(first, n); free_all(more, nmore); free_all(again, n);
+  mi_collect(true);
+  return ok_all;
+}
+
 int main(void) {
   mi_version();
   purging_enabled = mi_option_is_enabled(mi_option_purge_holes);
@@ -1397,6 +1456,7 @@ int main(void) {
   CHECK("floor", test_floor());
   CHECK("floor-decay", test_floor_decay());
   CHECK("floor-free-page", test_floor_free_page());
+  CHECK("take-back", test_take_back());
 
   // everything above is freed by now, so every hole must have been handed back
   mi_collect(true);
