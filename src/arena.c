@@ -784,7 +784,9 @@ static mi_page_t* mi_arenas_page_try_find_abandoned(mi_theap_t* theap, size_t sl
 // extended. Claimed and taken out of the abandoned map as for `mi_arenas_page_regular_alloc`; the caller reclaims it.
 // Only one that has a block to give: the map has every abandoned page that is not full, also one whose blocks are yet to
 // be formed (the last page of a thread that ended), and that one goes back as it was. A caller that kept it would take
-// one such page out of the map for every block that it forms.
+// one such page out of the map for every block that it forms. (It goes back where it was, so the next search of this
+// thread finds it first again: while it is there, a page behind it that has a block is not found. `pages_reclaim_on_alloc`
+// counts it each time.)
 mi_page_t* _mi_arenas_page_try_reclaim_abandoned(mi_theap_t* theap, size_t block_size) {
   if (block_size <= MI_MEDIUM_MAX_OBJ_SIZE || block_size > MI_LARGE_MAX_OBJ_SIZE) return NULL;
   mi_page_t* const page = mi_arenas_page_try_find_abandoned(theap, mi_slice_count_of_size(MI_LARGE_PAGE_SIZE), block_size);

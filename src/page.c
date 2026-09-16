@@ -2423,9 +2423,10 @@ static mi_decl_noinline mi_page_t* mi_page_queue_find_free_ex(mi_theap_t* theap,
         _mi_page_free(page_candidate, pq);
         page_candidate = page;
       }
-      // a large page with a block that is there, before one whose next block is yet to be formed: that is memory that was
-      // never touched (and the thread would go to the arena for a page of another thread first: below)
-      else if (pq->block_size > MI_MEDIUM_MAX_OBJ_SIZE && immediate_available && !mi_page_immediate_available(page_candidate)) {
+      // a large page with a block that is there, before the candidate, whose next block is yet to be formed (the search
+      // ends at the first page that has a block): that is memory that was never touched, and the thread would go to the
+      // arena for a page of another thread first (below)
+      else if (pq->block_size > MI_MEDIUM_MAX_OBJ_SIZE && immediate_available) {
         page_candidate = page;
       }
       // prefer to reuse fuller pages (in the hope the less used page gets freed)
