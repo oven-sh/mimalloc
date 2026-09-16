@@ -112,9 +112,14 @@ static bool mi_theap_page_collect(mi_theap_t* theap, mi_page_queue_t* pq, mi_pag
     // no more used blocks, possibly free the page.
     if (collect >= MI_FORCE || page->retire_expire == 0) {  // either forced/abandon, or not already retired
       // note: this will potentially free retired pages as well.
-      // (but a large page that the sweep right after this collect is to decide on)
-      if (collect != MI_IDLE || !_mi_page_purge_holes_large_page_waits(page, theap->tld)) {
+      // (but a large page that is for the sweeps to decide on: the collect of an idle thread leaves it to the sweep right
+      //  after it. Any other collect that is not forced leaves the one that the last sweep kept under the floor, and
+      //  retires the one that no sweep has decided on, as where its last block is freed: `_mi_page_purge_holes_large_page_waits`)
+      if (collect >= MI_FORCE || !_mi_page_purge_holes_large_page_waits(page, theap->tld)) {
         _mi_page_free(page, pq);
+      }
+      else if (collect != MI_IDLE && !_mi_page_purge_holes_large_page_is_kept(page, theap->tld)) {
+        _mi_page_retire(page);
       }
     }
   }
