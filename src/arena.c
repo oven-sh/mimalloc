@@ -780,6 +780,13 @@ static mi_page_t* mi_arenas_page_try_find_abandoned(mi_theap_t* theap, size_t sl
   return NULL;
 }
 
+// For `page.c:mi_page_queue_find_free_ex`: an abandoned large page with free blocks, before one of the thread's own is
+// extended. Claimed and taken out of the abandoned map as for `mi_arenas_page_regular_alloc`; the caller reclaims it.
+mi_page_t* _mi_arenas_page_try_reclaim_abandoned(mi_theap_t* theap, size_t block_size) {
+  if (block_size <= MI_MEDIUM_MAX_OBJ_SIZE || block_size > MI_LARGE_MAX_OBJ_SIZE) return NULL;
+  return mi_arenas_page_try_find_abandoned(theap, mi_slice_count_of_size(MI_LARGE_PAGE_SIZE), block_size);
+}
+
 static uint8_t* mi_arenas_page_alloc_fresh_area(mi_theap_t* theap, size_t slice_count, size_t max_page_meta_count, size_t block_alignment, bool os_align, bool commit, mi_memid_t* memid, mi_arena_pages_t** parena_pages ) {
   MI_UNUSED(max_page_meta_count);
   mi_assert_internal(parena_pages!=NULL);

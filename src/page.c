@@ -2458,6 +2458,20 @@ static mi_decl_noinline mi_page_t* mi_page_queue_find_free_ex(mi_theap_t* theap,
     page = page_candidate;
   }
   if (page != NULL) {
+    // A large page is abandoned when it is full, and what is freed in it after that is free in a page that nobody
+    // allocates from: the thread goes on in its next page, which it extends into memory that was never touched (a page
+    // fault for every 4 KiB of every buffer), while the free blocks of the first one are resident, all the more so
+    // since the idle sweep leaves them (`purge_holes_large_floor`). Before a large page is extended, such a page is
+    // taken back. It is the same search as where a fresh page would be allocated (`_mi_arenas_page_alloc`), one
+    // relaxed load when the heap has no abandoned page of this size with a free block, which is nearly always; and a
+    // page is extended once for each of its blocks in its life, not for each allocation.
+    if (!mi_page_immediate_available(page) && pq->block_size > MI_MEDIUM_MAX_OBJ_SIZE) {
+      mi_page_t* const reclaimed = _mi_arenas_page_try_reclaim_abandoned(theap, pq->block_size);
+      if (reclaimed != NULL) {
+        _mi_theap_page_reclaim(theap, reclaimed);   // (in the queue either way: it is this thread's now)
+        if (mi_page_immediate_available(reclaimed)) { page = reclaimed; }
+      }
+    }
     if (!mi_page_immediate_available(page)) {
       mi_assert_internal(mi_page_is_expandable(page));
       if (!mi_page_extend_free(theap, page)) {
