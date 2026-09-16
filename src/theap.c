@@ -413,10 +413,10 @@ mi_msecs_t _mi_theap_sweep_parked(mi_subproc_t* subproc) {
       const mi_msecs_t now = _mi_clock_now();
       const mi_msecs_t interval = (mi_msecs_t)mi_option_get_clamp(mi_option_purge_holes_min_interval, 0, 3600000);
       for (mi_tld_t* tld = subproc->tlds; tld != NULL; tld = tld->subproc_next) {
-        // Done for this park? But for what it left under `purge_holes_large_floor`: that is looked at again once it is old
-        // enough to go, which is when the sweeps of OTHER threads have moved the epoch that far (nothing is woken for it:
-        // we are here because some thread parked). A thread that stays parked is not to hold the floor against the ones
-        // that run. (Its fields are read once it is claimed: its owner writes them when it sweeps itself.)
+        // Done for this park? But for what it left under `purge_holes_large_floor`: that is looked at again once the oldest
+        // of it is due by the clock (`_mi_page_purge_holes_floor_due_in`), and we say when so that the scavenger wakes for it:
+        // a process that goes idle gives the floor back. (Its fields are read once it is claimed: its owner writes them
+        // when it sweeps itself.)
         const bool done = (mi_atomic_load_acquire(&tld->park_swept) == MI_PARK_SWEPT_DONE);
         if (done && (mi_atomic_load_relaxed(&tld->holes_floor_kept) == 0 || mi_atomic_load_relaxed(&tld->park_reclaim) != 0)) continue;   // (most: nothing kept. Or its owner is on the way out)
         if (!done && interval > 0 && tld->holes_sweep_last != 0 && now - tld->holes_sweep_last < interval) {
@@ -428,7 +428,14 @@ mi_msecs_t _mi_theap_sweep_parked(mi_subproc_t* subproc) {
         }
         uint32_t expected = MI_PARK_PARKED;
         if (mi_atomic_cas_strong_acq_rel(&tld->park_state, &expected, MI_PARK_SWEEPING)) {
-          if (done && (!_mi_page_purge_holes_floor_is_due(tld) || mi_atomic_load_relaxed(&tld->park_reclaim) != 0)) { mi_atomic_store_release(&tld->park_state, MI_PARK_PARKED); continue; }
+          if (done) {   // (its fields are ours to read now)
+            const mi_msecs_t floor_due = _mi_page_purge_holes_floor_due_in(tld);
+            if (floor_due > 0 || mi_atomic_load_relaxed(&tld->park_reclaim) != 0) {
+              if (floor_due > 0 && (due_in == 0 || floor_due < due_in)) { due_in = floor_due; }   // the scavenger comes back for it by the clock
+              mi_atomic_store_release(&tld->park_state, MI_PARK_PARKED);
+              continue;
+            }
+          }
           claimed = tld; theap0 = tld->park_theap0; break;
         }
       }

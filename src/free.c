@@ -534,6 +534,27 @@ static mi_decl_noinline bool mi_abandoned_page_try_reclaim(mi_page_t* page, long
 }
 
 
+// Helper for mi_free_try_collect_mt: a large page is abandoned when it is full, so the buffers of a thread with a
+// working set of more than one page are freed here. With its last block free the page would go back to the arena, and
+// the next burst of that thread would extend or allocate another one: all of it faulted in again. If the thread that
+// allocated from it frees that block, and its sweeps keep such pages (`purge_holes_large_floor`), it takes the page
+// back instead, retired as an own page with no block in use is (`_mi_page_retire`): the sweeps decide from there.
+static mi_decl_noinline bool mi_abandoned_large_page_try_keep(mi_page_t* page) mi_attr_noexcept
+{
+  mi_assert_internal(mi_page_is_owned(page) && mi_page_is_abandoned(page) && mi_page_all_free(page));
+  if (!_mi_thread_is_initialized()) return false;
+  mi_theap_t* const theap = _mi_page_associated_theap_peek(page);
+  if (theap==NULL || theap->tld==NULL || !theap->allow_page_reclaim || theap != page->theap) return false;
+  if (!_mi_page_purge_holes_large_page_waits(page, theap->tld)) return false;
+  const long max_reclaim = _mi_option_get_fast(mi_option_page_max_reclaim);
+  if (max_reclaim >= 0 && !mi_page_queue_len_is_atmost(theap, page->block_size, max_reclaim)) return false;
+  _mi_arenas_page_unabandon(page, theap);
+  _mi_theap_page_reclaim(theap, page);
+  mi_theap_stat_counter_increase(theap, pages_reclaim_on_free, 1);
+  _mi_page_retire(page);
+  return true;
+}
+
 // We freed a block in an abandoned page (that was not owned). Try to collect
 static void mi_decl_noinline mi_free_try_collect_mt(mi_page_t* page, mi_block_t* mt_free, bool allow_reclaim) mi_attr_noexcept
 {
@@ -562,6 +583,7 @@ static void mi_decl_noinline mi_free_try_collect_mt(mi_page_t* page, mi_block_t*
   #endif
 
   // try to: 1. free it, 2. reclaim it, or 3. reabandon it to be mapped
+  if (page->block_size > MI_MEDIUM_MAX_OBJ_SIZE && reclaim_on_free >= 0 && mi_page_all_free(page) && mi_abandoned_large_page_try_keep(page)) return;
   if (mi_abandoned_page_try_free(page)) return;
   if (page->block_size <= MI_MEDIUM_MAX_OBJ_SIZE && reclaim_on_free >= 0) {  // early test for better codegen
     if (mi_abandoned_page_try_reclaim(page, reclaim_on_free)) return;
