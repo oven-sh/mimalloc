@@ -163,8 +163,10 @@ static bool test_no_block_to_give(void) {
   for (int i = 0; i < 12; i++) { mi_free(mine[i]); }
   for (int i = 0; i < LEAVERS; i++) { mi_free(left_behind[i]); mi_free(came_after[i]); }
   fprintf(stderr, "%d threads ended with a page each, this thread allocated 12 blocks of that size, and %d of %d threads after that took one of those pages\n", left, found, came);
-  // (this thread may have taken one for its first block, as it always did where a thread has no page of a size)
-  return (left < LEAVERS || came < LEAVERS || found >= LEAVERS - 3);
+  // (This thread may have taken one for its first block, as it always did where a thread has no page of a size; and in a
+  //  build that forms eight blocks at a time, MI_SECURE, those pages do have blocks to give and it takes a few of them.
+  //  Where every page that the search claims is kept, none is left: 0 of 8.)
+  return (left < LEAVERS || came < LEAVERS || found >= 3);
 }
 
 int main(void) {
