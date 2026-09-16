@@ -1068,6 +1068,7 @@ void          _mi_page_purge_holes_end(mi_tld_t* tld);
 void          _mi_page_purge_holes_sweep_begin(mi_tld_t* tld);   // once per idle sweep, before its passes
 void          _mi_page_purge_holes_forked_child(void);
 void          _mi_page_purge_holes_floor_release(mi_tld_t* tld);  // a tld that goes away gives its share of `purge_holes_large_floor` back
+#define MI_HOLES_FLOOR_EXPIRED   ((mi_msecs_t)(-1))   // `tld->holes_floor_kept_at` during the sweep of a thread that has stayed parked for that long: it leaves nothing under the floor
 mi_msecs_t    _mi_page_purge_holes_floor_due_in(const mi_tld_t* tld);   // in how many msecs is what its last sweep left under the floor to go (0: now; negative: it left nothing)
 void          _mi_page_purge_holes_sweep_end(mi_tld_t* tld);     // once per idle sweep, after its passes
 void          _mi_page_purge_holes_floor_resolve(mi_tld_t* tld);  // once per idle sweep, after the pages of the thread's own theaps: which of them stay under the floor

@@ -618,7 +618,7 @@ typedef enum mi_option_e {
   mi_option_purge_holes_min_interval,  // min milliseconds between idle sweeps of one thread's heaps (=100, 0=every park). Also the least length of an epoch of the sweep: the free blocks of a large page stay until the page was not allocated from for a whole epoch, which is one to two intervals after the last allocation (0=they go at the next sweep). See `_mi_theap_sweep_parked`, `_mi_page_purge_holes`.
   mi_option_purge_holes_full_every,     // every N'th idle sweep walks every page instead of skipping the unchanged ones (=64, 0=never). See `_mi_page_purge_holes`.
   mi_option_purge_holes_large_floor,    // KiB of large pages (their free blocks, or all of a page with none in use) that the idle sweeps of all threads together leave alone (=4096, 0=none). See `_mi_page_purge_holes`. In the environment a bare number is BYTES, as for every size option: write `MIMALLOC_PURGE_HOLES_LARGE_FLOOR=4MiB` (or `4096KiB`), not `4096`.
-  mi_option_purge_holes_large_floor_epochs,   // ..while their page was allocated from in the last so many epochs of the sweep (=256; 0=the floor is off). An epoch lasts for `purge_holes_min_interval` at least and ends only when a thread is swept: nothing is kept by the clock, and nothing is woken for this.
+  mi_option_purge_holes_large_floor_epochs,   // ..while their page was allocated from in the last so many epochs of the sweep (=256; 0=the floor is off). An epoch lasts for `purge_holes_min_interval` at least and ends only when a thread is swept. A thread that stays parked gives what it kept back after so many intervals (25.6 s with the defaults): the scavenger is back for it once.
   _mi_option_last,
   // legacy option names
   mi_option_large_os_pages = mi_option_allow_large_os_pages,

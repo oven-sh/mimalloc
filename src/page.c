@@ -208,13 +208,12 @@ static bool mi_holes_floor_is_on(void) {
           mi_option_get(mi_option_purge_holes_min_interval) > 0 && mi_option_is_enabled(mi_option_purge_holes) && mi_option_get(mi_option_purge_delay) >= 0);
 }
 
-// What the sweeps of a thread leave under the floor is for a thread that is swept now and then. One that is not swept
-// any more (it stays parked, in a process that has gone idle) gives it back: `purge_holes_large_floor_epochs` intervals
-// after the last sweep that left anything, which is the least that so many epochs take, a sweep of that thread leaves
-// nothing (`mi_page_holes_floor_keep`). The ages of the pages stay epochs, and a thread that is swept within that time
-// never gets here: this is one clock reading a sweep, and one wake of the scavenger for a thread that stays parked
-// (`_mi_theap_sweep_parked` tells it when), after which nothing is kept and nothing more is due.
-#define MI_HOLES_FLOOR_EXPIRED   ((mi_msecs_t)(-1))
+// What the sweeps of a thread leave under the floor is for a thread that runs now and then. One that stays parked (in a
+// process that has gone idle) gives it back: `purge_holes_large_floor_epochs` intervals after the sweep that left it,
+// which is the least that so many epochs take, the scavenger sweeps it once more, and that sweep leaves nothing
+// (`_mi_theap_sweep_parked` says when that is and marks the sweep: `MI_HOLES_FLOOR_EXPIRED`; `mi_page_holes_floor_keep`).
+// The ages of the pages stay epochs, and a thread that leaves its park within that time never gets here: this is one
+// clock reading a sweep, and one wake of the scavenger for a park, after which nothing is kept and nothing more is due.
 
 static mi_msecs_t mi_holes_floor_hold_msecs(void) {
   return ((mi_msecs_t)mi_option_get_clamp(mi_option_purge_holes_large_floor_epochs, 0, INT32_MAX) * (mi_msecs_t)mi_option_get_clamp(mi_option_purge_holes_min_interval, 0, 3600000));
@@ -916,7 +915,6 @@ void _mi_page_purge_holes_sweep_begin(mi_tld_t* tld) {
   tld->holes_sweep_full = (every > 0 && (seq % (size_t)every) == 0);
   if (tld->holes_sweep_full) { mi_atomic_addi64_relaxed(&mi_holes_full_sweeps, 1); }
   tld->holes_sweep_epoch = _mi_page_purge_holes_epoch();   // the sweep owns the time that large pages are held by (see `_mi_page_purge_holes`): no page of this sweep is compared with an older epoch than this
-  if (_mi_page_purge_holes_floor_due_in(tld) == 0) { tld->holes_floor_kept_at = MI_HOLES_FLOOR_EXPIRED; }   // not swept for so long: this sweep leaves nothing under the floor
 }
 
 // ..and after them: when did a sweep of this thread last leave anything under the floor?
@@ -1235,7 +1233,7 @@ static bool mi_page_holes_floor_keep(mi_page_t* page, mi_tld_t* tld) {
   const uint32_t age = mi_page_sweep_state_alloc_age(stamp);
   if (age >= (uint32_t)mi_option_get_clamp(mi_option_purge_holes_large_floor_epochs, 0, INT32_MAX)) return false;   // not used for that long: it goes
   if (kept && mi_page_is_abandoned(page) && keeper != mi_page_sweep_state_keeper(tld) && ((keeper >> 32) & 0xFF) == (mi_atomic_load_relaxed(&mi_holes_keepers_gone) & 0xFF)) return true;   // another thread counts it: left alone, and not counted twice
-  if (tld->holes_floor_kept_at == MI_HOLES_FLOOR_EXPIRED) return false;   // this thread was not swept for too long (`_mi_page_purge_holes_floor_due_in`)
+  if (tld->holes_floor_kept_at == MI_HOLES_FLOOR_EXPIRED) return false;   // this thread has stayed parked for too long (`_mi_page_purge_holes_floor_due_in`)
   const size_t bytes = mi_page_large_resident_free(page);   // (what is discarded already is not on the free list)
   if (bytes == 0) return false;
   mi_holes_floor_list_t* const list = tld->holes_floor_list;
@@ -1386,9 +1384,10 @@ void _mi_page_purge_holes(mi_page_t* page, mi_tld_t* tld) {
   //   it is left alone until it has not been allocated from for `purge_holes_large_floor_epochs` epochs, for up to
   //   `purge_holes_large_floor` bytes process-wide (the pages that were used last first); past either, the two epochs
   //   above are all it gets.
-  // A server with a request now and then would fault its buffers in again on every request otherwise. The only time
-  // there is is the epoch, which a sweep moves and nothing else: no clock is kept in the page and nothing is woken for
-  // this. A process in which no thread parks any more keeps those bytes until one does.
+  // A server with a request now and then would fault its buffers in again on every request otherwise. The age of a
+  // page is in epochs, which a sweep moves and nothing else: no clock is kept in the page. A thread that stays parked
+  // gives what it kept back after that many intervals by the clock (`_mi_page_purge_holes_floor_due_in`); one that
+  // neither parks nor is swept keeps it.
   if (mi_page_holes_floor_keep(page, tld)) return;
   mi_page_purge_holes_now(page, tld);
 }

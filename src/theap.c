@@ -438,6 +438,7 @@ mi_msecs_t _mi_theap_sweep_parked(mi_subproc_t* subproc) {
               continue;
             }
           }
+          if (done) { tld->holes_floor_kept_at = MI_HOLES_FLOOR_EXPIRED; }   // (due: this sweep leaves nothing under the floor)
           claimed = tld; theap0 = tld->park_theap0; break;
         }
       }
@@ -460,6 +461,7 @@ mi_msecs_t _mi_theap_sweep_parked(mi_subproc_t* subproc) {
     const uint32_t swept = mi_atomic_load_relaxed(&claimed->park_swept);
     claimed->holes_sweep_deferred = false;
     _mi_thread_idle_work(claimed, theap0);
+    if (claimed->holes_floor_kept_at == MI_HOLES_FLOOR_EXPIRED) { _mi_page_purge_holes_sweep_end(claimed); }   // (its owner wanted it back before the sweep began)
     // After the work: the sweep that comes back is to find the epoch that this one began (if it did) as old as the interval.
     claimed->holes_sweep_last = _mi_clock_now();
     // Mark BEFORE releasing: a `park_swept` set after the store could land on the thread's *next*

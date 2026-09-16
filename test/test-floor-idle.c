@@ -30,6 +30,7 @@ int main(void) { printf("skipped (uses usleep and /proc)\n"); return 0; }
 
 #include <unistd.h>
 #include <dirent.h>
+#include <time.h>
 
 #define INTERVAL_MS  (10)
 #define EPOCHS       (100)     // so many intervals: a second
@@ -39,6 +40,10 @@ static int failures = 0;
 static void check(const char* name, bool ok) {
   fprintf(stderr, "test: %s...  %s\n", name, ok ? "ok." : "FAILED");
   if (!ok) failures++;
+}
+
+static long msecs_now(void) {
+  struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return (long)t.tv_sec * 1000 + (long)(t.tv_nsec / 1000000);
 }
 
 static size_t purged_now(void) {
@@ -101,11 +106,13 @@ int main(void) {
 
   // 2. one that stays parked keeps them for a second, and then the scavenger comes back for them, once
   const size_t target = before + freed * (BLOCK - 16 * 1024);
+  const long park_at = msecs_now();
   if (mi_on_thread_idle_start()) {
     usleep(300 * 1000);   // the sweeps of the hold are over
     const size_t held = purged_now();
     usleep(400 * 1000);   // not yet a second since the last of them
     const size_t still = purged_now();
+    const long still_at = msecs_now() - park_at;   // (unless this machine was stalled: then there is nothing to say about it)
     size_t gone = still;
     int waited = 0;
     for (; waited < 4000 && gone < target; waited += 20) { usleep(20 * 1000); gone = purged_now(); }
@@ -116,7 +123,7 @@ int main(void) {
     fprintf(stderr, "  parked for good: %zu KiB purged at 300 ms, %zu KiB at 700 ms, %zu KiB %d ms later; the scavenger was woken %ld times in the 2.5 s after that\n",
             (held - before) / 1024, (still - before) / 1024, (gone - before) / 1024, waited, wakeups_later - wakeups);
     check("a thread that stays parked keeps them at first", held - before < 2 * (size_t)BLOCK);
-    check("and for purge_holes_large_floor_epochs intervals", still == held);
+    if (still_at < 900) check("and for purge_holes_large_floor_epochs intervals", still == held);
     check("and gives them back then, with nobody else that parks", gone >= target);
     if (wakeups >= 0 && wakeups_later >= 0) check("after which nothing comes back for it", wakeups_later - wakeups <= 1);
   }
