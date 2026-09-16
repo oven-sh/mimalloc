@@ -142,6 +142,15 @@ void* _mi_os_get_aligned_hint(size_t try_alignment, size_t sze)
 
   // todo: perhaps only do alignment hints if THP is enabled?
   if (try_alignment <= mi_os_mem_config.alloc_granularity || try_alignment > 16*MI_GiB) return NULL;
+  // No hint for huge blocks (> 1GiB, as mimalloc v2 did unconditionally). Blocks above
+  // `arena_max_object_size` are mapped from the OS directly and unmapped again on free. Since
+  // `aligned_base` only moves forward, each one would land in a fresh 512MiB region of the 2-level
+  // page map and leave a sub-map behind that is only freed at process exit: 4KiB of RSS per
+  // alloc/free cycle, for example per 4GiB WebAssembly memory reservation (oven-sh/bun#41459).
+  // Without a hint the OS hands back the range that was just unmapped, so the sub-map is reused.
+  // Upstream relaxed this cap in 82c1688674 (microsoft/mimalloc#1290) so that arena reservations
+  // above 1GiB still get a hint. Keep the cap until the page map can release empty sub-maps.
+  if (sze > 1*MI_GiB) return NULL;
   if (mi_os_mem_config.virtual_address_bits < 46) return NULL;  // < 64TiB virtual address space
   
   size_t req_size = sze + _mi_os_page_size(); // always reserve a bit more to create virtual gaps between hinted blocks.
