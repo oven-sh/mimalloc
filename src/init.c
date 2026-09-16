@@ -134,6 +134,7 @@ static mi_decl_cache_align mi_tld_t mi_tld_detached = {
   false, false, 0, 0,     // holes_sweeping / _full / _skipped / _visited
   false, 0, 0,            // holes_sweep_deferred / holes_sweep_epoch / holes_park_epoch
   MI_ATOMIC_VAR_INIT(0),  // holes_floor_kept
+  0,                      // holes_floor_kept_at
   NULL                    // holes_floor_list
 };
 
