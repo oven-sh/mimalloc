@@ -791,7 +791,21 @@ mi_page_t* _mi_arenas_page_try_reclaim_abandoned(mi_theap_t* theap, size_t block
   if (block_size <= MI_MEDIUM_MAX_OBJ_SIZE || block_size > MI_LARGE_MAX_OBJ_SIZE) return NULL;
   mi_page_t* const page = mi_arenas_page_try_find_abandoned(theap, mi_slice_count_of_size(MI_LARGE_PAGE_SIZE), block_size);
   if (page == NULL || mi_page_immediate_available(page) || mi_page_all_free(page)) return page;
-  _mi_arenas_page_abandon(page, theap);
+  // Back as it was: the inverse of what the search did, whatever the state of its heap (not `_mi_arenas_page_abandon`,
+  // which leaves a page of a heap that is being released out of the map, while this page still says that it is in it:
+  // `_mi_arenas_page_unabandon` would wait for a bit that never comes). As `mi_arena_page_purge_holes_at` does it.
+  mi_heap_t* const heap = mi_page_heap(page);
+  const size_t bin = _mi_bin(block_size);
+  size_t slice_index;
+  size_t slice_count;
+  mi_arena_pages_t* arena_pages = NULL;
+  mi_arena_t* const arena = mi_page_arena_pages(page, &slice_index, &slice_count, &arena_pages); MI_UNUSED(arena);
+  mi_bitmap_t* const bitmap = mi_arena_pages_abandoned(arena_pages, bin);
+  mi_assert_internal(bitmap != NULL && mi_page_is_abandoned_mapped(page));
+  mi_atomic_increment_relaxed(&heap->abandoned_count[bin]);
+  mi_theap_stat_increase(theap, pages_abandoned, 1);
+  mi_bitmap_set(bitmap, slice_index);     // back in the map *before* unowning: unown may free the page
+  mi_abandoned_page_unown(page, theap);
   return NULL;
 }
 
