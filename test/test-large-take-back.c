@@ -108,7 +108,67 @@ static void* consumer(void* arg) {
   return NULL;
 }
 
+// An abandoned page that has no block to give stays where it is. Eight threads end at the same time with one buffer in
+// use each, in a page whose other blocks were never formed; a thread that then forms the blocks of its own page one at
+// a time (every allocation here extends the page) is not to take one of those pages out of the map for each of them.
+#define LEAVERS  (8)
+static _Atomic(int) leavers_ready;
+static _Atomic(int) leavers_go;
+static void* left_behind[LEAVERS];
+static void* came_after[LEAVERS];
+
+static void* leaver(void* arg) {
+  const size_t k = (size_t)(uintptr_t)arg;
+  left_behind[k] = mi_malloc(200 * 1024);
+  if (left_behind[k] != NULL) { memset(left_behind[k], 0x33, 64); }
+  atomic_fetch_add(&leavers_ready, 1);
+  while (atomic_load(&leavers_go) == 0) { sched_yield(); }   // all of them have their page before one of them ends
+  return NULL;
+}
+
+static void* comer(void* arg) {
+  const size_t k = (size_t)(uintptr_t)arg;
+  came_after[k] = mi_malloc(200 * 1024);
+  atomic_fetch_add(&leavers_ready, 1);
+  while (atomic_load(&leavers_go) == 0) { sched_yield(); }
+  return NULL;
+}
+
+static int run_together(void* (*fun)(void*)) {
+  pthread_t t[LEAVERS];
+  bool started[LEAVERS];
+  int n = 0;
+  atomic_store(&leavers_ready, 0); atomic_store(&leavers_go, 0);
+  for (int i = 0; i < LEAVERS; i++) { started[i] = (pthread_create(&t[i], NULL, fun, (void*)(uintptr_t)i) == 0); if (started[i]) n++; }
+  while (atomic_load(&leavers_ready) < n) { sched_yield(); }
+  atomic_store(&leavers_go, 1);
+  for (int i = 0; i < LEAVERS; i++) { if (started[i]) pthread_join(t[i], NULL); }
+  return n;
+}
+
+static bool test_no_block_to_give(void) {
+  const int left = run_together(&leaver);
+  void* mine[12];
+  for (int i = 0; i < 12; i++) { mine[i] = mi_malloc(200 * 1024); }
+  // Are the pages that were left behind still there for who needs a page? Eight more threads each need one: they find
+  // them (a block in one of them is within a large page's size after the block that was left in it).
+  const int came = run_together(&comer);
+  int found = 0;
+  for (int k = 0; k < LEAVERS; k++) {
+    if (came_after[k] == NULL) continue;
+    for (int j = 0; j < LEAVERS; j++) {
+      if (left_behind[j] != NULL && (uint8_t*)came_after[k] > (uint8_t*)left_behind[j] && (size_t)((uint8_t*)came_after[k] - (uint8_t*)left_behind[j]) < 4 * 1024 * 1024) { found++; break; }
+    }
+  }
+  for (int i = 0; i < 12; i++) { mi_free(mine[i]); }
+  for (int i = 0; i < LEAVERS; i++) { mi_free(left_behind[i]); mi_free(came_after[i]); }
+  fprintf(stderr, "%d threads ended with a page each, this thread allocated 12 blocks of that size, and %d of %d threads after that took one of those pages\n", left, found, came);
+  // (this thread may have taken one for its first block, as it always did where a thread has no page of a size)
+  return (left < LEAVERS || came < LEAVERS || found >= LEAVERS - 3);
+}
+
 int main(void) {
+  if (!test_no_block_to_give()) { fprintf(stderr, "FAILED: abandoned pages without a block to give were taken\n"); return 1; }
   mi_option_set(mi_option_purge_holes_min_interval, 1);   // epochs of a millisecond: the sweeps of the parks above get to take and to keep
   atomic_store(&producers_left, PRODUCERS * ROUNDS);
   pthread_t c;

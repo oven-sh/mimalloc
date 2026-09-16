@@ -2423,6 +2423,11 @@ static mi_decl_noinline mi_page_t* mi_page_queue_find_free_ex(mi_theap_t* theap,
         _mi_page_free(page_candidate, pq);
         page_candidate = page;
       }
+      // a large page with a block that is there, before one whose next block is yet to be formed: that is memory that was
+      // never touched (and the thread would go to the arena for a page of another thread first: below)
+      else if (pq->block_size > MI_MEDIUM_MAX_OBJ_SIZE && immediate_available && !mi_page_immediate_available(page_candidate)) {
+        page_candidate = page;
+      }
       // prefer to reuse fuller pages (in the hope the less used page gets freed)
       else if (mi_page_used(page) >= mi_page_used(page_candidate) && !mi_page_is_mostly_used(page)) { // && !mi_page_is_expandable(page)) {
         page_candidate = page;
@@ -2463,13 +2468,13 @@ static mi_decl_noinline mi_page_t* mi_page_queue_find_free_ex(mi_theap_t* theap,
     // fault for every 4 KiB of every buffer), while the free blocks of the first one are resident, all the more so
     // since the idle sweep leaves them (`purge_holes_large_floor`). Before a large page is extended, such a page is
     // taken back. It is the same search as where a fresh page would be allocated (`_mi_arenas_page_alloc`), one
-    // relaxed load when the heap has no abandoned page of this size with a free block, which is nearly always; and a
+    // relaxed load when the heap has no abandoned page of this size that is not full, which is nearly always; and a
     // page is extended once for each of its blocks in its life, not for each allocation.
     if (!mi_page_immediate_available(page) && pq->block_size > MI_MEDIUM_MAX_OBJ_SIZE) {
       mi_page_t* const reclaimed = _mi_arenas_page_try_reclaim_abandoned(theap, pq->block_size);
       if (reclaimed != NULL) {
-        _mi_theap_page_reclaim(theap, reclaimed);   // (in the queue either way: it is this thread's now)
-        if (mi_page_immediate_available(reclaimed)) { page = reclaimed; }
+        _mi_theap_page_reclaim(theap, reclaimed);
+        if (mi_page_immediate_available(reclaimed)) { page = reclaimed; }   // (else all its blocks are free and discarded: it is this thread's all the same)
       }
     }
     if (!mi_page_immediate_available(page)) {

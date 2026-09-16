@@ -1387,10 +1387,18 @@ static bool test_take_back(void) {
   // fill the page: it is abandoned with its last block
   if (!alloc_filled(first, n, size, &usable)) { free_all(first, n); return false; }
   for (size_t i = 0; i < n; i++) { if (_mi_ptr_page(first[i]) != page1) { fprintf(stderr, "\n  block %zu of the first %zu is not in the first page\n", i, n); ok_all = false; } }
-  // the thread goes on in a second page, which has one block formed and the rest to come
+  // the thread goes on in a second page, until every block that is formed there is in use and the next one is yet to
+  // be formed (that is after one block, or after eight in a build that forms that many at once: MI_SECURE)
   if (!alloc_filled(more, 1, size, &usable)) { free_all(first, n); return false; }
+  size_t nmore = 1;
   const mi_page_t* const page2 = _mi_ptr_page(more[0]);
   if (page2 == page1) { fprintf(stderr, "\n  the first page was not full after %zu blocks\n", n); ok_all = false; }
+  while (nmore < MAXB && mi_page_used(page2) < page2->capacity) {
+    more[nmore] = mi_malloc(size);
+    if (more[nmore] == NULL) { free_all(first, n); free_all(more, nmore); return false; }
+    pattern_fill(more[nmore], usable, nmore);
+    nmore++;
+  }
   // most of the first page is freed (by this thread, into a page that it does not own any more)
   const size_t nfreed = n - 1;
   for (size_t i = 0; i < nfreed; i++) { mi_free(first[i]); first[i] = NULL; }
@@ -1408,9 +1416,9 @@ static bool test_take_back(void) {
     ok_all = false;
   }
   if (!survivors_intact(first, n, usable, "take-back, the block that stayed")) { ok_all = false; }
-  if (!survivors_intact(more, 1, usable, "take-back, the second page")) { ok_all = false; }
+  if (!survivors_intact(more, nmore, usable, "take-back, the second page")) { ok_all = false; }
   fprintf(stderr, "(%zu of %zu allocations took the blocks that were freed in the full page) ", from_first, nfreed);
-  free_all(first, n); free_all(more, 1); free_all(again, n);
+  free_all(first, n); free_all(more, nmore); free_all(again, n);
   mi_collect(true);
   return ok_all;
 }
