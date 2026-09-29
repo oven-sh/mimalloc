@@ -532,6 +532,403 @@ static void test_park_between_walk_and_wait(void) { fprintf(stderr, "test: park 
 #endif
 
 // ---------------------------------------------------------------------------
+// The schedule of the scavenger. A park inside the rate window of its thread is passed over, and from then on
+// the scavenger comes for that thread by itself when the window ends (`park_paced`): until then the parks of the
+// thread wake nobody, and none of them is lost to that.
+// ---------------------------------------------------------------------------
+static long now_ms(void) {
+  struct timespec t;
+  clock_gettime(CLOCK_MONOTONIC, &t);
+  return (long)t.tv_sec * 1000 + (long)(t.tv_nsec / 1000000);
+}
+
+// A thread that parks all the time (an event loop that is busy) wakes the scavenger a few times for each
+// window, not once for each park, and is swept as often as it was when each park woke it.
+// The scavenger has to see a park of 1 ms to put the thread on its schedule. On a machine that is busy with
+// something else for a moment it comes too late for that, and the next park wakes it again: go again then.
+static void test_frequent_parks_wake_seldom(void) {
+  enum { PARKS = 1000, ATTEMPTS = 3 };
+  const long interval_ms = mi_option_get(mi_option_purge_holes_min_interval);
+  if (!mi_on_thread_idle_start()) { fprintf(stderr, "test: parks inside the rate window wake nobody...  skipped (nobody to hand off to)\n"); return; }
+  mi_on_thread_idle_end();
+  bool seldom = false, swept = false, slow = false;
+  for (int attempt = 0; attempt < ATTEMPTS && !(seldom && swept); attempt++) {
+    const handoff_counts_t before = handoff_counts();
+    const long t0 = now_ms();
+    for (int i = 0; i < PARKS; i++) {
+      if (mi_on_thread_idle_start()) { usleep(1000); mi_on_thread_idle_end(); }
+    }
+    const long elapsed_ms = now_ms() - t0;
+    const handoff_counts_t after = handoff_counts();
+    const size_t wakes = after.wakes - before.wakes, turns = after.turns - before.turns, sweeps = after.sweeps - before.sweeps;
+    fprintf(stderr, "  %d parks of 1 ms in %ld ms: %zu wakes, %zu turns of the scavenger, %zu sweeps (min_interval=%ldms)\n", PARKS, elapsed_ms, wakes, turns, sweeps, interval_ms);
+    if (interval_ms <= 0) {   // no window (the `-eager` variant): nothing is ever on the schedule
+      seldom = true;
+      swept = (sweeps >= (size_t)PARKS / 2);
+      continue;
+    }
+    // A window takes a wake for its sweep and one to get on the schedule for the next: twice as many for each window
+    // are still far fewer than one for each park, unless the machine is so slow that a window has but a few parks.
+    const size_t windows = (size_t)(elapsed_ms / interval_ms) + 1;
+    slow = (8 * windows > (size_t)PARKS);
+    if (slow) continue;
+    seldom = (wakes <= 4 * windows + 4);
+    swept = (2 * sweeps + 2 >= windows);
+  }
+  if (interval_ms <= 0) { check("with no rate window every park is swept", swept); return; }
+  if (slow && !(seldom && swept)) { fprintf(stderr, "test: parks inside the rate window wake nobody...  skipped (too slow: a window has but a few parks of 1 ms)\n"); return; }
+  check("a thread that parks all the time wakes the scavenger for its windows, not for its parks", seldom);
+  check("and is swept once for each window", swept);
+}
+
+// a thread that parks when it is told to, so that the test can look on while it is in `mi_on_thread_idle_start`
+enum { PARKER_RUNS = 0, PARKER_PARKS = 1, PARKER_REFUSED = 2, PARKER_EXITS = 3 };
+typedef struct parker_s {
+  pthread_t   thread;
+  atomic_int  want;    // what it is asked for
+  atomic_int  is;      // what it did
+} parker_t;
+
+static void* parker_main(void* arg) {
+  parker_t* const pk = (parker_t*)arg;
+  void* q = mi_malloc(64); mi_free(q);   // heaps of its own to hand off
+  for (;;) {
+    const int want = atomic_load(&pk->want);
+    const int is = atomic_load(&pk->is);
+    if (want == PARKER_EXITS) break;   // (parked or not)
+    if (want == PARKER_PARKS && is == PARKER_RUNS) {
+      atomic_store(&pk->is, mi_on_thread_idle_start() ? PARKER_PARKS : PARKER_REFUSED);
+    }
+    else if (want == PARKER_RUNS && is != PARKER_RUNS) {
+      mi_on_thread_idle_end();
+      atomic_store(&pk->is, PARKER_RUNS);
+    }
+    else {
+      #if defined(MI_TSAN)
+      sched_yield();   // (see `park_then_cancel`)
+      #else
+      usleep(50);
+      #endif
+    }
+  }
+  return NULL;
+}
+
+static bool parker_start(parker_t* pk) {
+  atomic_store(&pk->want, PARKER_RUNS);
+  atomic_store(&pk->is, PARKER_RUNS);
+  return (pthread_create(&pk->thread, NULL, &parker_main, pk) == 0);
+}
+
+static void parker_stop(parker_t* pk) {
+  atomic_store(&pk->want, PARKER_EXITS);
+  pthread_join(pk->thread, NULL);
+}
+
+static bool parker_wait(parker_t* pk, int is, long deadline_ms) {
+  for (long i = 0; i < deadline_ms * 10; i++) { if (atomic_load(&pk->is) == is) return true; usleep(100); }
+  return atomic_load(&pk->is) == is;
+}
+
+static void parker_park_begin(parker_t* pk) { atomic_store(&pk->want, PARKER_PARKS); }
+static bool parker_park(parker_t* pk)       { parker_park_begin(pk); return parker_wait(pk, PARKER_PARKS, 5000); }
+static void parker_unpark(parker_t* pk)     { atomic_store(&pk->want, PARKER_RUNS); parker_wait(pk, PARKER_RUNS, 5000); }
+
+// Have a park of `pk` swept, and the next one, inside the window that begins with that sweep, passed over: the
+// thread is on the schedule then, and running. The window ends between `*ends_after` and `*ends_before`.
+// False if the machine was too slow for that (the window was over before the second park was looked at).
+static bool parker_get_on_schedule(parker_t* pk, long interval_ms, long* ends_after, long* ends_before) {
+  usleep((useconds_t)(interval_ms * 1000 + 5000));   // due
+  size_t before = handoff_counts().sweeps;
+  *ends_after = now_ms() + interval_ms;
+  if (!parker_park(pk)) { parker_unpark(pk); return false; }
+  const bool swept = wait_for_sweep_after(before, 3000);
+  parker_unpark(pk);   // (waits for the sweep to end: it is stamped now)
+  *ends_before = now_ms() + interval_ms + 1;
+  if (!swept) return false;
+  before = handoff_counts().turns;
+  if (!parker_park(pk)) { parker_unpark(pk); return false; }
+  for (int i = 0; i < 10000 && handoff_counts().turns == before; i++) { usleep(100); }   // this park woke the scavenger: it walks
+  size_t turns = handoff_counts().turns;
+  for (int i = 0; i < 20; i++) {   // ..and is back in its wait
+    usleep(1000);
+    const size_t now = handoff_counts().turns;
+    if (now == turns && i > 0) break;
+    turns = now;
+  }
+  const bool looked = (turns > before && now_ms() < *ends_after - 10);
+  parker_unpark(pk);
+  return looked;
+}
+
+// A park of a thread that is on the schedule wakes nobody, and is swept when the window ends.
+static void test_park_on_schedule_is_swept(void) {
+  const long interval_ms = mi_option_get(mi_option_purge_holes_min_interval);
+  if (interval_ms <= 0) return;   // no window (the `-eager` variant)
+  if (!mi_on_thread_idle_start()) { fprintf(stderr, "test: a park of a thread on the schedule...  skipped (nobody to hand off to)\n"); return; }
+  mi_on_thread_idle_end();
+  parker_t pk;
+  if (!parker_start(&pk)) return;
+  bool tried = false, quiet = false, swept = false;
+  long waited_ms = -1;
+  for (int round = 0; round < 8 && !quiet; round++) {   // (again if the scavenger was too slow to see the park that gets the thread on the schedule)
+    long ends_after, ends_before;
+    if (!parker_get_on_schedule(&pk, interval_ms, &ends_after, &ends_before)) continue;
+    const handoff_counts_t before = handoff_counts();
+    const long t0 = now_ms();
+    const bool parked = parker_park(&pk);
+    if (parked && now_ms() < ends_after - 5) {   // parked inside the window
+      tried = true;
+      quiet = (handoff_counts().wakes == before.wakes);
+      swept = wait_for_sweep_after(before.sweeps, interval_ms * 10 + 1000);
+      waited_ms = now_ms() - t0;
+    }
+    parker_unpark(&pk);
+  }
+  parker_stop(&pk);
+  if (!tried) { fprintf(stderr, "test: a park of a thread on the schedule...  skipped (too slow to park inside a window of %ld ms)\n", interval_ms); return; }
+  fprintf(stderr, "  park of a thread on the schedule swept after %ldms (min_interval=%ldms)\n", waited_ms, interval_ms);
+  check("a park of a thread that is on the schedule of the scavenger wakes nobody", quiet);
+  check("and is swept when the window of the thread ends", swept);
+}
+
+// A thread that is on the schedule and then exits is taken off it, and a forked child starts with nobody on it:
+// a park there has to wake the scavenger of the child, which has no schedule to go by.
+static void* park_on_schedule_then_exit(void* arg) {
+  (void)arg;
+  void* q = mi_malloc(64); mi_free(q);
+  for (int i = 0; i < 3; i++) {   // swept, passed over, and parked once more on the schedule
+    if (!mi_on_thread_idle_start()) break;
+    usleep(3000);
+    if (i < 2) { mi_on_thread_idle_end(); }
+  }
+  return NULL;   // (parked)
+}
+
+static void test_exit_and_fork_on_schedule(void) {
+  enum { THREADS = 4 };
+  const long interval_ms = mi_option_get(mi_option_purge_holes_min_interval);
+  if (!mi_on_thread_idle_start()) { fprintf(stderr, "test: exit and fork on the schedule...  skipped (nobody to hand off to)\n"); return; }
+  mi_on_thread_idle_end();
+  pthread_t t[THREADS];
+  for (int i = 0; i < THREADS; i++) { if (pthread_create(&t[i], NULL, &park_on_schedule_then_exit, NULL) != 0) return; }
+  for (int i = 0; i < THREADS; i++) { pthread_join(t[i], NULL); }
+  usleep((useconds_t)(interval_ms * 1000 + 20000));   // the windows of the threads that are gone end
+  size_t before = handoff_counts().sweeps;
+  bool parked = mi_on_thread_idle_start();
+  const bool swept = parked && wait_for_sweep_after(before, 3000);
+  mi_on_thread_idle_end();
+  check("a thread may exit while it is on the schedule of the scavenger", swept);
+  if (interval_ms <= 0) return;
+  #if defined(MI_TSAN)
+  // (the child starts a scavenger thread, which the thread sanitizer does not let a forked child do)
+  fprintf(stderr, "test: a park in a forked child...  skipped (thread sanitizer)\n");
+  #else
+  // get on the schedule ourselves (swept just now: the next park is passed over), and fork
+  before = handoff_counts().turns;
+  parked = mi_on_thread_idle_start();
+  for (int i = 0; parked && i < 10000 && handoff_counts().turns == before; i++) { usleep(100); }
+  usleep(2000);
+  mi_on_thread_idle_end();
+  const pid_t pid = fork();
+  if (pid == 0) {
+    // The child has a scavenger of its own from its first park on, which knows of no schedule. (A park that is
+    // over before that thread runs: it is not to come upon this thread by the walk it starts with.)
+    int bad = 0;
+    if (mi_on_thread_idle_start()) { mi_on_thread_idle_end(); } else { bad = 1; }
+    usleep((useconds_t)(interval_ms * 1000 + 5000));   // the window of the last sweep, which came along, ends
+    const size_t sweeps = handoff_counts().sweeps;
+    if (bad == 0) {
+      if (!mi_on_thread_idle_start()) { bad = 1; }
+      else if (!wait_for_sweep_after(sweeps, 3000)) { bad = 2; }
+      mi_on_thread_idle_end();
+    }
+    _exit(bad);
+  }
+  int status = 0;
+  const bool child_ok = (pid > 0 && waitpid(pid, &status, 0) == pid && WIFEXITED(status) && WEXITSTATUS(status) == 0);
+  if (!child_ok && pid > 0 && WIFEXITED(status)) { fprintf(stderr, "\n  the child failed with %d (1: nobody to hand off to, 2: its park was not swept)\n", WEXITSTATUS(status)); }
+  check("a park in a forked child wakes the scavenger of the child", child_ok);
+  #endif
+}
+
+#if MI_DEBUG > 0
+extern _Atomic(uintptr_t) mi_debug_stall_in_park_start;
+extern _Atomic(uintptr_t) mi_debug_stall_in_scavenger_visit;
+
+// Wait until the scavenger is held before its wait and that wait is to be a long one: it has nobody on its
+// schedule and nothing to purge, so nothing but a wake ends that wait before `deadline_ms`.
+// (`mi_debug_stall_in_scavenger_wait` is set on return if that is true: the scavenger is held.)
+static bool hold_scavenger_before_long_wait(long deadline_ms, long give_up_ms) {
+  const long t0 = now_ms();
+  atomic_store(&mi_debug_stall_in_scavenger_wait, (uintptr_t)1);
+  for (;;) {
+    if (atomic_load(&mi_debug_stall_in_scavenger_wait) == 2) {
+      if ((long)atomic_load(&mi_debug_scavenger_wait_msecs) >= 2 * deadline_ms) return true;
+      atomic_store(&mi_debug_stall_in_scavenger_wait, (uintptr_t)1);   // on to its next turn, and hold it there
+    }
+    if (now_ms() - t0 > give_up_ms) { atomic_store(&mi_debug_stall_in_scavenger_wait, (uintptr_t)0); return false; }
+    usleep(100);
+  }
+}
+
+// The thread publishes its park and THEN reads whether it is on the schedule. Hold it before it publishes, until
+// the scavenger has come for it (its window ended), found it running, taken it off the schedule and is about to
+// wait for good: the park that is published then has to find the mark gone, and wake the scavenger.
+static void test_park_after_visit_wakes(void) {
+  const long interval_ms = mi_option_get(mi_option_purge_holes_min_interval);
+  const long deadline_ms = interval_ms * 10 + 1000;
+  if (interval_ms <= 0) return;
+  if (!mi_on_thread_idle_start()) { fprintf(stderr, "test: a park after the visit of the scavenger...  skipped (nobody to hand off to)\n"); return; }
+  mi_on_thread_idle_end();
+  parker_t pk;
+  if (!parker_start(&pk)) return;
+  bool tried = false, swept = false;
+  for (int round = 0; round < 5 && !tried; round++) {
+    long ends_after, ends_before;
+    if (!parker_get_on_schedule(&pk, interval_ms, &ends_after, &ends_before)) continue;
+    atomic_store(&mi_debug_stall_in_park_start, (uintptr_t)1);
+    parker_park_begin(&pk);
+    const bool held = wait_for_stall(&mi_debug_stall_in_park_start, 1000) && (now_ms() < ends_after - 5);   // (inside the window: on the schedule)
+    const bool visited = held && hold_scavenger_before_long_wait(deadline_ms, (ends_before - now_ms()) + 2000);
+    const size_t before = handoff_counts().sweeps;
+    atomic_store(&mi_debug_stall_in_park_start, (uintptr_t)0);
+    const bool parked = parker_wait(&pk, PARKER_PARKS, 5000);
+    atomic_store(&mi_debug_stall_in_scavenger_wait, (uintptr_t)0);
+    if (visited && parked) {
+      tried = true;
+      swept = wait_for_sweep_after(before, deadline_ms);
+    }
+    parker_unpark(&pk);
+  }
+  parker_stop(&pk);
+  if (!tried) { fprintf(stderr, "test: a park after the visit of the scavenger...  skipped (too slow, or the scavenger had something scheduled each time)\n"); return; }
+  check("a park that is published after the scavenger took the thread off its schedule wakes it", swept);
+}
+
+// The scavenger takes the thread off its schedule and THEN looks at its park. Hold it between the two, until
+// the thread has published a park: that park found the mark gone, so it woke the scavenger, and is swept.
+static void test_park_during_visit_is_seen(void) {
+  const long interval_ms = mi_option_get(mi_option_purge_holes_min_interval);
+  const long deadline_ms = interval_ms * 10 + 1000;
+  if (interval_ms <= 0) return;
+  if (!mi_on_thread_idle_start()) { fprintf(stderr, "test: a park during the visit of the scavenger...  skipped (nobody to hand off to)\n"); return; }
+  mi_on_thread_idle_end();
+  parker_t pk;
+  if (!parker_start(&pk)) return;
+  bool tried = false, swept = false;
+  for (int round = 0; round < 5 && !tried; round++) {
+    long ends_after, ends_before;
+    if (!parker_get_on_schedule(&pk, interval_ms, &ends_after, &ends_before)) continue;
+    atomic_store(&mi_debug_stall_in_scavenger_visit, (uintptr_t)1);
+    const bool visiting = wait_for_stall(&mi_debug_stall_in_scavenger_visit, (ends_before - now_ms()) + 2000);
+    const size_t before = handoff_counts().sweeps;
+    const bool parked = visiting && parker_park(&pk);
+    atomic_store(&mi_debug_stall_in_scavenger_visit, (uintptr_t)0);
+    if (parked) {
+      tried = true;
+      swept = wait_for_sweep_after(before, deadline_ms);
+    }
+    parker_unpark(&pk);
+  }
+  parker_stop(&pk);
+  if (!tried) { fprintf(stderr, "test: a park during the visit of the scavenger...  skipped (too slow to get a thread on the schedule)\n"); return; }
+  check("a park that is published while the scavenger takes the thread off its schedule is swept", swept);
+}
+
+// A thread on the schedule bounds the wait of the scavenger until its window ends, parked or not: its parks
+// wake nobody. Have the scavenger walk (for the park of another thread) while the thread runs, and park after.
+static void test_schedule_bounds_the_wait(void) {
+  const long interval_ms = mi_option_get(mi_option_purge_holes_min_interval);
+  const long deadline_ms = interval_ms * 10 + 1000;
+  if (interval_ms <= 0) return;
+  if (!mi_on_thread_idle_start()) { fprintf(stderr, "test: a thread on the schedule bounds the wait...  skipped (nobody to hand off to)\n"); return; }
+  mi_on_thread_idle_end();
+  parker_t pk;
+  if (!parker_start(&pk)) return;
+  bool tried = false, bounded = false, swept = false;
+  for (int round = 0; round < 5 && !tried; round++) {
+    parker_t other;   // a new thread: never swept, so its park is due, and not on the schedule, so it wakes
+    long ends_after, ends_before;
+    if (!parker_get_on_schedule(&pk, interval_ms, &ends_after, &ends_before)) continue;
+    if (!parker_start(&other)) break;
+    atomic_store(&mi_debug_stall_in_scavenger_wait, (uintptr_t)1);
+    const bool parked_other = parker_park(&other);
+    const bool held = parked_other && wait_for_stall(&mi_debug_stall_in_scavenger_wait, 1000) && (now_ms() < ends_after - 5);
+    const long wait_ms = (long)atomic_load(&mi_debug_scavenger_wait_msecs);
+    const handoff_counts_t before = handoff_counts();
+    const bool parked = held && parker_park(&pk);
+    const bool quiet = parked && (handoff_counts().wakes == before.wakes) && (now_ms() < ends_after - 5);
+    atomic_store(&mi_debug_stall_in_scavenger_wait, (uintptr_t)0);
+    if (quiet) {
+      tried = true;
+      bounded = (wait_ms <= interval_ms);
+      swept = wait_for_sweep_after(before.sweeps, deadline_ms);
+    }
+    parker_unpark(&pk);
+    parker_unpark(&other);
+    parker_stop(&other);
+  }
+  parker_stop(&pk);
+  if (!tried) { fprintf(stderr, "test: a thread on the schedule bounds the wait...  skipped (too slow to park inside a window of %ld ms)\n", interval_ms); return; }
+  check("a thread on the schedule bounds the wait of the scavenger while it runs", bounded);
+  check("and its next park is swept when its window ends", swept);
+}
+
+// A thread comes off the schedule when its window ends. A park that it is in then, and that was not swept yet, is
+// not swept there and then: the thread did not say when that park began, and one that parks all the time is about
+// to take its heaps back. The scavenger looks again in a moment, and sweeps the thread if it is still parked.
+// Hold it where it took the thread off its schedule, and again before its next wait: it swept nothing in between,
+// and that wait is the short one. (A turn that something else asks for in between sweeps the park: go again then.)
+static void test_park_at_visit_is_looked_at_again(void) {
+  const long interval_ms = mi_option_get(mi_option_purge_holes_min_interval);
+  const long deadline_ms = interval_ms * 10 + 1000;
+  if (interval_ms <= 0) return;
+  const long moment_ms = (interval_ms >= 32 ? interval_ms / 16 : 1);   // (`MI_PARK_VISIT_GRACE_DIV`)
+  if (!mi_on_thread_idle_start()) { fprintf(stderr, "test: a park at the visit of the scavenger...  skipped (nobody to hand off to)\n"); return; }
+  mi_on_thread_idle_end();
+  parker_t pk;
+  if (!parker_start(&pk)) return;
+  bool tried = false, left = false, soon = false, swept = false;
+  for (int round = 0; round < 5 && !(left && soon); round++) {
+    long ends_after, ends_before;
+    if (!parker_get_on_schedule(&pk, interval_ms, &ends_after, &ends_before)) continue;
+    const handoff_counts_t before = handoff_counts();
+    atomic_store(&mi_debug_stall_in_scavenger_visit, (uintptr_t)1);
+    // a park inside the window, which wakes nobody: the scavenger does not know of it
+    const bool parked = parker_park(&pk) && (now_ms() < ends_after - 5) && (handoff_counts().wakes == before.wakes);
+    const bool visiting = parked && wait_for_stall(&mi_debug_stall_in_scavenger_visit, (ends_before - now_ms()) + 2000);
+    atomic_store(&mi_debug_stall_in_scavenger_wait, (uintptr_t)1);
+    atomic_store(&mi_debug_stall_in_scavenger_visit, (uintptr_t)0);
+    const bool waiting = visiting && wait_for_stall(&mi_debug_stall_in_scavenger_wait, 5000);
+    if (waiting) {
+      tried = true;
+      left = (handoff_counts().sweeps == before.sweeps);
+      soon = ((long)atomic_load(&mi_debug_scavenger_wait_msecs) <= moment_ms);
+    }
+    atomic_store(&mi_debug_stall_in_scavenger_wait, (uintptr_t)0);
+    if (left && soon) { swept = wait_for_sweep_after(before.sweeps, deadline_ms); }
+    parker_unpark(&pk);
+  }
+  parker_stop(&pk);
+  if (!tried) { fprintf(stderr, "test: a park at the visit of the scavenger...  skipped (too slow to park inside a window of %ld ms)\n", interval_ms); return; }
+  check("a park that was not swept yet is not swept where its thread comes off the schedule", left);
+  check("the scavenger looks at it again in a moment", soon);
+  check("and sweeps the thread if it is still parked", swept);
+}
+
+static void test_schedule_handshake(void) {
+  usleep(300000);   // what the tests before this one freed is purged: nothing is scheduled
+  test_park_after_visit_wakes();
+  test_park_during_visit_is_seen();
+  test_park_at_visit_is_looked_at_again();
+  test_schedule_bounds_the_wait();
+}
+#else
+static void test_schedule_handshake(void) { fprintf(stderr, "test: the order of a park and the visit of the scavenger...  skipped (needs MI_DEBUG>0)\n"); }
+#endif
+
+// ---------------------------------------------------------------------------
 // fork() by a thread that is between _start and _end -- fork does not allocate, so the contract
 // permits it, and the scavenger may be part-way through rewriting this thread's page free lists.
 // The damage is in those *freed* holes, not the survivors: the child must be able to allocate
@@ -757,6 +1154,10 @@ int main(void) {
   test_park_inside_window_gets_swept();
   test_handoff_counters();
   test_park_between_walk_and_wait();
+  test_frequent_parks_wake_seldom();
+  test_park_on_schedule_is_swept();
+  test_schedule_handshake();
+  test_exit_and_fork_on_schedule();
   test_fork_while_parked();
   test_park_then_exit();
   test_exit_while_swept_with_dyn_tls();

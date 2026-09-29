@@ -429,11 +429,13 @@ void _mi_process_fork_child(void) {
     mi_lock_init(&sp->theap_meta_lock);
     mi_atomic_store_relaxed(&sp->scavenger_wake, (uint32_t)0);
     mi_atomic_store_relaxed(&sp->parked_count, (size_t)0);
+    mi_atomic_store_relaxed(&sp->paced_count, (size_t)0);
     for (mi_tld_t* t = sp->tlds; t != NULL; t = t->subproc_next) {   // every tld, the forking thread's included, is registered here
       mi_lock_init(&t->theaps_lock);
       mi_atomic_store_relaxed(&t->park_state, (uint32_t)MI_PARK_RUNNING);
       mi_atomic_store_relaxed(&t->park_reclaim, (uint32_t)0);
       mi_atomic_store_relaxed(&t->park_swept, (uint32_t)0);
+      mi_atomic_store_relaxed(&t->park_paced, (uint32_t)0);   // the scavenger that had it on its schedule is gone
       t->holes_sweeping = false;   // a sweep that was running at the fork (by the scavenger, or by a thread that is gone) does not continue here
       t->holes_sweep_deferred = false;
       mi_atomic_store_relaxed(&t->holes_floor_kept, (size_t)0);   // (`_mi_page_purge_holes_forked_child` zeroes the sum)

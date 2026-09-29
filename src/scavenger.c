@@ -207,6 +207,12 @@ static void mi_scavenger_run(void) {
     // `parked_count` read below can pass the parker's increment and its exchange in opposite
     // directions (store-buffering) -- we see no parked thread, it sees a stale wake==1 and issues
     // no syscall, and that park is silently deferred to the safety timeout.
+    // A park of a thread that is on our schedule (`tld->park_paced`) does not come through here at all: it
+    // issues no wake. That one rests on the same two steps in the same order, one thread at a time, in
+    // `_mi_theap_sweep_parked`: the mark is taken off (where the wake word is cleared here), and then the
+    // park is looked at; and the thread publishes its park, and then reads the mark (where it sets the wake
+    // word here). Whatever is put between the two steps of a side loses parks: test-park-handoff holds each
+    // side there (`mi_debug_stall_in_..`) while the other one takes both of its steps.
     mi_atomic_exchange_acq_rel(&subproc->scavenger_wake, (uint32_t)0);
     mi_atomic_increment_relaxed(&subproc->scavenger_turns);
     // Do the idle work of any thread that parked and handed us its theaps. This is the expensive

@@ -351,6 +351,19 @@ bool mi_on_thread_idle_pending(void) mi_attr_noexcept {
   return theap0->tld->holes_sweep_deferred;
 }
 
+#if MI_DEBUG > 0
+mi_decl_export _Atomic(uintptr_t) mi_debug_stall_in_park_start;        // test hook (test-park-handoff): 1 holds a thread that is about to publish its park
+mi_decl_export _Atomic(uintptr_t) mi_debug_stall_in_scavenger_visit;   // ..and the scavenger where it took a thread off its schedule and has yet to look at it
+static void mi_debug_stall(_Atomic(uintptr_t)* stall) {
+  if (mi_atomic_load_acquire(stall) == 1) {
+    mi_atomic_store_release(stall, (uintptr_t)2);   // signal: held here
+    while (mi_atomic_load_acquire(stall) == 2) { _mi_prim_thread_yield(); }
+  }
+}
+#else
+#define mi_debug_stall(stall)
+#endif
+
 // Declare that this thread will not allocate or free until `mi_on_thread_idle_end` -- the sweep's
 // precondition -- so the scavenger can do it while we block.
 //
@@ -358,6 +371,13 @@ bool mi_on_thread_idle_pending(void) mi_attr_noexcept {
 // It deliberately does NOT sweep inline in that case: a caller parks far more often than it is
 // idle, and sweeping on every park is what it is trying to avoid. Only the caller knows whether
 // this park is idle enough to afford `mi_on_thread_idle()` instead.
+//
+// A park wakes the scavenger only while the thread is not on the scavenger's schedule (`park_paced`). The scavenger
+// puts a thread there when it passes a park of it over for `purge_holes_min_interval`: it comes back by itself when
+// that window ends, so until then a wake would have it walk the threads to find nothing due, once for each park.
+// No park is lost to that, by the order on both sides: we publish the park and THEN read the mark, the scavenger
+// takes the mark off and THEN looks at the park (`_mi_theap_sweep_parked`). All four are sequentially consistent,
+// so one of us sees what the other wrote: we find the mark gone and wake it, or it finds us parked.
 bool mi_on_thread_idle_start(void) mi_attr_noexcept {
   mi_theap_t* const theap0 = _mi_theap_default();
   if (theap0 == NULL || !mi_theap_is_initialized(theap0) || theap0->tld == NULL) return false;
@@ -375,10 +395,13 @@ bool mi_on_thread_idle_start(void) mi_attr_noexcept {
   tld->park_theap0 = theap0;
   mi_atomic_store_release(&tld->park_reclaim, 0);
   mi_atomic_store_release(&tld->park_swept, (uint32_t)MI_PARK_SWEPT_NONE);
+  mi_debug_stall(&mi_debug_stall_in_park_start);
   uint32_t expected = MI_PARK_RUNNING;
-  if (!mi_atomic_cas_strong_acq_rel(&tld->park_state, &expected, MI_PARK_PARKED)) return false;
+  if (!mi_atomic_cas_strong_seq_cst(&tld->park_state, &expected, MI_PARK_PARKED)) return false;
   mi_atomic_increment_relaxed(&tld->subproc->parked_count);
-  if (_mi_scavenger_wake(tld->subproc)) { mi_atomic_increment_relaxed(&tld->subproc->park_wakes); }
+  if (mi_atomic_load_seq_cst(&tld->park_paced) == 0) {   // (after the park is published)
+    if (_mi_scavenger_wake(tld->subproc)) { mi_atomic_increment_relaxed(&tld->subproc->park_wakes); }
+  }
   return true;
 }
 
@@ -402,9 +425,13 @@ void mi_on_thread_idle_end(void) mi_attr_noexcept {
 // Returns in how many msecs a park that was passed over for `purge_holes_min_interval`, or one that is to be
 // swept again for its large pages, becomes due (0: none), so the scavenger can wake for it instead of
 // leaving it to its safety timeout.
+//
+// A thread whose park is passed over that way is on our schedule from then on (`park_paced`): its parks do not
+// wake us (`mi_on_thread_idle_start`), so the end of its window is ours to keep, parked at this moment or not,
+// and the walk is made for a thread on the schedule as it is for one that is parked.
 mi_msecs_t _mi_theap_sweep_parked(mi_subproc_t* subproc) {
   if (subproc == NULL) return 0;
-  if (mi_atomic_load_relaxed(&subproc->parked_count) == 0) return 0;
+  if (mi_atomic_load_relaxed(&subproc->parked_count) == 0 && mi_atomic_load_relaxed(&subproc->paced_count) == 0) return 0;
   for (;;) {
     mi_tld_t* claimed = NULL;
     mi_theap_t* theap0 = NULL;
@@ -413,6 +440,32 @@ mi_msecs_t _mi_theap_sweep_parked(mi_subproc_t* subproc) {
       const mi_msecs_t now = _mi_clock_now();
       const mi_msecs_t interval = (mi_msecs_t)mi_option_get_clamp(mi_option_purge_holes_min_interval, 0, 3600000);
       for (mi_tld_t* tld = subproc->tlds; tld != NULL; tld = tld->subproc_next) {
+        if (mi_atomic_load_relaxed(&tld->park_paced) != 0) {   // (only we set it, and we and the end of the thread take it off: under the lock)
+          if (interval > 0 && tld->holes_sweep_last != 0 && now - tld->holes_sweep_last < interval) {
+            const mi_msecs_t due = interval - (now - tld->holes_sweep_last);
+            if (due_in == 0 || due < due_in) { due_in = due; }
+            continue;
+          }
+          // Its window is over. Off the schedule BEFORE the look at its park: a park that is published after this look
+          // finds the mark gone and wakes us. And the state of the park before what else the thread wrote for it: with
+          // no wake there is nothing but that state to say that its `park_swept` is the one of this park.
+          mi_atomic_exchange_seq_cst(&tld->park_paced, (uint32_t)0);
+          mi_atomic_decrement_relaxed(&subproc->paced_count);
+          mi_debug_stall(&mi_debug_stall_in_scavenger_visit);
+          if (mi_atomic_load_seq_cst(&tld->park_state) != MI_PARK_PARKED) continue;
+          if (mi_atomic_load_acquire(&tld->park_swept) == MI_PARK_SWEPT_NONE) {
+            // A park that was not swept yet. If it began while the thread was on the schedule, the thread told nobody
+            // when, and a thread that parks all the time is somewhere in a park that ends soon: a sweep that begins now
+            // has what is left of that park (the owner takes its heaps back when the park ends), and a sweep that is cut
+            // short uses up the window like any other (`holes_sweep_last` below). So it is not swept now but with its
+            // next park, which wakes us: that sweep has the park from its start, as it had when every park woke us.
+            // A thread that is still parked when we look again in a moment is idle, and is swept then.
+            const mi_msecs_t grace = (interval >= 2 * MI_PARK_VISIT_GRACE_DIV ? interval / MI_PARK_VISIT_GRACE_DIV : 1);
+            if (due_in == 0 || grace < due_in) { due_in = grace; }
+            continue;
+          }
+          // (a park that we swept and come back to for its large pages: the thread has been parked since)
+        }
         // Done for this park? But for what it left under `purge_holes_large_floor`: that is looked at again once it is old
         // enough to go, which is when the sweeps of OTHER threads have moved the epoch that far (nothing is woken for it:
         // we are here because some thread parked). A thread that stays parked is not to hold the floor against the ones
@@ -423,6 +476,8 @@ mi_msecs_t _mi_theap_sweep_parked(mi_subproc_t* subproc) {
           if (mi_atomic_load_relaxed(&tld->park_state) == MI_PARK_PARKED) {
             const mi_msecs_t due = interval - (now - tld->holes_sweep_last);
             if (due_in == 0 || due < due_in) { due_in = due; }
+            // on the schedule: we are back when its window ends, and it need not tell us of its parks until then
+            if (mi_atomic_exchange_seq_cst(&tld->park_paced, (uint32_t)1) == 0) { mi_atomic_increment_relaxed(&subproc->paced_count); }
           }
           continue;
         }

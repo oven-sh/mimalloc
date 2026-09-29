@@ -220,6 +220,11 @@ mi_decl_export void mi_collect(bool force)      mi_attr_noexcept;
 // RETURNED, and three more times at the most: two will do as a rule, and what is left after
 // those are pages that other threads are using, for which it can stay true as long as they
 // do. The `_start`/`_end` pair below does all of that by itself.
+// What the pair costs the thread that calls it: two atomic read-modify-writes in `_start` and two in
+// `_end`, and in `_start` a wake of the scavenger (a syscall) only while the thread is not on the
+// scavenger's schedule. A thread gets there when a park of it is passed over for
+// `purge_holes_min_interval`, and the scavenger comes for it by itself when that window ends.
+// Between a `_start` that returned true and its `_end` the thread must not allocate or free.
 mi_decl_export void mi_on_thread_idle(void)     mi_attr_noexcept;
 mi_decl_export bool mi_on_thread_idle_pending(void) mi_attr_noexcept;  // did the last sweep of this thread's heaps (its `mi_on_thread_idle`, or the scavenger's during a park) leave free blocks of a large page that was just in use? Not to be called between `_start` and `_end`.
 mi_decl_export bool mi_on_thread_idle_start(void) mi_attr_noexcept;  // about to block: hand the theaps to the scavenger. false = nothing handed off, no _end needed

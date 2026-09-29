@@ -76,6 +76,9 @@ terms of the MIT license. A copy of the license can be found in the file
 #define mi_atomic_exchange_relaxed(p,x)          mi_atomic(exchange_explicit)(p,x,mi_memory_order(relaxed))
 #define mi_atomic_exchange_release(p,x)          mi_atomic(exchange_explicit)(p,x,mi_memory_order(release))
 #define mi_atomic_exchange_acq_rel(p,x)          mi_atomic(exchange_explicit)(p,x,mi_memory_order(acq_rel))
+// (sequentially consistent: for the one handshake where each side stores and then loads what the other stored, see `mi_on_thread_idle_start`)
+#define mi_atomic_load_seq_cst(p)                mi_atomic(load_explicit)(p,mi_memory_order(seq_cst))
+#define mi_atomic_exchange_seq_cst(p,x)          mi_atomic(exchange_explicit)(p,x,mi_memory_order(seq_cst))
 
 #define mi_atomic_cas_weak_relaxed(p,exp,des)    mi_atomic_cas_weak(p,exp,des,mi_memory_order(relaxed),mi_memory_order(relaxed))
 #define mi_atomic_cas_weak_release(p,exp,des)    mi_atomic_cas_weak(p,exp,des,mi_memory_order(release),mi_memory_order(relaxed))
@@ -83,6 +86,7 @@ terms of the MIT license. A copy of the license can be found in the file
 #define mi_atomic_cas_strong_relaxed(p,exp,des)  mi_atomic_cas_strong(p,exp,des,mi_memory_order(relaxed),mi_memory_order(relaxed))
 #define mi_atomic_cas_strong_release(p,exp,des)  mi_atomic_cas_strong(p,exp,des,mi_memory_order(release),mi_memory_order(relaxed))
 #define mi_atomic_cas_strong_acq_rel(p,exp,des)  mi_atomic_cas_strong(p,exp,des,mi_memory_order(acq_rel),mi_memory_order(acquire))
+#define mi_atomic_cas_strong_seq_cst(p,exp,des)  mi_atomic_cas_strong(p,exp,des,mi_memory_order(seq_cst),mi_memory_order(seq_cst))
 
 #define mi_atomic_add_relaxed(p,x)               mi_atomic(fetch_add_explicit)(p,x,mi_memory_order(relaxed))
 #define mi_atomic_add_acq_rel(p,x)               mi_atomic(fetch_add_explicit)(p,x,mi_memory_order(acq_rel))

@@ -129,6 +129,7 @@ static mi_decl_cache_align mi_tld_t mi_tld_detached = {
   MI_ATOMIC_VAR_INIT(0),  // park_reclaim
   NULL,                   // park_theap0
   MI_ATOMIC_VAR_INIT(0),  // park_swept
+  MI_ATOMIC_VAR_INIT(0),  // park_paced
   NULL,                   // subproc_next
   0, 0,                   // holes_sweep_seq / _last
   false, false, 0, 0,     // holes_sweeping / _full / _skipped / _visited
@@ -321,6 +322,8 @@ static void mi_tld_unregister(mi_tld_t* tld) {
   _mi_page_purge_holes_floor_release(tld);
   mi_subproc_t* const subproc = tld->subproc;
   mi_lock(&subproc->tlds_lock) {
+    // off the schedule of the scavenger: the walk does not find it any more to take it off
+    if (mi_atomic_exchange_seq_cst(&tld->park_paced, (uint32_t)0) != 0) { mi_atomic_decrement_relaxed(&subproc->paced_count); }
     mi_tld_t** prev = &subproc->tlds;
     while (*prev != NULL) {
       if (*prev == tld) { *prev = tld->subproc_next; break; }

@@ -359,6 +359,8 @@ extern "C" {
 extern mi_decl_export _Atomic(uintptr_t) mi_debug_stall_in_thread_theaps_done;
 extern mi_decl_export _Atomic(uintptr_t) mi_debug_stall_in_heap_delete_claim;
 extern mi_decl_export _Atomic(uintptr_t) mi_debug_stall_in_pthread_key_create;
+extern mi_decl_export _Atomic(uintptr_t) mi_debug_stall_in_park_start;
+extern mi_decl_export _Atomic(uintptr_t) mi_debug_stall_in_scavenger_visit;
 extern mi_decl_export _Atomic(uintptr_t) mi_debug_stall_in_scavenger_wait;
 extern mi_decl_export _Atomic(uintptr_t) mi_debug_scavenger_wait_msecs;
 extern mi_decl_export _Atomic(uintptr_t) mi_debug_abandoned_maps_allocated;
