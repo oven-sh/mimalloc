@@ -288,7 +288,7 @@ void          _mi_scavenger_start(void);
 void          _mi_scavenger_forked_child(void);
 void          _mi_scavenger_start_lazy(void);
 void          _mi_scavenger_stop(void);
-void          _mi_scavenger_wake(mi_subproc_t* subproc);
+bool          _mi_scavenger_wake(mi_subproc_t* subproc);   // true if it issued the wake syscall (false: not running, or a wake is pending already)
 bool          _mi_scavenger_is_running(void);
 void          _mi_arenas_purge_now(mi_subproc_t* subproc);
 
@@ -359,6 +359,8 @@ extern "C" {
 extern mi_decl_export _Atomic(uintptr_t) mi_debug_stall_in_thread_theaps_done;
 extern mi_decl_export _Atomic(uintptr_t) mi_debug_stall_in_heap_delete_claim;
 extern mi_decl_export _Atomic(uintptr_t) mi_debug_stall_in_pthread_key_create;
+extern mi_decl_export _Atomic(uintptr_t) mi_debug_stall_in_scavenger_wait;
+extern mi_decl_export _Atomic(uintptr_t) mi_debug_scavenger_wait_msecs;
 extern mi_decl_export _Atomic(uintptr_t) mi_debug_abandoned_maps_allocated;
 extern mi_decl_export volatile long      mi_debug_fail_os_commit_after;
 #ifdef __cplusplus

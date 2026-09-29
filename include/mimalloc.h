@@ -255,6 +255,10 @@ typedef struct mi_purge_holes_stats_s {
   size_t pages_skipped;         // pages skipped that way (monotonic)
   size_t blocks_visited;        // free-list blocks the sweep did walk (monotonic): what the skip avoids
   size_t full_sweeps;           // sweeps that walked every page anyway (`purge_holes_full_every`)
+  // The idle handoff (`mi_on_thread_idle_start`): what it costs and what it gets done (monotonic).
+  size_t park_wakes;            // wake syscalls that a park issued to the scavenger, on the thread that parked
+  size_t scavenger_turns;       // turns of the scavenger's loop: one for each time it woke up, or found a wake pending before it slept
+  size_t parked_sweeps;         // sweeps of a parked thread's heaps by the scavenger
 } mi_purge_holes_stats_t;
 
 mi_decl_export void mi_purge_holes_stats_get(mi_purge_holes_stats_t* stats) mi_attr_noexcept;

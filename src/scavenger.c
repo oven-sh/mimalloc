@@ -17,7 +17,7 @@ terms of the MIT license. A copy of the license can be found in the file
 // No scavenger thread on these platforms; purging stays allocation-driven.
 void _mi_scavenger_start(void) { }
 void _mi_scavenger_stop(void)  { }
-void _mi_scavenger_wake(mi_subproc_t* subproc) { MI_UNUSED(subproc); }
+bool _mi_scavenger_wake(mi_subproc_t* subproc) { MI_UNUSED(subproc); return false; }
 bool _mi_scavenger_is_running(void) { return false; }
 void _mi_scavenger_forked_child(void) { }
 void _mi_scavenger_start_lazy(void) { _mi_scavenger_start(); }
@@ -191,6 +191,12 @@ static void mi_scav_init(void) { }
 // Scavenger thread body (shared across platforms)
 // -----------------------------------------------------------------------------
 
+#if MI_DEBUG > 0
+#include "mimalloc/prim.h"   // _mi_prim_thread_yield
+mi_decl_export _Atomic(uintptr_t) mi_debug_stall_in_scavenger_wait;   // test hook (test-park-handoff): 1 holds the scavenger between its walk of the parked threads and its wait
+mi_decl_export _Atomic(uintptr_t) mi_debug_scavenger_wait_msecs;      // ..and this is for how long it is going to wait at the most
+#endif
+
 static void mi_scavenger_run(void) {
   // Use the main subproc directly: this thread never allocates, so don't
   // initialise a theap/tld via _mi_subproc()'s TLS path.
@@ -202,6 +208,7 @@ static void mi_scavenger_run(void) {
     // directions (store-buffering) -- we see no parked thread, it sees a stale wake==1 and issues
     // no syscall, and that park is silently deferred to the safety timeout.
     mi_atomic_exchange_acq_rel(&subproc->scavenger_wake, (uint32_t)0);
+    mi_atomic_increment_relaxed(&subproc->scavenger_turns);
     // Do the idle work of any thread that parked and handed us its theaps. This is the expensive
     // part (the hole punch is ~99% madvise) and it is why the owner gets to skip it.
     const mi_msecs_t park_due = _mi_theap_sweep_parked(subproc);
@@ -237,6 +244,13 @@ static void mi_scavenger_run(void) {
     // a park passed over for `purge_holes_min_interval` is swept when its window ends, not at the safety timeout
     if (park_due > 0 && park_due < timeout_ms) { timeout_ms = park_due; }
     if (mi_atomic_load_acquire(&_mi_scavenger_running) == 0) break;
+    #if MI_DEBUG > 0
+    if (mi_atomic_load_acquire(&mi_debug_stall_in_scavenger_wait) == 1) {
+      mi_atomic_store_release(&mi_debug_scavenger_wait_msecs, (uintptr_t)timeout_ms);
+      mi_atomic_store_release(&mi_debug_stall_in_scavenger_wait, (uintptr_t)2);   // signal: the walk is done, the wait has not begun
+      while (mi_atomic_load_acquire(&mi_debug_stall_in_scavenger_wait) == 2) { _mi_prim_thread_yield(); }
+    }
+    #endif
     mi_scav_wait(&subproc->scavenger_wake, timeout_ms);
     // The safety net: nothing was scheduled and nothing woke us. Look at the arenas all the same.
     if (expire == 0 && mi_atomic_load_relaxed(&subproc->scavenger_wake) == 0) {
@@ -249,14 +263,16 @@ bool _mi_scavenger_is_running(void) {
   return (mi_atomic_load_relaxed(&_mi_scavenger_running) != 0);
 }
 
-void _mi_scavenger_wake(mi_subproc_t* subproc) {
-  if (mi_atomic_load_relaxed(&_mi_scavenger_running) == 0) return;
+bool _mi_scavenger_wake(mi_subproc_t* subproc) {
+  if (mi_atomic_load_relaxed(&_mi_scavenger_running) == 0) return false;
   // Coalesce: only issue the wake syscall on the 0->1 edge. Callers sit on
   // the page-free path and would otherwise turn every arena page free into a
   // syscall on the freeing thread.
   if (mi_atomic_exchange_acq_rel(&subproc->scavenger_wake, (uint32_t)1) == 0) {
     mi_scav_wake_one(&subproc->scavenger_wake);
+    return true;
   }
+  return false;
 }
 
 // -----------------------------------------------------------------------------

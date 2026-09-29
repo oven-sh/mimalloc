@@ -811,6 +811,10 @@ void mi_purge_holes_stats_get(mi_purge_holes_stats_t* stats) mi_attr_noexcept {
   stats->pages_skipped          = mi_holes_load(&mi_holes_pages_skipped);
   stats->blocks_visited         = mi_holes_load(&mi_holes_blocks_visited);
   stats->full_sweeps            = mi_holes_load(&mi_holes_full_sweeps);
+  const mi_subproc_t* const subproc = _mi_subproc_main();   // the scavenger serves the main sub-process only
+  stats->park_wakes             = mi_atomic_load_relaxed(&subproc->park_wakes);
+  stats->scavenger_turns        = mi_atomic_load_relaxed(&subproc->scavenger_turns);
+  stats->parked_sweeps          = mi_atomic_load_relaxed(&subproc->parked_sweeps);
 }
 
 void _mi_page_holes_count_page_freed(void) {

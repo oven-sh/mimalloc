@@ -541,6 +541,10 @@ void mi_subproc_stats_print_out(mi_subproc_id_t subproc_id, mi_output_fun* out, 
     _mi_fprintf(out, arg, "holes: the sweeps walked %zu free blocks and skipped %zu unchanged pages\n",
                 hs.blocks_visited, hs.pages_skipped);
   }
+  if (hs.scavenger_turns > 0) {
+    _mi_fprintf(out, arg, "parks: %zu wakes issued, %zu scavenger turns, %zu sweeps of a parked thread\n",
+                hs.park_wakes, hs.scavenger_turns, hs.parked_sweeps);
+  }
 }
 
 void mi_stats_print_out(mi_output_fun* out, void* arg) mi_attr_noexcept {

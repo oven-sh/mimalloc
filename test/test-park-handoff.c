@@ -434,6 +434,104 @@ static void test_park_inside_window_gets_swept(void) {
 }
 
 // ---------------------------------------------------------------------------
+// What the handoff costs and what it gets done is counted (`mi_purge_holes_stats_t`): the wake
+// syscalls that parks issued, the turns of the scavenger's loop, and its sweeps of parked threads.
+// ---------------------------------------------------------------------------
+typedef struct handoff_counts_s { size_t wakes, turns, sweeps; } handoff_counts_t;
+
+static handoff_counts_t handoff_counts(void) {
+  mi_purge_holes_stats_t h; mi_purge_holes_stats_get(&h);
+  handoff_counts_t c = { h.park_wakes, h.scavenger_turns, h.parked_sweeps };
+  return c;
+}
+
+// wait (bounded) for the scavenger to have swept a parked thread since `before`
+static bool wait_for_sweep_after(size_t before, long deadline_ms) {
+  for (long i = 0; i < deadline_ms * 10; i++) { if (handoff_counts().sweeps > before) return true; usleep(100); }
+  return handoff_counts().sweeps > before;
+}
+
+static void test_handoff_counters(void) {
+  const long interval_ms = mi_option_get(mi_option_purge_holes_min_interval);
+  const handoff_counts_t start = handoff_counts();
+  if (!mi_on_thread_idle_start()) {
+    const handoff_counts_t end = handoff_counts();
+    check("nothing is counted where nothing is handed off", end.wakes == start.wakes && end.turns == start.turns && end.sweeps == start.sweeps);
+    return;
+  }
+  mi_on_thread_idle_end();
+  // A park that finds the scavenger asleep wakes it, and a park that is due is swept. The wake of a park is
+  // not counted if another wake was pending (a free that scheduled a purge): go again then.
+  bool woke = false, turned = false, swept = false;
+  for (int round = 0; round < 5 && !(woke && turned && swept); round++) {
+    usleep((useconds_t)((interval_ms > 0 ? interval_ms : 1) * 1000 + 20000));   // past the rate window, and the scavenger is back in its wait
+    const handoff_counts_t before = handoff_counts();
+    if (!mi_on_thread_idle_start()) break;
+    const bool swept_now = wait_for_sweep_after(before.sweeps, 3000);
+    mi_on_thread_idle_end();
+    const handoff_counts_t after = handoff_counts();
+    woke   = woke   || (after.wakes > before.wakes);
+    turned = turned || (after.turns > before.turns);
+    swept  = swept  || swept_now;
+  }
+  check("a park that wakes the scavenger counts a wake", woke);
+  check("the scavenger counts its turns", turned);
+  check("a sweep of a parked thread is counted", swept);
+}
+
+// ---------------------------------------------------------------------------
+// The scavenger clears its wake word BEFORE it walks the parked threads (`mi_scavenger_run`), so a park that
+// comes after the walk and before the wait is not lost: its wake is still pending when the wait begins.
+// Hold the scavenger at exactly that point (a hook that only a debug build has) and park.
+// A wake that is lost only shows if nothing else ends the wait: the scavenger says for how long it is going
+// to wait, and while that is less than the deadline (a purge is scheduled) the case says nothing: go again.
+// ---------------------------------------------------------------------------
+#if MI_DEBUG > 0
+extern _Atomic(uintptr_t) mi_debug_stall_in_scavenger_wait;
+extern _Atomic(uintptr_t) mi_debug_scavenger_wait_msecs;
+
+// wait (bounded) for a thread to be held at a stall point that was set to 1
+static bool wait_for_stall(_Atomic(uintptr_t)* stall, long deadline_ms) {
+  for (long i = 0; i < deadline_ms * 10; i++) { if (atomic_load(stall) == 2) return true; usleep(100); }
+  return atomic_load(stall) == 2;
+}
+
+static void test_park_between_walk_and_wait(void) {
+  const long interval_ms = mi_option_get(mi_option_purge_holes_min_interval);
+  const long deadline_ms = interval_ms * 10 + 1000;
+  if (!mi_on_thread_idle_start()) { fprintf(stderr, "test: park between the walk and the wait...  skipped (nobody to hand off to)\n"); return; }
+  mi_on_thread_idle_end();
+  bool held = false, told = false, swept = false;
+  for (int round = 0; round < 20 && !told; round++) {
+    usleep(20000);   // the scavenger is back in its wait
+    atomic_store(&mi_debug_stall_in_scavenger_wait, (uintptr_t)1);
+    if (mi_on_thread_idle_start()) { mi_on_thread_idle_end(); }   // a park to have it take a turn
+    held = wait_for_stall(&mi_debug_stall_in_scavenger_wait, 5000);
+    if (!held) break;
+    const long wait_ms = (long)atomic_load(&mi_debug_scavenger_wait_msecs);
+    if (wait_ms < 2 * deadline_ms) {
+      atomic_store(&mi_debug_stall_in_scavenger_wait, (uintptr_t)0);
+      usleep((useconds_t)((wait_ms + 20) * 1000));   // let what is scheduled pass
+      continue;
+    }
+    told = true;
+    const size_t before = handoff_counts().sweeps;
+    const bool parked = mi_on_thread_idle_start();   // the scavenger is past its walk: it cannot have seen this park
+    atomic_store(&mi_debug_stall_in_scavenger_wait, (uintptr_t)0);
+    // (inside the rate window if a park above was swept: then the sweep comes when the window ends)
+    swept = parked && wait_for_sweep_after(before, deadline_ms);
+    mi_on_thread_idle_end();
+  }
+  atomic_store(&mi_debug_stall_in_scavenger_wait, (uintptr_t)0);
+  check("the scavenger was held between its walk and its wait", held);
+  if (held && !told) { fprintf(stderr, "test: a park between the walk and the wait of the scavenger is swept...  skipped (the scavenger had something scheduled each time)\n"); return; }
+  check("a park between the walk and the wait of the scavenger is swept", swept);
+}
+#else
+static void test_park_between_walk_and_wait(void) { fprintf(stderr, "test: park between the walk and the wait...  skipped (needs MI_DEBUG>0)\n"); }
+#endif
+
+// ---------------------------------------------------------------------------
 // fork() by a thread that is between _start and _end -- fork does not allocate, so the contract
 // permits it, and the scavenger may be part-way through rewriting this thread's page free lists.
 // The damage is in those *freed* holes, not the survivors: the child must be able to allocate
@@ -657,6 +755,8 @@ int main(void) {
   test_third_thread_frees_during_sweep();
   test_parks_get_swept();
   test_park_inside_window_gets_swept();
+  test_handoff_counters();
+  test_park_between_walk_and_wait();
   test_fork_while_parked();
   test_park_then_exit();
   test_exit_while_swept_with_dyn_tls();

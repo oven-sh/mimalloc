@@ -378,7 +378,7 @@ bool mi_on_thread_idle_start(void) mi_attr_noexcept {
   uint32_t expected = MI_PARK_RUNNING;
   if (!mi_atomic_cas_strong_acq_rel(&tld->park_state, &expected, MI_PARK_PARKED)) return false;
   mi_atomic_increment_relaxed(&tld->subproc->parked_count);
-  _mi_scavenger_wake(tld->subproc);
+  if (_mi_scavenger_wake(tld->subproc)) { mi_atomic_increment_relaxed(&tld->subproc->park_wakes); }
   return true;
 }
 
@@ -450,6 +450,7 @@ mi_msecs_t _mi_theap_sweep_parked(mi_subproc_t* subproc) {
     // is not due, so the next one in the list is claimed.
     const uint32_t swept = mi_atomic_load_relaxed(&claimed->park_swept);
     claimed->holes_sweep_deferred = false;
+    mi_atomic_increment_relaxed(&subproc->parked_sweeps);
     _mi_thread_idle_work(claimed, theap0);
     // After the work: the sweep that comes back is to find the epoch that this one began (if it did) as old as the interval.
     claimed->holes_sweep_last = _mi_clock_now();
