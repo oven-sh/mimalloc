@@ -98,9 +98,14 @@ void __mi_stat_adjust_decrease(mi_stat_count_t* stat, uint64_t amount) {
 // must be thread safe as it is called from stats_merge
 static void mi_stat_count_add_mt(mi_stat_count_t* stat, const mi_stat_count_t* src) {
   if (stat==src) return;
-  mi_atomic_void_addi64_relaxed(&stat->total, &src->total);
+  const int64_t src_total = mi_atomic_loadi64_relaxed((_Atomic(int64_t)*)&src->total);
   const int64_t src_peak = mi_atomic_loadi64_relaxed((_Atomic(int64_t)*)&src->peak);
   const int64_t src_current = mi_atomic_loadi64_relaxed((_Atomic(int64_t)*)&src->current);
+  // A count that the source never touched has nothing to add, and most counts of a merge are like that
+  // (there is a count per size bin). An atomic add of zero is still a locked instruction: a merge had
+  // about 180 of them, and `mi_heap_delete`/`mi_heap_destroy` merge three times (see `test-stats-merge.c`).
+  if (src_total==0 && src_peak==0 && src_current==0) return;
+  if (src_total!=0) { mi_atomic_addi64_relaxed(&stat->total, src_total); }
   const int64_t prev_current = mi_atomic_addi64_relaxed(&stat->current, src_current);
 
   // Global current plus thread peak approximates new global peak
