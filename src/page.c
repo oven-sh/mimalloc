@@ -1995,6 +1995,16 @@ void _mi_page_free(mi_page_t* page, mi_page_queue_t* pq) {
   // _mi_arenas_collect(false, false, theap->tld);  // allow purging
 }
 
+// Free a page even if it has live blocks (for `mi_heap_destroy`)
+void _mi_page_destroy(mi_page_t* page, mi_page_queue_t* pq) {
+  mi_assert_internal(page != NULL);
+  mi_assert_internal(pq == mi_page_queue_of(page));
+  mi_page_queue_remove(pq, page);
+  mi_theap_t* theap = mi_page_theap(page); mi_assert_internal(theap!=NULL);
+  mi_page_set_theap(page,NULL);
+  _mi_arenas_page_destroy(page, theap);
+}
+
 #define MI_RETIRE_CYCLES      (16)      /* keep a retired page around for about 16 "admin cycles" before free'ing it */
 #define MI_RETIRE_MAX_PAGES   (3)       /* keep at most N pages per size bin as retired */
 

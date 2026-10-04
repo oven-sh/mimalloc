@@ -118,7 +118,7 @@ static void chacha_split(mi_random_ctx_t* ctx, uint64_t nonce, mi_random_ctx_t* 
   ctx_new->input[14] = (uint32_t)nonce;
   ctx_new->input[15] = (uint32_t)(nonce >> 32);
   mi_assert_internal(ctx->input[14] != ctx_new->input[14] || ctx->input[15] != ctx_new->input[15]); // do not reuse nonces!
-  chacha_block(ctx_new);
+  // the first block is generated on demand by `chacha_next32`
 }
 
 

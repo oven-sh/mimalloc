@@ -428,38 +428,16 @@ static inline bool mi_arena_is_suitable_ex(mi_arena_t* arena, mi_arena_t* req_ar
   return true;
 }
 
-// determine the start of search; important to keep heaps and threads
-// into their own memory regions to reduce contention.
-static size_t mi_arena_start_idx(mi_heap_t* heap, size_t tseq, size_t arena_cycle) {
-  const size_t hseq   = heap->heap_seq;
-  const size_t hcount = mi_atomic_load_relaxed(&heap->subproc->heap_count);
-  if (arena_cycle <= 1)     return 0;
-  if (hseq==0 || hcount<=1 || arena_cycle > 0x8FF) return (tseq % arena_cycle); // common for single heap programs
-
-  // spread heaps evenly among arena's, and then evenly for threads in their fraction
-  size_t start;
-  mi_assert_internal(arena_cycle <= 0x8FF);             // prevent overflow on 32-bit
-  const size_t frac = (arena_cycle * 256) / hcount;     // fraction in the arena_cycle; at most: arena_cycle * 0x100
-  if (frac==0) {
-    // many heaps (> 256 per arena)
-    start = (hseq % arena_cycle);
-  }
-  else {
-    const size_t hspot = (hseq % hcount);  
-    start = (frac * hspot) / 256;           // (arena_cycle * (hseq % hcount)) / hcount
-    if (frac >= 512) {  // at least 2 arena's per heap?
-      start = start + (tseq % (frac/256));
-    }
-  }
-  mi_assert_internal(start < arena_cycle);
-  return start;
+// determine the start of search; important to keep threads into their own memory regions to reduce contention.
+static size_t mi_arena_start_idx(size_t tseq, size_t arena_cycle) {
+  return (arena_cycle <= 1 ? 0 : tseq % arena_cycle);
 }
 
 #define mi_forall_arenas(heap, req_arena, tseq, name_arena) { \
   const size_t _arena_count = mi_arenas_get_count(heap->subproc); \
   const size_t _arena_cycle = (_arena_count == 0 ? 0 : _arena_count - 1); /* first search the arenas below the last one */ \
   /* always start searching in the arena's below the max */ \
-  const size_t _start = mi_arena_start_idx(heap,tseq,_arena_cycle); \
+  const size_t _start = mi_arena_start_idx(tseq,_arena_cycle); \
   for (size_t _i = 0; _i < _arena_count; _i++) { \
     mi_arena_t* name_arena; \
     if (req_arena != NULL) { \
@@ -703,25 +681,23 @@ static mi_arena_pages_t* mi_heap_ensure_arena_pages(mi_heap_t* heap, mi_arena_t*
   mi_assert_internal(heap!=NULL);
   mi_assert(arena->arena_idx < MI_MAX_ARENAS);
   mi_arena_pages_t* arena_pages = mi_heap_arena_pages(heap, arena);
-  if (arena_pages==NULL) {
-    mi_lock(&heap->arena_pages_lock) {
-      arena_pages = mi_atomic_load_ptr_acquire(mi_arena_pages_t, &heap->arena_pages[arena->arena_idx]);
-      if (arena_pages == NULL) {  // still NULL?
-        if (_mi_is_heap_main(heap)) {
-          // the page info for the main heap is always allocated as part of an arena
-          arena_pages = &arena->pages_main;
-        }
-        else {
-          // always allocate the arena pages info from the main heap
-          // todo: allocate into the current arena?
-          arena_pages = mi_arena_pages_alloc(arena);
-        }
-        mi_atomic_store_ptr_release(mi_arena_pages_t, &heap->arena_pages[arena->arena_idx], arena_pages);
-      }
-    }
+  if mi_likely(arena_pages!=NULL) return arena_pages;
+  const bool is_main = _mi_is_heap_main(heap);
+  if (is_main) {
+    // the page info for the main heap is always allocated as part of an arena
+    arena_pages = &arena->pages_main;  // can never fail
   }
-  if (_mi_is_heap_main(heap)) { mi_assert(arena_pages != NULL); }  // can never fail
-  return arena_pages;
+  else {
+    // always allocate the arena pages info from the main heap
+    // todo: allocate into the current arena?
+    arena_pages = mi_arena_pages_alloc(arena);
+    if (arena_pages==NULL) return NULL;
+  }
+  mi_arena_pages_t* expected = NULL;
+  if (mi_atomic_cas_ptr_strong_acq_rel(mi_arena_pages_t, &heap->arena_pages[arena->arena_idx], &expected, arena_pages)) return arena_pages;
+  if (!is_main) { _mi_arena_pages_free(arena_pages); }  // lost the race
+  mi_assert_internal(expected != NULL);
+  return expected;
 }
 
 static mi_page_t* mi_arenas_page_try_find_abandoned(mi_theap_t* theap, size_t slice_count, size_t block_size)
@@ -866,7 +842,10 @@ static uint8_t* mi_arenas_page_alloc_fresh_area(mi_theap_t* theap, size_t slice_
       start = (uint8_t*)mi_arena_os_alloc_aligned(heap->subproc, alloc_size, page_alignment, 0 /* align offset */, commit, allow_large, req_arena, memid);
     }
     #endif
-    if (start!=NULL) { mi_heap_stat_increase(heap,pages_os_allocated,1); }
+    if (start!=NULL) { 
+      mi_atomic_store_release(&heap->has_os_pages, (uintptr_t)1);
+      mi_heap_stat_increase(heap,pages_os_allocated,1); 
+    }
   }
 
   if (start == NULL) return NULL;
@@ -1826,16 +1805,6 @@ static bool mi_arenas_add(mi_subproc_t* subproc, mi_arena_t* arena, mi_arena_id_
   return false;
 }
 
-static size_t mi_arena_pages_size(size_t slice_count, size_t* bitmap_base) {
-  if (slice_count == 0) slice_count = MI_BCHUNK_BITS;
-  mi_assert_internal((slice_count % MI_BCHUNK_BITS) == 0);
-  const size_t base_size = _mi_align_up(sizeof(mi_arena_pages_t), MI_BCHUNK_SIZE);
-  const size_t bitmaps_size = mi_bitmap_size(slice_count, NULL); // pages (the abandoned bitmaps are allocated on demand)
-  const size_t size = base_size + bitmaps_size;
-  if (bitmap_base != NULL) *bitmap_base = base_size;
-  return size;
-}
-
 static mi_arena_t* mi_arena_info(void* area) {
   return (mi_arena_t*)((uint8_t*)area + mi_size_of_slices(mi_arena_page_meta_aligned_slice_count()));
 }
@@ -1876,11 +1845,11 @@ static mi_bbitmap_t* mi_arena_bbitmap_init(mi_subproc_t* subproc, size_t slice_c
 
 static mi_arena_pages_t* mi_arena_pages_alloc(mi_arena_t* arena) {
   const size_t slice_count = arena->slice_count;
-  size_t bitmap_base = 0;
-  const size_t size = mi_arena_pages_size(slice_count, &bitmap_base);
-  mi_arena_pages_t* arena_pages = (mi_arena_pages_t*)mi_heap_zalloc_aligned(arena->subproc->heap_main, size, MI_BCHUNK_SIZE);
+  // only the bitmap needs alignment: align it inside the block instead of using the (slower) aligned allocation
+  const size_t size = sizeof(mi_arena_pages_t) + (MI_BCHUNK_SIZE - 1) + mi_bitmap_size(slice_count, NULL);
+  mi_arena_pages_t* arena_pages = (mi_arena_pages_t*)mi_heap_zalloc(arena->subproc->heap_main, size);
   if (arena_pages==NULL) return NULL;
-  uint8_t* base = (uint8_t*)arena_pages + bitmap_base;
+  uint8_t* base = (uint8_t*)_mi_align_up_ptr(arena_pages + 1, MI_BCHUNK_SIZE);
   mi_assert_internal(_mi_is_aligned(base, MI_BCHUNK_SIZE));
   arena_pages->pages = mi_arena_bitmap_init(slice_count, &base);
   // `pages_abandoned[]` stays NULL (the allocation is zeroed) until a page of that bin is abandoned.
@@ -2961,6 +2930,7 @@ static bool mi_heap_visit_page_at(size_t slice_index, size_t slice_count, mi_are
 // unlink it before it can free it (`_mi_arenas_page_unabandon`). So we claim under the lock, and if the page
 // is owned we drop the lock to let that free finish and start over, until the list is empty.
 static bool mi_heap_visit_os_pages(mi_heap_t* heap, mi_heap_visit_info_t* vinfo) {
+  if mi_likely(mi_atomic_load_acquire(&heap->has_os_pages) == 0) return true;
   if (!vinfo->claim_pages) {
     // (we assume we are the only thread running in this heap)
     mi_page_t* page = NULL;
@@ -3033,6 +3003,32 @@ bool mi_heap_visit_abandoned_blocks(mi_heap_t* heap, bool visit_blocks, mi_block
 }
 
 
+// Free a page even if it has live blocks (for `mi_heap_destroy`).
+// The page must be owned and not be in a page queue or in the abandoned map/list.
+void _mi_arenas_page_destroy(mi_page_t* page, mi_theap_t* current_theapx) {
+  // Fold in the blocks that other threads freed: an abandoned page keeps at least the last of them on its
+  // thread-free list (`_mi_page_free_collect_partly` never collects the head), and they still count as used.
+  // (no un-purging: nothing is allocated from this page here)
+  _mi_page_free_collect_no_unpurge(page, false);
+  if (mi_page_used(page)!=0) {
+    #if MI_GUARDED
+    _mi_page_unguard_all(page);          // remove potential interior guard pages 
+    #endif
+    #if MI_PROFILE
+    if mi_unlikely(mi_page_has_interior_pointers(page)) {
+      mi_heap_area_t area;
+      _mi_heap_area_init(&area, page);
+      _mi_page_profile_free_all(&area,page); // the sampled blocks that are still in use get their `on_free`
+    }
+    #endif
+    // Drop what is (still) on the thread-free list first: `_mi_arenas_page_free` collects it, and with the used
+    // count reset that reads as a corrupted list (more blocks freed than were in use).
+    mi_atomic_store_release(&page->xthread_free, mi_tf_create(NULL, true /* owned */));
+    mi_page_used_reset(page);           // note: invariant `|local_free| + |free| == reserved - used`  does not hold in this case
+  }
+  _mi_arenas_page_free(page, current_theapx);
+}
+
 typedef struct mi_heap_delete_visit_info_s {
   mi_heap_t*  heap_target;
   mi_theap_t* theap_target;
@@ -3043,7 +3039,7 @@ static bool mi_heap_delete_page(const mi_heap_t* heap, const mi_heap_area_t* are
   MI_UNUSED(block); MI_UNUSED(block_size); MI_UNUSED(heap);
   mi_heap_delete_visit_info_t* info = (mi_heap_delete_visit_info_t*)arg;
   mi_heap_t*  heap_target           = info->heap_target;
-  mi_theap_t* const theap           = NULL; // info->theap;       mi_assert_internal(_mi_theap_heap(theap) == heap);
+  mi_theap_t* const theap           = info->theap;  // only used for statistics (can be NULL)
   mi_page_t*  const page            = (mi_page_t*)area->reserved1;
 
   // claimed by `mi_heap_visit_page_claim` (or `mi_heap_visit_os_pages`)
@@ -3051,27 +3047,16 @@ static bool mi_heap_delete_page(const mi_heap_t* heap, const mi_heap_area_t* are
   mi_assert_internal(mi_page_is_abandoned(page));
   _mi_arenas_page_unabandon(page,theap);
 
-  // Fold in the blocks that other threads freed: an abandoned page keeps at least the last of them on its
-  // thread-free list (`_mi_page_free_collect_partly` never collects the head), and they still count as used.
-  // (no un-purging: nothing is allocated from this page here)
+  if (heap_target==NULL) {
+    _mi_arenas_page_destroy(page, theap);
+    return true;
+  }
+
+  // collect blocks freed by other threads (see `_mi_arenas_page_destroy`)
   _mi_page_free_collect_no_unpurge(page, false);
 
   if (mi_page_used(page)==0) {
     // free the page
-    _mi_arenas_page_free(page, theap);
-  }
-  else if (heap_target==NULL) {
-    #if MI_GUARDED
-    _mi_page_unguard_all(page);          // remove potential interior guard pages 
-    #endif
-    #if MI_PROFILE
-    _mi_page_profile_free_all(area,page); // the sampled blocks that are still in use get their `on_free`
-    #endif
-    // destroy the page
-    // Drop what is (still) on the thread-free list first: `_mi_arenas_page_free` collects it, and with the used
-    // count reset that reads as a corrupted list (more blocks freed than were in use).
-    mi_atomic_store_release(&page->xthread_free, mi_tf_create(NULL, true /* owned */));
-    mi_page_used_reset(page);           // note: invariant `|local_free| + |free| == reserved - used`  does not hold in this case
     _mi_arenas_page_free(page, theap);
   }
   else if (page->memid.memkind != MI_MEM_ARENA) {
@@ -3081,6 +3066,7 @@ static bool mi_heap_delete_page(const mi_heap_t* heap, const mi_heap_area_t* are
     if (theap != NULL) { mi_theap_stat_decrease(theap, page_bins[sbin], 1); mi_theap_stat_decrease(theap, pages, 1); }
     else               { mi_heap_stat_decrease((mi_heap_t*)heap, page_bins[sbin], 1); mi_heap_stat_decrease((mi_heap_t*)heap, pages, 1); }
     mi_theap_t* theap_target = info->theap_target;
+    mi_atomic_store_release(&heap_target->has_os_pages, (uintptr_t)1);
     page->heap = heap_target;
     mi_theap_stat_increase(theap_target, page_bins[sbin], 1);
     mi_theap_stat_increase(theap_target, pages, 1);
@@ -3138,8 +3124,9 @@ static bool mi_heap_delete_page(const mi_heap_t* heap, const mi_heap_area_t* are
 
 static void mi_heap_delete_pages(mi_heap_t* heap, mi_heap_t* heap_target) {
   mi_theap_t* const theap_target = (heap_target != NULL ? _mi_heap_theap(heap_target) : NULL);
-  // mi_theap_t* const theap = _mi_heap_theap(heap);
-  mi_heap_delete_visit_info_t info = { heap_target, theap_target, NULL };
+  // count on our theap of the main heap, where `mi_heap_release_pages` merged the stats of `heap`
+  mi_theap_t* const theap = _mi_heap_theap_peek(mi_heap_get_heap_main(heap));
+  mi_heap_delete_visit_info_t info = { heap_target, theap_target, theap };
   _mi_heap_visit_blocks(heap, false, false, true /* claim each page */, &mi_heap_delete_page, &info);
   #if MI_DEBUG>1
   // no more arena pages?

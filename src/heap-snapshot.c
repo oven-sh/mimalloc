@@ -387,12 +387,14 @@ int mi_heap_snapshot(int fd, unsigned flags) mi_attr_noexcept {
 
   // --- heaps + os-backed abandoned pages ---
   for (mi_subproc_t* sp = subproc; sp != NULL; sp = sp->next) {
-    mi_lock(&sp->heaps_lock) {
-      for (mi_heap_t* h = sp->heaps; h != NULL; h = h->next) {
-        mi_snap_emit_heap(&out, h);
-        mi_snap_u32(&out, MI_SNAP_SEC_PAGE);
-        mi_snap_walk_heap_os_pages(&ctx, h);
-        mi_snap_u64(&out, 0);  // sentinel
+    for (size_t i = 0; i < MI_HEAPS_SHARD_COUNT; i++) {
+      mi_lock(&sp->heaps[i].lock) {
+        for (mi_heap_t* h = sp->heaps[i].first; h != NULL; h = h->next) {
+          mi_snap_emit_heap(&out, h);
+          mi_snap_u32(&out, MI_SNAP_SEC_PAGE);
+          mi_snap_walk_heap_os_pages(&ctx, h);
+          mi_snap_u64(&out, 0);  // sentinel
+        }
       }
     }
   }

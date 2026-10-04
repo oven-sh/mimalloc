@@ -172,9 +172,11 @@ mi_subproc_t* _mi_subproc_from_id(mi_subproc_id_t subproc_id);
 void          _mi_subprocs_unsafe_destroy_all(void);
 
 void*         _mi_meta_zalloc( mi_subproc_t* subproc, size_t size, mi_memid_t* memid );
+void*         _mi_meta_malloc( mi_subproc_t* subproc, size_t size, mi_memid_t* memid );
 void*         _mi_meta_rezalloc( mi_subproc_t* subproc, void* p, size_t newsize, mi_memid_t* memid );
 void*         _mi_meta_zalloc_aligned( mi_subproc_t* subproc, size_t size, size_t alignment, mi_memid_t* memid );
 void          _mi_meta_free(mi_subproc_t* subproc, void* p, mi_memid_t memid);
+void          _mi_meta_collect(mi_subproc_t* subproc);
 bool          _mi_meta_is_meta_page(const mi_subproc_t* subproc, const mi_page_t* p);
 
 
@@ -249,6 +251,7 @@ void*         _mi_os_alloc_huge_os_pages(mi_subproc_t* subproc, size_t pages, in
 
 mi_thread_local_t _mi_thread_local_create(void);
 void          _mi_thread_local_free( mi_thread_local_t key );
+void          _mi_thread_local_tld_done( mi_tld_t* tld );
 bool          _mi_thread_local_set(  mi_thread_local_t key, void* val );
 void*         _mi_thread_local_get(  mi_thread_local_t key );
 void          _mi_thread_locals_init(void);
@@ -277,6 +280,7 @@ void          _mi_arenas_page_abandon(mi_page_t* page, mi_theap_t* current_theap
 void          _mi_arenas_page_unabandon(mi_page_t* page, mi_theap_t* current_theapx /* can be NULL */);
 bool          _mi_arenas_page_try_reabandon_to_mapped(mi_page_t* page);
 void          _mi_arena_pages_free(mi_arena_pages_t* arena_pages);
+void          _mi_arenas_page_destroy(mi_page_t* page, mi_theap_t* current_theapx /* can be NULL */);
 size_t        mi_arenas_get_count(mi_subproc_t* subproc);
 uint8_t*      mi_arena_slice_start(mi_arena_t* arena, size_t slice_index);
 
@@ -316,6 +320,7 @@ void          _mi_page_retire(mi_page_t* page) mi_attr_noexcept;       // free t
 void          _mi_page_unfull(mi_page_t* page);
 void          _mi_page_free(mi_page_t* page, mi_page_queue_t* pq);     // free the page
 void          _mi_page_abandon(mi_page_t* page, mi_page_queue_t* pq);  // abandon the page, to be picked up by another thread...
+void          _mi_page_destroy(mi_page_t* page, mi_page_queue_t* pq);  // free the page even if it has live blocks
 void          _mi_deferred_free(mi_theap_t* theap, bool force);
 void          _mi_page_free_collect(mi_page_t* page, bool force);
 void          _mi_page_free_collect_no_unpurge(mi_page_t* page, bool force);   // for read-only heap inspection: never un-purges a hole
@@ -347,8 +352,9 @@ void          _mi_scavenger_forked_child(void);
 bool          _mi_theap_area_visit_blocks(const mi_heap_area_t* area, mi_page_t* page, mi_block_visit_fun* visitor, void* arg);
 void          _mi_theap_page_reclaim(mi_theap_t* theap, mi_page_t* page);
 
-void          _mi_heap_detach_theaps( mi_heap_t* heap );
+mi_theap_t*   _mi_heap_detach_theaps( mi_heap_t* heap );
 void          _mi_theap_abandon(mi_theap_t* theap);
+void          _mi_theap_destroy_pages(mi_theap_t* theap);
 
 #if MI_DEBUG>0
 // Test hooks (see the tests named at their definitions). Declared here so that they keep C linkage
@@ -371,7 +377,8 @@ void          _mi_theap_decref(mi_theap_t* theap);
 void          _mi_theap_merge_stats(mi_theap_t* theap);
 
 // "heap.c"
-void          _mi_heap_init(mi_heap_t* heap, mi_thread_local_t theap, mi_subproc_t* subproc, mi_arena_id_t exclusive_arena_id);
+void          _mi_heap_init(mi_heap_t* heap, mi_thread_local_t theap, mi_subproc_t* subproc, mi_arena_id_t exclusive_arena_id, mi_stats_t* stats /* only for a main heap, else NULL */);
+mi_stats_t*   _mi_heap_stats_ensure(mi_heap_t* heap);
 void          _mi_heap_area_init(mi_heap_area_t* area, mi_page_t* page);
 mi_decl_cold  mi_theap_t* _mi_heap_theap_get_or_init(const mi_heap_t* heap);  // get (and possible create) the theap belonging to a heap
 void          _mi_heap_move_pages(mi_heap_t* heap_from, mi_heap_t* heap_to);  // in "arena.c"
@@ -383,6 +390,8 @@ bool          _mi_heap_theap_set(mi_heap_t* heap, mi_theap_t* theap);
 // "stats.c"
 void          _mi_stats_init(void);
 void          _mi_stats_merge_into(mi_stats_t* to, mi_stats_t* from);
+void          _mi_stats_add_into(mi_stats_t* to, const mi_stats_t* from);
+void          _mi_stats_add_into_local(mi_stats_t* to, const mi_stats_t* from);
 
 mi_msecs_t    _mi_clock_now(void);
 mi_msecs_t    _mi_clock_end(mi_msecs_t start);
@@ -478,11 +487,17 @@ static inline void __mi_stat_counter_decrease(mi_stat_counter_t* stat, uint64_t 
   stat->total -= (int64_t)amount;
 }
 
-#define mi_heap_stat_counter_increase(heap,stat,amount)         __mi_stat_counter_increase_mt( &(heap)->stats.stat, amount)
-#define mi_heap_stat_increase(heap,stat,amount)                 __mi_stat_increase_mt( &(heap)->stats.stat, amount)
-#define mi_heap_stat_decrease(heap,stat,amount)                 __mi_stat_decrease_mt( &(heap)->stats.stat, amount)
-#define mi_heap_stat_adjust_increase(heap,stat,amnt)            __mi_stat_adjust_increase_mt( &(heap)->stats.stat, amnt)
-#define mi_heap_stat_adjust_decrease(heap,stat,amnt)            __mi_stat_adjust_decrease_mt( &(heap)->stats.stat, amnt)
+// Heap statistics are allocated lazily (except for main heaps). Never returns NULL.
+static inline mi_stats_t* _mi_heap_stats(mi_heap_t* heap) {
+  mi_stats_t* const stats = mi_atomic_load_ptr_acquire(mi_stats_t,&heap->stats);
+  return (mi_likely(stats!=NULL) ? stats : _mi_heap_stats_ensure(heap));
+}
+
+#define mi_heap_stat_counter_increase(heap,stat,amount)         __mi_stat_counter_increase_mt( &_mi_heap_stats(heap)->stat, amount)
+#define mi_heap_stat_increase(heap,stat,amount)                 __mi_stat_increase_mt( &_mi_heap_stats(heap)->stat, amount)
+#define mi_heap_stat_decrease(heap,stat,amount)                 __mi_stat_decrease_mt( &_mi_heap_stats(heap)->stat, amount)
+#define mi_heap_stat_adjust_increase(heap,stat,amnt)            __mi_stat_adjust_increase_mt( &_mi_heap_stats(heap)->stat, amnt)
+#define mi_heap_stat_adjust_decrease(heap,stat,amnt)            __mi_stat_adjust_decrease_mt( &_mi_heap_stats(heap)->stat, amnt)
 
 #define mi_subproc_stat_counter_increase(subproc,stat,amount)   __mi_stat_counter_increase_mt( &(subproc)->stats.stat, amount)
 #define mi_subproc_stat_increase(subproc,stat,amount)           __mi_stat_increase_mt( &(subproc)->stats.stat, amount)

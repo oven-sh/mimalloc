@@ -721,7 +721,7 @@ typedef size_t mi_thread_local_t;
 
 typedef struct mi_heap_s {
   mi_subproc_t*         subproc;                        // a heap belongs to a subprocess
-  size_t                heap_seq;                       // unique sequence number for heaps in this subprocess
+  size_t                heap_seq;                       // unique id in this subprocess (0 for the main heap); `heap_seq % MI_HEAPS_SHARD_COUNT` is its shard in `subproc->heaps`
   mi_heap_t*            next;                           // list of heaps in this subprocess
   mi_heap_t*            prev;
   mi_thread_local_t     theap;                          // dynamic thread local for the thread-local theaps of this heap
@@ -736,13 +736,13 @@ typedef struct mi_heap_s {
 
   _Atomic(size_t)       abandoned_count[MI_BIN_COUNT];  // total count of abandoned pages in this heap
   _Atomic(uintptr_t)    releasing;                      // set when `mi_heap_delete`/`mi_heap_destroy` starts: its pages are abandoned unmapped
+  _Atomic(uintptr_t)    has_os_pages;                   // set once the heap has allocated a page directly from the OS
   mi_page_t*            os_abandoned_pages;             // list of pages that are OS allocated and not in an arena
   mi_lock_t             os_abandoned_pages_lock;        // lock for the os abandoned pages list (this lock protects list operations)
 
-  _Atomic(mi_arena_pages_t*) arena_pages[MI_MAX_ARENAS]; // track owned and abandoned pages in the arenas (entries can be NULL)
-  mi_lock_t             arena_pages_lock;                // lock to update the arena_pages array
+  _Atomic(mi_arena_pages_t*) arena_pages[MI_MAX_ARENAS]; // track owned and abandoned pages in the arenas (entries can be NULL; published with a CAS)
   mi_memid_t            memid;                           // provenance of the heap memory
-  mi_stats_t            stats;                           // statistics for this heap; periodically updated by merging from each theap
+  _Atomic(mi_stats_t*)  stats;                           // statistics for this heap; periodically updated by merging from each theap. Lazily allocated: use `_mi_heap_stats`
 } mi_heap_t;
 
 
@@ -755,11 +755,25 @@ typedef struct mi_heap_s {
 // (and needs to call `mi_subproc_add_current_thread` before any allocations).
 // ------------------------------------------------------
 
+// The list of heaps in a subprocess is sharded by the creating thread to avoid contention on a single lock.
+#define MI_HEAPS_SHARD_COUNT   (16)
+
+typedef struct mi_heaps_shard_s {
+  mi_lock_t             lock;
+  mi_heap_t*            first;
+  size_t                total_count;                    // heaps ever added to this shard
+  uint8_t               padding[64 - ((sizeof(mi_lock_t) + sizeof(mi_heap_t*) + sizeof(size_t)) % 64)];  // one shard per cache line
+} mi_heaps_shard_t;
+
 struct mi_subproc_s {
+  // read-mostly fields first, to keep them off the cache lines of the locks and counters below
   size_t                subproc_seq;                    // unique id for sub-processes
   mi_subproc_t*         next;                           // list of all sub-processes
   mi_subproc_t*         prev;
   _Atomic(mi_meta_page_t*) meta_pages;                  // meta data pages
+  _Atomic(mi_heap_t*)   heap_main;                      // main heap for this sub process  
+  mi_theap_t*           theap_meta;                     // detached theap for allocating meta-data
+  _Atomic(mi_profiler_t*) profiler;
 
   _Atomic(size_t)       arena_count;                    // current count of arena's
   _Atomic(mi_arena_t*)  arenas[MI_MAX_ARENAS];          // arena's of this sub-process
@@ -768,11 +782,6 @@ struct mi_subproc_s {
   _Atomic(int64_t)      purge_expire;                   // expiration is set if any arenas can be purged
   _Atomic(uint32_t)     scavenger_wake;                 // futex word signalled when a purge is scheduled (scavenger thread waits on this)
 
-  _Atomic(mi_heap_t*)   heap_main;                      // main heap for this sub process  
-  mi_heap_t*            heaps;                          // heaps belonging to this sub-process
-  mi_lock_t             heaps_lock;
-
-  mi_theap_t*           theap_meta;                     // detached theap for allocating meta-data
   mi_lock_t             theap_meta_lock;                // all allocations in theap_meta need a lock
 
   mi_tld_t*             tlds;                           // list of tlds of this sub-process (walked by the scavenger for parked threads)
@@ -781,13 +790,12 @@ struct mi_subproc_s {
 
   _Atomic(size_t)       thread_count;                   // current threads associated with this sub-process
   _Atomic(size_t)       thread_total_count;             // total created threads associated with this sub-process
-  _Atomic(size_t)       heap_count;                     // current heaps in this sub-process (== |heaps|)
-  _Atomic(size_t)       heap_total_count;               // total created heaps in this sub-process
-
-  _Atomic(mi_profiler_t*) profiler;
 
   mi_memid_t            memid;                          // provenance of this memory block (meta or static)
   mi_subproc_t*         parent;                         // subproc in which this one was allocated
+
+  uint8_t               padding[64];
+  mi_heaps_shard_t      heaps[MI_HEAPS_SHARD_COUNT];    // heaps belonging to this sub-process
   mi_decl_align(8)                                      // needed on some 32-bit platforms
   mi_stats_t            stats;                          // subprocess statistics; updated for arena/OS stats like committed,
                                                         // and otherwise merged with heap stats when those are deleted
@@ -855,6 +863,11 @@ struct mi_tld_s {
   uint32_t              holes_park_epoch;     // ..and that of the first sweep of the current park: what the thread left when it parked is from that epoch or an earlier one
   _Atomic(size_t)       holes_floor_kept;     // bytes that the last sweep of this tld left under `purge_holes_large_floor` (its share of `mi_holes_floor_kept` in `page.c`)
   struct mi_holes_floor_list_s* holes_floor_list;   // the pages of this thread that the current sweep has yet to decide on (`_mi_page_purge_holes_floor_resolve`); on the stack of `mi_purge_holes_of`
+
+  mi_theap_t*           theap_spare;          // memory of the last freed theap, reused by the next `_mi_theap_alloc`
+  size_t                tls_idx_kept;         // index+1 of the last freed thread-local key (or 0), reused by the next `_mi_thread_local_create`
+  size_t                tls_version_next;     // batch of key versions reserved by this thread
+  size_t                tls_version_count;
 };
 
 

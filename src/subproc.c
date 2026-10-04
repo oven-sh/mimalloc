@@ -36,6 +36,16 @@ void* _mi_meta_zalloc( mi_subproc_t* subproc, size_t size, mi_memid_t* memid ) {
   return p;
 }
 
+void* _mi_meta_malloc( mi_subproc_t* subproc, size_t size, mi_memid_t* memid ) {
+  mi_assert_internal(subproc->theap_meta != NULL);
+  void* p = NULL;
+  mi_lock(&subproc->theap_meta_lock) {
+    p = mi_theap_malloc(subproc->theap_meta, size);
+    if (memid != NULL) { *memid = (p==NULL ? _mi_memid_none() : _mi_memid_create_malloc(p,size,false) ); }
+  }
+  return p;
+}
+
 void* _mi_meta_zalloc_aligned( mi_subproc_t* subproc, size_t size, size_t aligned, mi_memid_t* memid ) {
   mi_assert_internal(subproc->theap_meta != NULL);
   void* p = NULL;
@@ -78,6 +88,14 @@ void _mi_meta_free(mi_subproc_t* subproc, void* p, mi_memid_t memid) {
   else {
     mi_assert_internal(subproc!=NULL);  
     _mi_arenas_free(subproc, p, _mi_memid_size(memid), memid);
+  }
+}
+
+// Free empty meta-data pages. Meta-data blocks are always freed cross-thread, and otherwise
+// only get collected by a later meta-data allocation.
+void _mi_meta_collect(mi_subproc_t* subproc) {
+  mi_lock(&subproc->theap_meta_lock) {
+    if (subproc->theap_meta != NULL) { mi_theap_collect(subproc->theap_meta, false /* force? */); }
   }
 }
 
@@ -144,7 +162,7 @@ static mi_subproc_t* mi_subproc_init(mi_subproc_t* subproc, mi_subproc_t* parent
   subproc->subproc_seq = mi_atomic_increment_relaxed(&subproc_total_count);
   mi_stats_header_init(&subproc->stats);
   mi_lock_init(&subproc->arena_reserve_lock);
-  mi_lock_init(&subproc->heaps_lock);
+  for (size_t i = 0; i < MI_HEAPS_SHARD_COUNT; i++) { mi_lock_init(&subproc->heaps[i].lock); }
   mi_lock_init(&subproc->theap_meta_lock);
   mi_lock_init(&subproc->tlds_lock);   // fork: tld registry
   mi_lock(&mi_subprocs_lock) {
@@ -219,20 +237,24 @@ static void mi_subproc_unsafe_destroy(mi_subproc_t* subproc, bool acquire_subpro
   }
 
   // destroy all subproc heaps
-  mi_lock(&subproc->heaps_lock) {
-    mi_heap_t* heap = subproc->heaps;
-    while (heap != NULL) {
-      mi_heap_t* next = heap->next;
-      if (heap!=subproc->heap_main) { _mi_heap_force_destroy(heap, false /* don't re-acquire the heaps_lock */); }
-      heap = next;
+  for (size_t i = 0; i < MI_HEAPS_SHARD_COUNT; i++) {
+    mi_lock(&subproc->heaps[i].lock) {
+      mi_heap_t* heap = subproc->heaps[i].first;
+      while (heap != NULL) {
+        mi_heap_t* next = heap->next;
+        if (heap!=subproc->heap_main) { _mi_heap_force_destroy(heap, false /* don't re-acquire the lock */); }
+        heap = next;
+      }
+      mi_assert_internal(subproc->heaps[i].first == (i==0 ? mi_atomic_load_ptr_relaxed(mi_heap_t,&subproc->heap_main) : NULL));
     }
-    mi_assert_internal(subproc->heap_main==NULL || subproc->heaps == subproc->heap_main);
+  }
+  mi_lock(&subproc->heaps[0].lock) {  // shard of the main heap
     if (subproc->heap_main!=NULL) {
       _mi_thread_locals_thread_done(); // release thread locals that may have been allocated (safe as the main heap uses the fast key)
       if (_mi_subproc_is_main(subproc)) {
         _mi_thread_locals_done();      
       }
-      _mi_heap_force_destroy(subproc->heap_main, false /* don't re-acquire the heaps_lock */);  // no warning if destroying the main heap
+      _mi_heap_force_destroy(subproc->heap_main, false /* don't re-acquire the lock */);  // no warning if destroying the main heap
     }
   }
 
@@ -255,7 +277,7 @@ static void mi_subproc_unsafe_destroy(mi_subproc_t* subproc, bool acquire_subpro
 
   // todo: should we refcount subprocesses?
   mi_lock_done(&subproc->arena_reserve_lock);
-  mi_lock_done(&subproc->heaps_lock);
+  for (size_t i = 0; i < MI_HEAPS_SHARD_COUNT; i++) { mi_lock_done(&subproc->heaps[i].lock); }
   mi_lock_done(&subproc->theap_meta_lock);  
   _mi_meta_free( subproc->parent, subproc, subproc->memid);  
   if (_mi_subproc_is_main(subproc)) {
@@ -312,9 +334,11 @@ bool mi_subproc_visit_heaps(mi_subproc_id_t subproc_id, mi_heap_visit_fun* visit
   mi_subproc_t* subproc = _mi_subproc_from_id(subproc_id);
   if (subproc==NULL) return false;
   bool ok = true;
-  mi_lock(&subproc->heaps_lock) {
-    for (mi_heap_t* heap = subproc->heaps; heap!=NULL && ok; heap = heap->next) {
-      ok = (*visitor)(heap, arg);
+  for (size_t i = 0; i < MI_HEAPS_SHARD_COUNT && ok; i++) {
+    mi_lock(&subproc->heaps[i].lock) {
+      for (mi_heap_t* heap = subproc->heaps[i].first; heap!=NULL && ok; heap = heap->next) {
+        ok = (*visitor)(heap, arg);
+      }
     }
   }
   return ok;
@@ -341,19 +365,19 @@ static _Atomic(uintptr_t) mi_fork_depth;  // allow nested prepare/parent calls (
 bool _mi_process_is_forked_child;          // set once in fork_child, never cleared; lets visitors avoid waiting on dead threads
 
 // Lock order (prepare acquires in this order; parent releases in reverse; child re-initializes everything):
-//   subprocs registry -> thread locals -> per subproc: main heap's arena_pages (it may allocate while held) -> heaps list ->
-//   every other heap's arena_pages/theaps/os_abandoned -> main heap's theaps/os_abandoned -> tlds registry (leaf) ->
+//   subprocs registry -> thread locals -> per subproc: heaps lists (in order) ->
+//   every other heap's theaps/os_abandoned -> main heap's theaps/os_abandoned -> tlds registry (leaf) ->
 //   meta-data theap -> arena reserve (a meta-data allocation may have to reserve a fresh arena while it holds the
 //   meta lock, `arena.c:mi_arenas_try_alloc`; nothing under the reserve lock allocates meta data).
 static void mi_subproc_fork_prepare(mi_subproc_t* sp) {
   mi_heap_t* const heap_main = _mi_subproc_heap_main(sp);
-  if (heap_main != NULL) { mi_lock_acquire(&heap_main->arena_pages_lock); }
-  mi_lock_acquire(&sp->heaps_lock);
-  for (mi_heap_t* h = sp->heaps; h != NULL; h = h->next) {
-    if (h == heap_main) continue;
-    mi_lock_acquire(&h->arena_pages_lock);
-    mi_lock_acquire(&h->theaps_lock);
-    mi_lock_acquire(&h->os_abandoned_pages_lock);
+  for (size_t i = 0; i < MI_HEAPS_SHARD_COUNT; i++) { mi_lock_acquire(&sp->heaps[i].lock); }
+  for (size_t i = 0; i < MI_HEAPS_SHARD_COUNT; i++) {
+    for (mi_heap_t* h = sp->heaps[i].first; h != NULL; h = h->next) {
+      if (h == heap_main) continue;
+      mi_lock_acquire(&h->theaps_lock);
+      mi_lock_acquire(&h->os_abandoned_pages_lock);
+    }
   }
   if (heap_main != NULL) {
     mi_lock_acquire(&heap_main->theaps_lock);
@@ -373,14 +397,14 @@ static void mi_subproc_fork_parent(mi_subproc_t* sp) {
     mi_lock_release(&heap_main->os_abandoned_pages_lock);
     mi_lock_release(&heap_main->theaps_lock);
   }
-  for (mi_heap_t* h = sp->heaps; h != NULL; h = h->next) {
-    if (h == heap_main) continue;
-    mi_lock_release(&h->os_abandoned_pages_lock);
-    mi_lock_release(&h->theaps_lock);
-    mi_lock_release(&h->arena_pages_lock);
+  for (size_t i = 0; i < MI_HEAPS_SHARD_COUNT; i++) {
+    for (mi_heap_t* h = sp->heaps[i].first; h != NULL; h = h->next) {
+      if (h == heap_main) continue;
+      mi_lock_release(&h->os_abandoned_pages_lock);
+      mi_lock_release(&h->theaps_lock);
+    }
   }
-  mi_lock_release(&sp->heaps_lock);
-  if (heap_main != NULL) { mi_lock_release(&heap_main->arena_pages_lock); }
+  for (size_t i = MI_HEAPS_SHARD_COUNT; i > 0; i--) { mi_lock_release(&sp->heaps[i-1].lock); }
 }
 
 void _mi_process_fork_prepare(void) {
@@ -424,7 +448,7 @@ void _mi_process_fork_child(void) {
   mi_lock_init(&mi_subprocs_lock);
   for (mi_subproc_t* sp = mi_subprocs; sp != NULL; sp = sp->next) {
     mi_lock_init(&sp->arena_reserve_lock);
-    mi_lock_init(&sp->heaps_lock);
+    for (size_t i = 0; i < MI_HEAPS_SHARD_COUNT; i++) { mi_lock_init(&sp->heaps[i].lock); }
     mi_lock_init(&sp->tlds_lock);
     mi_lock_init(&sp->theap_meta_lock);
     mi_atomic_store_relaxed(&sp->scavenger_wake, (uint32_t)0);
@@ -439,10 +463,11 @@ void _mi_process_fork_child(void) {
       mi_atomic_store_relaxed(&t->holes_floor_kept, (size_t)0);   // (`_mi_page_purge_holes_forked_child` zeroes the sum)
       t->holes_floor_list = NULL;
     }
-    for (mi_heap_t* h = sp->heaps; h != NULL; h = h->next) {
-      mi_lock_init(&h->theaps_lock);
-      mi_lock_init(&h->arena_pages_lock);
-      mi_lock_init(&h->os_abandoned_pages_lock);
+    for (size_t i = 0; i < MI_HEAPS_SHARD_COUNT; i++) {
+      for (mi_heap_t* h = sp->heaps[i].first; h != NULL; h = h->next) {
+        mi_lock_init(&h->theaps_lock);
+        mi_lock_init(&h->os_abandoned_pages_lock);
+      }
     }
   }
   _mi_thread_locals_fork_child();

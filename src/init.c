@@ -134,7 +134,9 @@ static mi_decl_cache_align mi_tld_t mi_tld_detached = {
   false, false, 0, 0,     // holes_sweeping / _full / _skipped / _visited
   false, 0, 0,            // holes_sweep_deferred / holes_sweep_epoch / holes_park_epoch
   MI_ATOMIC_VAR_INIT(0),  // holes_floor_kept
-  NULL                    // holes_floor_list
+  NULL,                   // holes_floor_list
+  NULL,                   // theap_spare
+  0, 0, 0                 // tls_idx_kept, tls_version_next, tls_version_count
 };
 
 mi_decl_hidden mi_decl_cache_align const mi_theap_t _mi_theap_empty = {
@@ -173,6 +175,7 @@ mi_decl_hidden mi_decl_cache_align const mi_theap_t _mi_theap_empty = {
 
 // pre-allocate the process heap, and meta-data theap
 static mi_decl_cache_align mi_heap_t    mi_process_heap_main  = mi_init_struct_zero;
+static mi_decl_cache_align mi_stats_t   mi_process_heap_main_stats = mi_init_struct_zero;
 static mi_decl_cache_align mi_theap_t   mi_process_theap_meta = mi_init_struct_zero;
 
 // pre-allocate the initial tld and theap for the main thread (this is not strictly needed but nice for stats)
@@ -218,7 +221,7 @@ static void mi_heap_main_init_once(void) {
   // main process heap
   mi_process_heap_main.memid = memid_static;
   mi_atomic_store_ptr_release(mi_heap_t,&subproc_main->heap_main,&mi_process_heap_main);
-  _mi_heap_init(&mi_process_heap_main,mi_thread_local_key_fast,subproc_main,0);
+  _mi_heap_init(&mi_process_heap_main,mi_thread_local_key_fast,subproc_main,0,&mi_process_heap_main_stats);
 
   // detached theap for allocating meta-data (we can allocate on this without having an initialized thread)
   mi_process_theap_meta.memid = memid_static;
@@ -334,6 +337,11 @@ mi_decl_noinline static void mi_tld_free(mi_tld_t* tld) {
   mi_tld_unregister(tld);
   if (tld==NULL) return;
   mi_atomic_decrement_relaxed(&tld->subproc->thread_count);
+  _mi_thread_local_tld_done(tld);
+  if (tld->theap_spare!=NULL) {
+    _mi_meta_free(tld->subproc, tld->theap_spare, tld->theap_spare->memid);
+    tld->theap_spare = NULL;
+  }
   tld->thread_id = (mi_threadid_t)(~0);          // it is best to set an invalid tid for tld_main as sometimes the same thread-id
                                                  // is reused by the OS after a thread has terminated. (see issue #1287)
   mi_lock_done(&tld->theaps_lock);
@@ -567,7 +575,9 @@ void _mi_thread_done(mi_theap_t* _theap_main)
   mi_thread_theaps_done(tld);
 
   // free thread local data
+  mi_subproc_t* const subproc = tld->subproc;
   mi_tld_free(tld);
+  _mi_meta_collect(subproc);
 }
 
 void mi_thread_set_in_threadpool(void) mi_attr_noexcept {
