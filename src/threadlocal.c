@@ -249,6 +249,7 @@ void _mi_thread_locals_done(void) {
   mi_lock(&mi_thread_locals_lock) {
     mi_bitmap_t* const slots = mi_thread_locals_free;
     if (slots!=NULL) {
+      mi_thread_locals_free = NULL;
       _mi_meta_free(_mi_subproc_main(), slots, mi_thread_locals_memid);
     }
   }
@@ -366,7 +367,7 @@ static void mi_thread_local_free_index(size_t idx) {
 // Free a key. Each thread keeps the last freed index for its next key to stay off the global lock
 // (the index is released in `_mi_thread_local_tld_done`).
 void _mi_thread_local_free(mi_thread_local_t key) {
-  if (key==0) return;
+  if (key==0 || key==mi_thread_local_key_fast) return;  // the fast key has no index of its own
   const size_t idx = mi_key_index(key);
   mi_tld_t* const tld = mi_thread_local_tld();
   if (tld!=NULL && tld->tls_idx_kept == 0) {

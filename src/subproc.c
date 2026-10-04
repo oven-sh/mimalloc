@@ -250,7 +250,9 @@ static void mi_subproc_unsafe_destroy(mi_subproc_t* subproc, bool acquire_subpro
   }
   mi_lock(&subproc->heaps[0].lock) {  // shard of the main heap
     if (subproc->heap_main!=NULL) {
-      _mi_thread_locals_thread_done(); // release thread locals that may have been allocated (safe as the main heap uses the fast key)
+      if (_mi_subproc() == subproc) {    // (the thread locals of a thread of another sub-process are for the heaps of that one)
+        _mi_thread_locals_thread_done(); // release thread locals that may have been allocated (safe as the main heap uses the fast key)
+      }
       if (_mi_subproc_is_main(subproc)) {
         _mi_thread_locals_done();      
       }

@@ -489,6 +489,82 @@ static void* stress_worker(void* arg) {
   return NULL;
 }
 
+// Reading the statistics walks all heaps, also the ones that are being destroyed.
+// (this needs a sanitizer to fail)
+#if defined(MI_TEST_LIGHT)
+#define WALK_ROUNDS 100
+#else
+#define WALK_ROUNDS 1000
+#endif
+
+static atomic_int walk_churners;
+
+static void* walk_helper(void* arg) {
+  mi_heap_malloc((mi_heap_t*)arg, 100);
+  return NULL;
+}
+
+static void* walk_churn(void* arg) {
+  (void)arg;
+  for (int round = 0; round < WALK_ROUNDS; round++) {
+    mi_heap_t* heap = mi_heap_new();
+    mi_heap_malloc(heap, 64);
+    // the exit of a thread that used the heap allocates the statistics of the heap
+    pthread_t thread;
+    pthread_create(&thread, NULL, &walk_helper, heap);
+    pthread_join(thread, NULL);
+    mi_heap_destroy(heap);
+  }
+  atomic_fetch_sub(&walk_churners, 1);
+  return NULL;
+}
+
+static void* walk_reader(void* arg) {
+  (void)arg;
+  while (atomic_load(&walk_churners) > 0) {
+    get_stats(NULL);
+  }
+  return NULL;
+}
+
+static void test_stats_walk(void) {
+  pthread_t churners[2];
+  pthread_t readers[2];
+  atomic_store(&walk_churners, 2);
+  for (int i = 0; i < 2; i++) {
+    pthread_create(&churners[i], NULL, &walk_churn, NULL);
+    pthread_create(&readers[i], NULL, &walk_reader, NULL);
+  }
+  for (int i = 0; i < 2; i++) {
+    pthread_join(churners[i], NULL);
+    pthread_join(readers[i], NULL);
+  }
+}
+
+// A sub-process main heap uses the fast key, which has no index that can be reused.
+// (this runs first, when no index is in use)
+static void test_subproc_key(void) {
+  enum { HEAPS = 4 };
+  mi_subproc_destroy(mi_subproc_new());
+
+  const mi_stats_t before = get_stats(NULL);
+  mi_heap_t* heaps[HEAPS];
+  for (int i = 0; i < HEAPS; i++) {
+    heaps[i] = mi_heap_new();
+  }
+  for (int round = 0; round < 100; round++) {
+    for (int i = 0; i < HEAPS; i++) {
+      mi_free(mi_heap_malloc(heaps[i], 32));
+    }
+  }
+  for (int i = 0; i < HEAPS; i++) {
+    mi_heap_destroy(heaps[i]);
+  }
+  // one theap per heap: heaps that share an index evict each other's theap on every use
+  const mi_stats_t after = get_stats(NULL);
+  CHECK(after.theaps.total - before.theaps.total == HEAPS);
+}
+
 static void test_stress(void) {
   const mi_stats_t before = get_stats(NULL);
 
@@ -516,11 +592,13 @@ static void run(const char* name, void (*test)(void)) {
 }
 
 int main(void) {
+  run("subproc-key", &test_subproc_key);
   run("live-stats", &test_live_stats);
   run("destroyed-stats", &test_destroyed_stats);
   run("visit-heaps", &test_visit_heaps);
   run("key-reuse", &test_key_reuse);
   run("meta-pages", &test_meta_pages);
+  run("stats-walk", &test_stats_walk);
   run("stress", &test_stress);
   if (failed > 0) {
     fprintf(stderr, "%d check(s) failed\n", failed);

@@ -255,12 +255,6 @@ static void mi_heap_free_theaps(mi_heap_t* heap, mi_theap_t* theaps) {
     theap = next;
   }
 
-  // set the theap thread local to NULL (so _mi_page_associated_theap does not read from a freed theap (through delete pages -> page_update_stats))
-  // (in this fork the theaps are detached before, and freed after, the pages leave the heap, so this only releases the slot)
-  if (!_mi_is_process_heap_main(heap)) { 
-    _mi_thread_local_free(heap->theap);
-    heap->theap = 0;
-  }
 }
 
 // free the heap resources (assuming the pages are already moved/destroyed, and all theaps have been freed)
@@ -268,22 +262,12 @@ static void mi_heap_free(mi_heap_t* heap, bool acquire_heaps_lock) {
   mi_assert_internal(heap!=NULL); // && !_mi_is_process_heap_main(heap));
 
   const bool is_main = _mi_is_heap_main(heap);
-
-  // remove the heap from the subproc
-  if (!is_main) { 
-    mi_stats_t* const stats = mi_atomic_load_ptr_acquire(mi_stats_t,&heap->stats);
-    if (stats!=NULL) {
-      _mi_stats_add_into(_mi_heap_stats(mi_heap_get_heap_main(heap)), stats);
-      _mi_free_subproc_safe(stats);
-    }
-    mi_heap_t* const  heap_main  = mi_heap_get_heap_main(heap);
-    mi_theap_t* const theap_main = _mi_heap_theap_peek(heap_main);
-    mi_theapx_stat_decrease(heap_main, theap_main, heaps, 1);
-  }
-  else {
+  if (is_main) {
     mi_heap_stats_merge_to_subproc(heap);
     mi_subproc_stat_decrease(heap->subproc, heaps, 1);
   }
+
+  // remove the heap from the subproc
   mi_heaps_shard_t* const shard = &heap->subproc->heaps[heap->heap_seq % MI_HEAPS_SHARD_COUNT];
   mi_lock_maybe(&shard->lock, acquire_heaps_lock) {
     if (heap->next!=NULL) { heap->next->prev = heap->prev; }
@@ -291,8 +275,22 @@ static void mi_heap_free(mi_heap_t* heap, bool acquire_heaps_lock) {
                      else { mi_assert_internal(shard->first==heap); shard->first = heap->next; }
   }
 
-  // free all arena pages infos (after unlinking, so no heap walker can see them half freed)
-  if (!is_main) {  // pages for the main heap are pre-allocated in the arenas
+  // release the thread local key, and free the statistics and the arena pages infos
+  // (after unlinking, so no heap walker can see them freed)
+  if (!_mi_is_process_heap_main(heap)) {
+    _mi_thread_local_free(heap->theap);
+    heap->theap = 0;
+  }
+  if (!is_main) {  // these are pre-allocated for a main heap
+    mi_heap_t* const  heap_main  = mi_heap_get_heap_main(heap);
+    mi_theap_t* const theap_main = _mi_heap_theap_peek(heap_main);
+    mi_theapx_stat_decrease(heap_main, theap_main, heaps, 1);
+    mi_stats_t* const stats = mi_atomic_load_ptr_acquire(mi_stats_t,&heap->stats);
+    if (stats!=NULL) {
+      mi_atomic_store_ptr_relaxed(mi_stats_t, &heap->stats, NULL);
+      _mi_stats_add_into(_mi_heap_stats(heap_main), stats);
+      _mi_free_subproc_safe(stats);
+    }
     const size_t arena_count = mi_atomic_load_acquire(&heap->subproc->arena_count);  // never shrinks while there are heaps
     for (size_t i = 0; i < arena_count; i++) {
       mi_arena_pages_t* arena_pages = mi_atomic_load_ptr_acquire(mi_arena_pages_t, &heap->arena_pages[i]);
@@ -306,7 +304,6 @@ static void mi_heap_free(mi_heap_t* heap, bool acquire_heaps_lock) {
   mi_lock_done(&heap->theaps_lock);
   mi_lock_done(&heap->os_abandoned_pages_lock);
   if (!_mi_is_process_heap_main(heap)) { 
-    // _mi_thread_local_free(heap->theap);
     _mi_free_subproc_safe(heap); 
   }
 }
