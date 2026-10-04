@@ -924,7 +924,9 @@ typedef struct mi_arena_s {
   mi_bbitmap_t*       slices_free;          // is the slice free? (a binned bitmap with size classes)
   mi_bitmap_t*        slices_committed;     // is the slice committed? (i.e. accessible)
   mi_bitmap_t*        slices_dirty;         // is the slice potentially non-zero?
-  mi_bitmap_t*        slices_purge;         // slices that can be purged
+  mi_bitmap_t*        slices_purge[2];      // slices that can be purged, in two generations: a free sets a bit in `[purge_gen&1]`;
+                                            // a purge pass purges the other one and then increments `purge_gen`
+  _Atomic(size_t)     purge_gen;
   mi_page_t*          pages_meta;           // pre-allocated `slice_count` page meta info -- only used if `MI_PAGE_META_IS_SEPARATED!=0`
   mi_arena_pages_t    pages_main;           // arena page bitmaps for the main heap are allocated up front as well
 

@@ -226,8 +226,7 @@ static void mi_scavenger_run(void) {
         // or what a free set since, so the next wait is exact.
         if (mi_atomic_loadi64_acquire(&subproc->purge_expire) != expire) continue;
         // Not reset. Do not clear it from here: if it was set to this same value
-        // again since (`_mi_arenas_purge_now` stores the current time), that pass
-        // would be lost, and no free into an armed arena asks for another.
+        // again since, that pass would be lost, and no free into an armed arena asks for another.
         // Dropped: another thread is in a pass. What was set since that pass reset
         // it, the pass leaves as it is, without a wake: come back for it.
         // Not dropped: purging got switched off, so nothing is scheduled.
@@ -383,8 +382,8 @@ void _mi_scavenger_stop(void) {
 }
 
 // The thread does not survive fork(), but every flag saying it does is inherited. Left alone the
-// child would: take the wake path in `_mi_arenas_purge_now` and signal nobody (so never purge at
-// all), and `pthread_join` a `pthread_t` that names no thread at exit.
+// child would: leave purging to a thread that is gone (so never purge at all), and
+// `pthread_join` a `pthread_t` that names no thread at exit.
 void _mi_scavenger_forked_child(void) {
   mi_atomic_store_release(&_mi_scavenger_joinable, (uintptr_t)0);
   mi_atomic_store_release(&_mi_scavenger_running, (uintptr_t)0);

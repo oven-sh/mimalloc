@@ -153,7 +153,7 @@ static void mi_theap_collect_ex(mi_theap_t* theap, mi_collect_t collect)
   // Not from a claimed parked sweep though: a woken owner spins in `_mi_park_leave` for the
   // whole of it and nothing in the arena purge reads `park_reclaim`, so the "bounded by one page"
   // wait would become an unbounded subproc-wide madvise pass. The sweep's caller runs the arena
-  // purge itself as a reclaim-gated phase (`_mi_arenas_purge_now`).
+  // purge itself.
   //mi_atomic_storei64_release(&theap->tld->subproc->purge_expire, 1);
   if (collect != MI_ABANDON && (theap->tld == NULL || mi_atomic_load_relaxed(&theap->tld->park_state) != MI_PARK_SWEEPING)) {
     _mi_arenas_collect(collect == MI_FORCE /* force purge? */, collect >= MI_FORCE /* visit all? */, theap->tld);
@@ -310,8 +310,10 @@ void _mi_thread_idle_work(mi_tld_t* tld, mi_theap_t* theap0) mi_attr_noexcept {
   }
   if (mi_atomic_load_relaxed(&tld->park_reclaim) != 0) return;
   mi_purge_holes_of(tld);   // every theap of this thread + the abandoned pages
-  if (mi_atomic_load_relaxed(&tld->park_reclaim) != 0) return;
-  _mi_arenas_purge_now(tld->subproc);
+  if (!_mi_scavenger_is_running()) {
+    // nobody will come back for what is not expired yet
+    _mi_arenas_try_purge(true /* force */, true /* visit all */, tld->subproc, 0 /* tseq */);
+  }
 }
 
 // Take the theaps of `tld` back from the scavenger. Also called from teardown: a thread can leave

@@ -294,7 +294,6 @@ void          _mi_scavenger_start_lazy(void);
 void          _mi_scavenger_stop(void);
 void          _mi_scavenger_wake(mi_subproc_t* subproc);
 bool          _mi_scavenger_is_running(void);
-void          _mi_arenas_purge_now(mi_subproc_t* subproc);
 
 // "page-map.c"
 bool          _mi_page_map_init(void);
