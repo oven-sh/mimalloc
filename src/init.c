@@ -149,6 +149,7 @@ mi_decl_hidden mi_decl_cache_align const mi_theap_t _mi_theap_empty = {
   false,                  // allow reclaim
   true,                   // allow abandon
   true,                   // is_detached 
+  false,                  // purged_search_short
   ~MI_ZU(0),              // sample countdown: "-1" (with a sample rate of 0, so we won't write to the empty theap with MI_SAMPLE==2)  
   0, 0,                   // sample rate, requested
   0, 0, 0,                // profile rate, countdown, epoch

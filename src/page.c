@@ -1020,7 +1020,7 @@ size_t _mi_page_unformed_purged_bytes(const mi_page_t* page) {
 static bool mi_page_unformed_tail_todo(const mi_page_t* page, uintptr_t* lo, uintptr_t* dlo, uintptr_t* hi) {
   *lo = 0; *dlo = 0; *hi = 0;
   if (!mi_page_holes_madvisable(page)) return false;
-  if (page->memid.initially_zero) return false;  // the tail was never touched: nothing to discard
+  if (page->memid.initially_zero && !mi_option_is_enabled(mi_option_allow_thp)) return false;  // the tail was never touched: nothing to discard
   mi_page_unformed_tail_range(page, lo, hi);
   if (*lo >= *hi) return false;
   const uintptr_t pstart = (uintptr_t)mi_page_start(page);
@@ -2397,6 +2397,7 @@ mi_decl_nodiscard bool _mi_page_init(mi_theap_t* theap, mi_page_t* page) {
 
 // Find a page with free blocks of `page->block_size`.
 #define MI_PURGED_SEARCH_MAX  (32)   // bound the search past pages that only have purged blocks
+#define MI_PURGED_SEARCH_MIN  (4)    // and more so after a search that found nothing
 
 static mi_decl_noinline mi_page_t* mi_page_queue_find_free_ex(mi_theap_t* theap, mi_page_queue_t* pq, bool first_try)
 {
@@ -2407,6 +2408,7 @@ static mi_decl_noinline mi_page_t* mi_page_queue_find_free_ex(mi_theap_t* theap,
   mi_page_t* page_candidate = NULL;  // a page with free space
   mi_page_t* page_purged = NULL;     // a page where all (formatted) free blocks are purged
   size_t purged_count = 0;
+  const size_t purged_max = (theap->purged_search_short ? MI_PURGED_SEARCH_MIN : MI_PURGED_SEARCH_MAX);
   const bool can_unpurge = !_mi_page_purge_holes_in_progress();
   mi_page_t* page = pq->first;
   mi_page_t* const last = pq->last;
@@ -2432,10 +2434,10 @@ static mi_decl_noinline mi_page_t* mi_page_queue_find_free_ex(mi_theap_t* theap,
       // no resident blocks are left: use this page only if there is no page that has them
       if (page_purged == NULL) { page_purged = page; }
       candidate_limit++;  // not a candidate
+      if (++purged_count >= purged_max) break;
       if (page!=last && pq->last!=page) {
         mi_page_queue_move_to_back(theap, pq, page);
       }
-      if (++purged_count >= MI_PURGED_SEARCH_MAX) break;
     }
     // if the page is completely full, move it to the `mi_pages_full`
     // queue so we don't visit long-lived pages too often.
@@ -2459,6 +2461,10 @@ static mi_decl_noinline mi_page_t* mi_page_queue_find_free_ex(mi_theap_t* theap,
       }
       else if (mi_page_all_free(page_candidate)) {
         _mi_page_free(page_candidate, pq);
+        page_candidate = page;
+      }
+      // resident blocks go before purged ones, which go before extending the candidate
+      else if (page_purged != NULL && immediate_available && !mi_page_immediate_available(page_candidate)) {
         page_candidate = page;
       }
       // prefer to reuse fuller pages (in the hope the less used page gets freed)
@@ -2494,10 +2500,12 @@ static mi_decl_noinline mi_page_t* mi_page_queue_find_free_ex(mi_theap_t* theap,
   // set the page to the best candidate: resident blocks first, then purged blocks, and then extend
   if (page_candidate != NULL && (page_purged == NULL || mi_page_immediate_available(page_candidate))) {
     page = page_candidate;
+    if (page_purged != NULL) { theap->purged_search_short = false; }
   }
   else if (page_purged != NULL) {
     page = page_purged;
     _mi_page_unpurge_run(page);
+    theap->purged_search_short = true;
   }
   if (page != NULL) {
     if (!mi_page_immediate_available(page)) {
