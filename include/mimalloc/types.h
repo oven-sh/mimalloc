@@ -663,6 +663,7 @@ struct mi_theap_s {
   bool                  allow_page_reclaim;                  // `true` if this theap can reclaim abandoned pages
   bool                  allow_page_abandon;                  // `true` if this theap can abandon pages to reduce memory footprint
   bool                  is_detached;                         // `true` if `tld->thread_id == MI_THREADID_DETACHED`
+  bool                  purged_search_short;                 // `true` if the last search past pages with only purged blocks found no resident blocks (see `page.c`)
 
   // sampling
   size_t                sample_countdown;                    // sample countdown in requested bytes (don't change the field order; see `internal.h:_mi_theap_get_free_small_page`)
@@ -826,6 +827,7 @@ typedef int64_t  mi_msecs_t;
 #define MI_PARK_SWEPT_NONE   (0)
 #define MI_PARK_SWEPT_DONE   (1)
 #define MI_PARK_SWEPT_SMALL  (2)   // but for large pages that were in use a moment ago: come back for those if the thread stays parked
+#define MI_PARK_SWEEP_AGAIN_MSECS  (30000)   // a thread that stays parked is swept again after this long (the safety timeout of the scavenger)
 #define MI_PARK_SWEEPS_MAX   (6)   // sweeps of one park at the most (two or three unless a sweeper that moves the epoch is held up)
 
 struct mi_tld_s {
@@ -925,9 +927,8 @@ typedef struct mi_arena_s {
   mi_bbitmap_t*       slices_free;          // is the slice free? (a binned bitmap with size classes)
   mi_bitmap_t*        slices_committed;     // is the slice committed? (i.e. accessible)
   mi_bitmap_t*        slices_dirty;         // is the slice potentially non-zero?
-  mi_bitmap_t*        slices_purge[2];      // slices that can be purged, in two generations: a free sets a bit in `[purge_gen&1]`;
-                                            // a purge pass purges the other one and then increments `purge_gen`
-  _Atomic(size_t)     purge_gen;
+  mi_bitmap_t*        slices_purge;         // slices that can be purged
+  mi_bitmap_t*        slices_purge_young;   // slices that were freed since the last purge pass (which leaves them to the next pass)
   mi_page_t*          pages_meta;           // pre-allocated `slice_count` page meta info -- only used if `MI_PAGE_META_IS_SEPARATED!=0`
   mi_arena_pages_t    pages_main;           // arena page bitmaps for the main heap are allocated up front as well
 

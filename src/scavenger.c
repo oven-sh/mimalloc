@@ -197,6 +197,7 @@ static void mi_scavenger_run(void) {
   // initialise a theap/tld via _mi_subproc()'s TLS path.
   mi_subproc_t* const subproc = _mi_subproc_main();
   mi_atomic_store_relaxed(&_mi_scavenger_thread_id, _mi_thread_id());
+  mi_msecs_t park_seen_last = 0;
   while (mi_atomic_load_acquire(&_mi_scavenger_running) != 0) {
     // Clear with an RMW, not a plain store: it must be totally ordered against the parker's
     // coalescing `exchange(wake, 1)` in `_mi_scavenger_wake`. With a store, our clear and the later
@@ -208,6 +209,18 @@ static void mi_scavenger_run(void) {
     // Do the idle work of any thread that parked and handed us its theaps. This is the expensive
     // part (the hole punch is ~99% madvise) and it is why the owner gets to skip it.
     const mi_msecs_t park_due = _mi_theap_sweep_parked(subproc);
+    // Do threads park all the time, or did one go idle?
+    const mi_msecs_t interval = (mi_msecs_t)mi_option_get_clamp(mi_option_purge_holes_min_interval, 1, 3600000);
+    bool poll = false;
+    if (park_seen) {
+      const mi_msecs_t now = _mi_clock_now();
+      poll = (now - park_seen_last <= 2*interval);
+      park_seen_last = now;
+      if (!poll) {
+        // idle: `purge_delay` is there for memory that is about to be used again
+        _mi_arenas_try_purge(true /* force */, true /* visit_all */, subproc, 0 /* tseq */);
+      }
+    }
     const mi_msecs_t expire = mi_atomic_loadi64_acquire(&subproc->purge_expire);
     mi_msecs_t timeout_ms;
     if (expire == 0) {
@@ -238,13 +251,12 @@ static void mi_scavenger_run(void) {
     }
     // a park passed over for `purge_holes_min_interval` is swept when its window ends, not at the safety timeout
     if (park_due > 0 && park_due < timeout_ms) { timeout_ms = park_due; }
-    // While threads keep parking, poll them every interval so they don't each have to wake us.
-    if (park_seen) {
-      const mi_msecs_t interval = (mi_msecs_t)mi_option_get_clamp(mi_option_purge_holes_min_interval, 1, 3600000);
+    // While threads park all the time, poll them every interval so they don't each have to wake us.
+    if (poll) {
       if (interval < timeout_ms) { timeout_ms = interval; }
       mi_atomic_store_release(&subproc->scavenger_polls, (uint32_t)1);
     }
-    else if (mi_atomic_exchange_acq_rel(&subproc->scavenger_polls, (uint32_t)0) != 0) {
+    else if (mi_atomic_exchange_seq_cst(&subproc->scavenger_polls, (uint32_t)0) != 0) {
       continue;  // stopped polling: look once more for a thread that parked and did not wake us
     }
     if (mi_atomic_load_acquire(&_mi_scavenger_running) == 0) break;
