@@ -270,7 +270,7 @@ static void test_key_reuse(void) {
 #define HOLDERS 32
 #define HEAPS_PER_HOLDER 6
 
-static pthread_barrier_t holders_barrier;
+static _Atomic(int) holders_ready;
 
 static bool count_area(const mi_heap_t* heap, const mi_heap_area_t* area, void* block, size_t block_size, void* arg) {
   (void)heap; (void)area; (void)block_size;
@@ -296,7 +296,8 @@ static void* hold_heaps(void* arg) {
     heap_alloc(heaps[i], 48);
   }
   // make sure the theaps of all threads are live at the same time
-  pthread_barrier_wait(&holders_barrier);
+  atomic_fetch_add(&holders_ready, 1);
+  while (atomic_load(&holders_ready) != HOLDERS) { }
   for (int i = 0; i < HEAPS_PER_HOLDER; i++) {
     mi_heap_destroy(heaps[i]);
   }
@@ -306,7 +307,6 @@ static void* hold_heaps(void* arg) {
 static void test_meta_pages(void) {
   const size_t before = main_heap_page_count();
 
-  pthread_barrier_init(&holders_barrier, NULL, HOLDERS);
   pthread_t threads[HOLDERS];
   for (int i = 0; i < HOLDERS; i++) {
     pthread_create(&threads[i], NULL, &hold_heaps, NULL);
@@ -314,7 +314,6 @@ static void test_meta_pages(void) {
   for (int i = 0; i < HOLDERS; i++) {
     pthread_join(threads[i], NULL);
   }
-  pthread_barrier_destroy(&holders_barrier);
 
   // the theaps took ~35 pages; allow for a few retired pages
   const size_t after = main_heap_page_count();
