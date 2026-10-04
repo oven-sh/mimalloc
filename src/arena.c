@@ -1615,7 +1615,9 @@ void _mi_arenas_holes_committed(mi_heap_t* heap, mi_holes_report_t* rep) {
 /* -----------------------------------------------------------
   Arena free
 ----------------------------------------------------------- */
-static void mi_arena_schedule_purge(mi_arena_t* arena, size_t slice_index, size_t slices);
+static long mi_arena_purge_delay(void);
+static bool mi_arena_purge(mi_arena_t* arena, size_t slice_index, size_t slice_count);
+static void mi_arena_schedule_purge(mi_arena_t* arena, size_t slice_index, size_t slice_count, long delay);
 
 void _mi_arenas_free(mi_subproc_t* subproc, void* p, size_t size, mi_memid_t memid) {
   if (p==NULL) return;
@@ -1651,10 +1653,10 @@ void _mi_arenas_free(mi_subproc_t* subproc, void* p, size_t size, mi_memid_t mem
       return;
     }
 
-    // potentially decommit
-    if (!arena->memid.is_pinned /* && !arena->memid.initially_committed */) { // todo: allow decommit even if initially committed?
-      // (delay) purge the page
-      mi_arena_schedule_purge(arena, slice_index, slice_count);
+    // <0 = no purging, 0 = purge now, >0 = delay in milli-seconds
+    const long delay = (arena->memid.is_pinned || _mi_preloading() ? -1 : mi_arena_purge_delay());
+    if (delay == 0) {
+      mi_arena_purge(arena, slice_index, slice_count);  // while we still own the slices
     }
 
     // and make it available to others again
@@ -1663,6 +1665,11 @@ void _mi_arenas_free(mi_subproc_t* subproc, void* p, size_t size, mi_memid_t mem
       _mi_error_message(EAGAIN, "trying to free an already freed arena block: %p, size %zu\n", mi_arena_slice_start(arena,slice_index), mi_size_of_slices(slice_count));
       return;
     };
+
+    // Schedule only after the slices are free: a purge pass drops slices that it cannot claim.
+    if (delay > 0) {
+      mi_arena_schedule_purge(arena, slice_index, slice_count, delay);
+    }
   }
   else if (memid.memkind == MI_MEM_MALLOC) {
     _mi_free_subproc_safe(p);
@@ -2563,35 +2570,22 @@ static bool mi_arena_purge(mi_arena_t* arena, size_t slice_index, size_t slice_c
 }
 
 
-// Schedule a purge. This is usually delayed to avoid repeated decommit/commit calls.
-// Note: assumes we (still) own the area as we may purge immediately
-static void mi_arena_schedule_purge(mi_arena_t* arena, size_t slice_index, size_t slice_count) {
-  const long delay = mi_arena_purge_delay();
-  if (arena->memid.is_pinned || delay < 0 || _mi_preloading()) return;  // is purging allowed at all?
+// Schedule a delayed purge of slices that were just freed (they may already be allocated again,
+// in which case the purge pass skips them).
+static void mi_arena_schedule_purge(mi_arena_t* arena, size_t slice_index, size_t slice_count, long delay) {
+  mi_assert_internal(delay > 0);
+  // Set the bits before looking at the expiration: a pass resets the expiration before it scans
+  // the bits, so either it sees our bits or we see the reset and schedule the next pass.
+  mi_bitmap_setN(arena->slices_purge, slice_index, slice_count, NULL);
+  if (mi_atomic_loadi64_acquire(&arena->purge_expire) != 0) return;  // already scheduled
 
-  mi_assert_internal(mi_bbitmap_is_clearN(arena->slices_free, slice_index, slice_count));
-  if (delay == 0) {
-    // purge directly
-    mi_arena_purge(arena, slice_index, slice_count);
-  }
-  else {
-    // schedule purge
-    const mi_msecs_t expire = _mi_clock_now() + delay;
-    mi_msecs_t expire0 = 0;
-    if (mi_atomic_casi64_strong_acq_rel(&arena->purge_expire, &expire0, expire)) {
-      // expiration was not yet set
-      // maybe set the global arenas expire as well (if it wasn't set already)
-      mi_assert_internal(expire0==0);
-      if (mi_atomic_casi64_strong_acq_rel(&arena->subproc->purge_expire, &expire0, expire)) {
-        // subproc expire went 0 -> set: this is the only transition the scavenger
-        // actually needs to observe, so wake it here instead of on every free.
-        _mi_scavenger_wake(arena->subproc);
-      }
+  const mi_msecs_t expire = _mi_clock_now() + delay;
+  mi_msecs_t expire0 = 0;
+  if (mi_atomic_casi64_strong_acq_rel(&arena->purge_expire, &expire0, expire)) {
+    // also set the global expiration if it wasn't set already, and wake the scavenger for it
+    if (mi_atomic_casi64_strong_acq_rel(&arena->subproc->purge_expire, &expire0, expire)) {
+      _mi_scavenger_wake(arena->subproc);
     }
-    else {
-      // already an expiration was set
-    }
-    mi_bitmap_setN(arena->slices_purge, slice_index, slice_count, NULL);
   }
 }
 
@@ -2653,8 +2647,8 @@ static int mi_arena_try_purge(mi_arena_t* arena, mi_msecs_t now, bool force)
   if (expire==0) return -1;
   if (!force && expire > now) return 0;
 
-  // reset expire
-  mi_atomic_storei64_release(&arena->purge_expire, (mi_msecs_t)0);
+  // reset expire (with an RMW so it is ordered before the scan of the bits, see `mi_arena_schedule_purge`)
+  while (!mi_atomic_casi64_strong_acq_rel(&arena->purge_expire, &expire, (mi_msecs_t)0)) { }
   mi_subproc_stat_counter_increase(arena->subproc, arena_purges, 1);
 
   // go through all purge info's  (with max MI_BFIELD_BITS ranges at a time)
