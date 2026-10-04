@@ -27,6 +27,7 @@ void _mi_scavenger_start_lazy(void) { _mi_scavenger_start(); }
 #include <errno.h>
 
 static _Atomic(uintptr_t) _mi_scavenger_running;  // 0 = not running, 1 = running
+static _Atomic(mi_threadid_t) _mi_scavenger_thread_id;
 
 // -----------------------------------------------------------------------------
 // Wait/wake on subproc->scavenger_wake (a uint32_t futex word).
@@ -195,13 +196,15 @@ static void mi_scavenger_run(void) {
   // Use the main subproc directly: this thread never allocates, so don't
   // initialise a theap/tld via _mi_subproc()'s TLS path.
   mi_subproc_t* const subproc = _mi_subproc_main();
+  mi_atomic_store_relaxed(&_mi_scavenger_thread_id, _mi_thread_id());
   while (mi_atomic_load_acquire(&_mi_scavenger_running) != 0) {
     // Clear with an RMW, not a plain store: it must be totally ordered against the parker's
     // coalescing `exchange(wake, 1)` in `_mi_scavenger_wake`. With a store, our clear and the later
-    // `parked_count` read below can pass the parker's increment and its exchange in opposite
+    // read of its `park_state` can pass the parker's CAS and its exchange in opposite
     // directions (store-buffering) -- we see no parked thread, it sees a stale wake==1 and issues
     // no syscall, and that park is silently deferred to the safety timeout.
     mi_atomic_exchange_acq_rel(&subproc->scavenger_wake, (uint32_t)0);
+    const bool park_seen = (mi_atomic_exchange_acq_rel(&subproc->park_seen, (uint32_t)0) != 0);
     // Do the idle work of any thread that parked and handed us its theaps. This is the expensive
     // part (the hole punch is ~99% madvise) and it is why the owner gets to skip it.
     const mi_msecs_t park_due = _mi_theap_sweep_parked(subproc);
@@ -235,6 +238,15 @@ static void mi_scavenger_run(void) {
     }
     // a park passed over for `purge_holes_min_interval` is swept when its window ends, not at the safety timeout
     if (park_due > 0 && park_due < timeout_ms) { timeout_ms = park_due; }
+    // While threads keep parking, poll them every interval so they don't each have to wake us.
+    if (park_seen) {
+      const mi_msecs_t interval = (mi_msecs_t)mi_option_get_clamp(mi_option_purge_holes_min_interval, 1, 3600000);
+      if (interval < timeout_ms) { timeout_ms = interval; }
+      mi_atomic_store_release(&subproc->scavenger_polls, (uint32_t)1);
+    }
+    else if (mi_atomic_exchange_acq_rel(&subproc->scavenger_polls, (uint32_t)0) != 0) {
+      continue;  // stopped polling: look once more for a thread that parked and did not wake us
+    }
     if (mi_atomic_load_acquire(&_mi_scavenger_running) == 0) break;
     mi_scav_wait(&subproc->scavenger_wake, timeout_ms);
     // The safety net: nothing was scheduled and nothing woke us. Look at the arenas all the same.
@@ -254,6 +266,7 @@ void _mi_scavenger_wake(mi_subproc_t* subproc) {
   // the page-free path and would otherwise turn every arena page free into a
   // syscall on the freeing thread.
   if (mi_atomic_exchange_acq_rel(&subproc->scavenger_wake, (uint32_t)1) == 0) {
+    if (mi_atomic_load_relaxed(&_mi_scavenger_thread_id) == _mi_thread_id()) return;  // we are the scavenger and not waiting
     mi_scav_wake_one(&subproc->scavenger_wake);
   }
 }

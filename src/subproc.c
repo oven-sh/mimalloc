@@ -452,7 +452,8 @@ void _mi_process_fork_child(void) {
     mi_lock_init(&sp->tlds_lock);
     mi_lock_init(&sp->theap_meta_lock);
     mi_atomic_store_relaxed(&sp->scavenger_wake, (uint32_t)0);
-    mi_atomic_store_relaxed(&sp->parked_count, (size_t)0);
+    mi_atomic_store_relaxed(&sp->scavenger_polls, (uint32_t)0);
+    mi_atomic_store_relaxed(&sp->park_seen, (uint32_t)0);
     for (mi_tld_t* t = sp->tlds; t != NULL; t = t->subproc_next) {   // every tld, the forking thread's included, is registered here
       mi_lock_init(&t->theaps_lock);
       mi_atomic_store_relaxed(&t->park_state, (uint32_t)MI_PARK_RUNNING);

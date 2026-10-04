@@ -786,7 +786,8 @@ struct mi_subproc_s {
 
   mi_tld_t*             tlds;                           // list of tlds of this sub-process (walked by the scavenger for parked threads)
   mi_lock_t             tlds_lock;                      // guards the `tlds` list structure only -- never held across a sweep
-  _Atomic(size_t)       parked_count;                   // threads currently parked; lets the scavenger skip the walk entirely
+  _Atomic(uint32_t)     scavenger_polls;                // set while the scavenger looks at the parked threads by itself: a park does not need to wake it
+  _Atomic(uint32_t)     park_seen;                      // set by a thread that parks, cleared by the scavenger
 
   _Atomic(size_t)       thread_count;                   // current threads associated with this sub-process
   _Atomic(size_t)       thread_total_count;             // total created threads associated with this sub-process

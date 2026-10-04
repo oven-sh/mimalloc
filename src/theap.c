@@ -338,7 +338,6 @@ void _mi_park_leave(mi_tld_t* tld) {
     }
   }
   mi_atomic_store_release(&tld->park_reclaim, 0);
-  mi_atomic_decrement_relaxed(&tld->subproc->parked_count);
 }
 
 // The original entry point: do the work inline, on the calling thread. Kept for callers that
@@ -389,8 +388,11 @@ bool mi_on_thread_idle_start(void) mi_attr_noexcept {
   mi_atomic_store_release(&tld->park_swept, (uint32_t)MI_PARK_SWEPT_NONE);
   uint32_t expected = MI_PARK_RUNNING;
   if (!mi_atomic_cas_strong_acq_rel(&tld->park_state, &expected, MI_PARK_PARKED)) return false;
-  mi_atomic_increment_relaxed(&tld->subproc->parked_count);
-  _mi_scavenger_wake(tld->subproc);
+  // Wake the scavenger unless it is polling. It stops polling with an RMW and then looks at all threads
+  // once more, so either we see that it stopped or it sees that we are parked.
+  mi_subproc_t* const subproc = tld->subproc;
+  if (mi_atomic_load_relaxed(&subproc->park_seen) == 0) { mi_atomic_store_relaxed(&subproc->park_seen, (uint32_t)1); }
+  if (mi_atomic_load_acquire(&subproc->scavenger_polls) == 0) { _mi_scavenger_wake(subproc); }
   return true;
 }
 
@@ -416,7 +418,6 @@ void mi_on_thread_idle_end(void) mi_attr_noexcept {
 // leaving it to its safety timeout.
 mi_msecs_t _mi_theap_sweep_parked(mi_subproc_t* subproc) {
   if (subproc == NULL) return 0;
-  if (mi_atomic_load_relaxed(&subproc->parked_count) == 0) return 0;
   for (;;) {
     mi_tld_t* claimed = NULL;
     mi_theap_t* theap0 = NULL;
