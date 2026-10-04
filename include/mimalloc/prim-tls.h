@@ -435,7 +435,7 @@ static inline mi_theap_t* _mi_heap_theap_peek(const mi_heap_t* heap) {
   theap = (mi_theap_t*)_mi_thread_local_get(heap->theap);  // don't update the cache on a query
   if (theap==NULL) return NULL;
   mi_assert_internal(!_mi_is_empty_theap(theap));
-  mi_assert_internal(_mi_theap_heap_peek(theap)==heap || _mi_theap_heap_peek(theap)==NULL);
+  mi_assert_internal(_mi_theap_heap_peek(theap)==heap || _mi_theap_heap_peek(theap)==NULL || heap->theap==mi_thread_local_key_fast /* the main heap of another sub-process */);
   if (_mi_theap_heap_peek(theap) != heap) return NULL;  // detached by a concurrent `mi_heap_delete`/`mi_heap_destroy` of `heap` (`_mi_heap_detach_theaps`)
   return theap;
 }

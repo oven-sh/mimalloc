@@ -317,9 +317,11 @@ mi_decl_export bool mi_subproc_profile(mi_subproc_id_t subproc_id, mi_profiler_t
   if (profiler!=NULL) { mi_profiler_set_enabled(profiler,false); }
   mi_profiler_t* previous = (profiler==NULL ? mi_atomic_load_ptr_acquire(mi_profiler_t,&subproc->profiler) : NULL); // don't overwrite unless it is NULL
   if (!mi_atomic_cas_ptr_strong_acq_rel(mi_profiler_t,&subproc->profiler, &previous, profiler)) { return false; }  
-  mi_lock(&subproc->heaps_lock) {
-    for (mi_heap_t* heap = subproc->heaps; heap!=NULL; heap = heap->next) {
-      mi_heap_set_profiler(heap,profiler);
+  for (size_t i = 0; i < MI_HEAPS_SHARD_COUNT; i++) {
+    mi_lock(&subproc->heaps[i].lock) {
+      for (mi_heap_t* heap = subproc->heaps[i].first; heap!=NULL; heap = heap->next) {
+        mi_heap_set_profiler(heap,profiler);
+      }
     }
   }
   return true;
@@ -337,19 +339,22 @@ _Atomic(size_t) _mi_profiler_epoch;   // = 0 (see `internal.h:mi_profiler_set_en
 // With `wait` false a lock that is taken is not waited for, and what is behind it is left out.
 static void mi_profiler_request_look_in(mi_subproc_t* subproc, mi_profiler_t* profiler, bool wait) {
   #if MI_SAMPLE
-  if (wait) { mi_lock_acquire(&subproc->heaps_lock); }
-  else if (!mi_lock_try_acquire(&subproc->heaps_lock)) { return; }
-  for (mi_heap_t* heap = subproc->heaps; heap!=NULL; heap = heap->next) {
-    if (mi_heap_profiler(heap)!=profiler) continue;
-    if (wait) { mi_lock_acquire(&heap->theaps_lock); }
-    else if (!mi_lock_try_acquire(&heap->theaps_lock)) { continue; }
-    for (mi_theap_t* theap = heap->theaps; theap!=NULL; theap = theap->hnext) {
-      if (theap->is_detached) continue;  // (meta data is not sampled)
-      mi_atomic_store_release(&theap->generic_fast_limit, (intptr_t)(-1));
+  for (size_t i = 0; i < MI_HEAPS_SHARD_COUNT; i++) {
+    mi_heaps_shard_t* const shard = &subproc->heaps[i];
+    if (wait) { mi_lock_acquire(&shard->lock); }
+    else if (!mi_lock_try_acquire(&shard->lock)) { continue; }
+    for (mi_heap_t* heap = shard->first; heap!=NULL; heap = heap->next) {
+      if (mi_heap_profiler(heap)!=profiler) continue;
+      if (wait) { mi_lock_acquire(&heap->theaps_lock); }
+      else if (!mi_lock_try_acquire(&heap->theaps_lock)) { continue; }
+      for (mi_theap_t* theap = heap->theaps; theap!=NULL; theap = theap->hnext) {
+        if (theap->is_detached) continue;  // (meta data is not sampled)
+        mi_atomic_store_release(&theap->generic_fast_limit, (intptr_t)(-1));
+      }
+      mi_lock_release(&heap->theaps_lock);
     }
-    mi_lock_release(&heap->theaps_lock);
+    mi_lock_release(&shard->lock);
   }
-  mi_lock_release(&subproc->heaps_lock);
   #else
   MI_UNUSED(subproc); MI_UNUSED(profiler); MI_UNUSED(wait);
   #endif

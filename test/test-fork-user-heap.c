@@ -18,9 +18,9 @@ terms of the MIT license.
    via mi_heap_delete -> _mi_theap_free -> theap.c:322.
 
    Case C: the scavenger thread does not survive fork(), but fork_child left
-   `_mi_scavenger_running` set. `_mi_arenas_purge_now` then takes the wake path
-   and signals a thread that does not exist instead of purging inline, so a
-   forked child never returns memory to the OS at all.
+   `_mi_scavenger_running` set. Purging is then left to a thread that does not
+   exist instead of done inline, so a forked child never returns memory to the
+   OS at all.
 
    Case D: the fork handlers must be registered once per process. When the
    pthread_atfork call sat in mi_process_init (reached from every mi_heap_new)
@@ -184,8 +184,8 @@ static size_t rss_mb(void) {
   return (size_t)res * (size_t)sysconf(_SC_PAGESIZE) / (1024 * 1024);
 }
 
-// Case C: a forked child must still purge. With the scavenger flags inherited, `_mi_arenas_purge_now`
-// wakes a thread that no longer exists and the memory stays resident forever.
+// Case C: a forked child must still purge. With the scavenger flags inherited, the purge is left
+// to a thread that no longer exists and the memory stays resident forever.
 static int case_c(void) {
   enum { N = 400, BLOCK = 256 * 1024 };   // 100MB: unmissable in RSS either way
   void** p = (void**)malloc(N * sizeof(void*));
@@ -197,13 +197,10 @@ static int case_c(void) {
     for (int i = 0; i < N; i++) { p[i] = mi_malloc(BLOCK); memset(p[i], 1, BLOCK); }
     const size_t live = rss_mb();
     for (int i = 0; i < N; i++) { mi_free(p[i]); }
-    // Deliberately do NOT wait out the purge delay: voiding it is exactly what
-    // `_mi_arenas_purge_now` is for, and it is the only channel a scavenger-less child has here.
-    // Sleeping first would let the ordinary due-purge do the work and the case would prove nothing.
+    // Without a scavenger `mi_on_thread_idle` purges everything right away; with one the purge
+    // follows within the purge delay. A stale flag means neither happens.
+    // Allocate nothing while polling: an allocation could purge inline and hide the difference.
     mi_on_thread_idle();
-    // `purge_now` sets the arenas due, so a live scavenger purges promptly; a stale flag means it
-    // signalled nobody and nothing ever will. Poll instead of assuming, and allocate nothing while
-    // polling -- an allocation would purge inline and hide the difference.
     size_t after = rss_mb();
     for (int i = 0; i < 200 && after + 40 > live; i++) { usleep(10 * 1000); after = rss_mb(); }
     fprintf(stderr, "case_c: child RSS %zuMB -> %zuMB\n", live, after);

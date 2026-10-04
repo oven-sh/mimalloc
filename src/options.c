@@ -289,12 +289,26 @@ mi_decl_export void mi_options_print(void) mi_attr_noexcept {
   mi_options_print_out(NULL, NULL);
 }
 
+// An option can be set while other threads (like the scavenger) read it.
+static inline long mi_option_desc_get(mi_option_desc_t* desc) {
+  return mi_atomic_load_relaxed((_Atomic(long)*)&desc->value);
+}
+
+static inline void mi_option_desc_set(mi_option_desc_t* desc, long value, mi_option_init_t init) {
+  mi_atomic_store_relaxed((_Atomic(long)*)&desc->value, value);
+  mi_atomic_store_relaxed((_Atomic(mi_option_init_t)*)&desc->init, init);
+}
+
+static inline mi_option_init_t mi_option_desc_init(mi_option_desc_t* desc) {
+  return mi_atomic_load_relaxed((_Atomic(mi_option_init_t)*)&desc->init);
+}
+
 long _mi_option_get_fast(mi_option_t option) {
   mi_assert(option >= 0 && option < _mi_option_last);
   mi_option_desc_t* desc = &mi_options[option];
   mi_assert(desc->option == option);  // index should match the option
   //mi_assert(desc->init != MI_OPTION_UNINIT);
-  return desc->value;
+  return mi_option_desc_get(desc);
 }
 
 
@@ -303,10 +317,10 @@ mi_decl_nodiscard long mi_option_get(mi_option_t option) {
   if (option < 0 || option >= _mi_option_last) return 0;
   mi_option_desc_t* desc = &mi_options[option];
   mi_assert(desc->option == option);  // index should match the option
-  if mi_unlikely(desc->init == MI_OPTION_UNINIT) {
+  if mi_unlikely(mi_option_desc_init(desc) == MI_OPTION_UNINIT) {
     mi_option_init(desc);
   }
-  return desc->value;
+  return mi_option_desc_get(desc);
 }
 
 mi_decl_nodiscard long mi_option_get_clamp(mi_option_t option, long min, long max) {
@@ -330,8 +344,7 @@ void mi_option_set(mi_option_t option, long value) {
   if (option < 0 || option >= _mi_option_last) return;
   mi_option_desc_t* desc = &mi_options[option];
   mi_assert(desc->option == option);  // index should match the option
-  desc->value = value;
-  desc->init = MI_OPTION_INITIALIZED;
+  mi_option_desc_set(desc, value, MI_OPTION_INITIALIZED);
   // ensure min/max range; be careful to not recurse.
   if (desc->option == mi_option_guarded_min && _mi_option_get_fast(mi_option_guarded_max) < value) {
     mi_option_set(mi_option_guarded_max, value);

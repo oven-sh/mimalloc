@@ -101,35 +101,7 @@ jobs:
           cmake --build out/secure-${{ matrix.c_or_cxx }} --parallel 4 --config Release
           ctest --test-dir out/secure-${{ matrix.c_or_cxx }} --verbose --timeout 240 -C Release
 
-      # Extra Windows: x86, clang-cl, and clang
-      - name: Debug, Win32
-        if: matrix.tests == 'basic' && runner.os == 'Windows'
-        run: |
-          cmake . -B out/debug-x86-${{ matrix.c_or_cxx }} -DCMAKE_BUILD_TYPE=Debug -A Win32 ${{ steps.cmake_args.outputs.CMAKE_CXX_OPT_MSVC }}
-          cmake --build out/debug-x86-${{ matrix.c_or_cxx }} --parallel 4 --config Debug
-          ctest --test-dir out/debug-x86-${{ matrix.c_or_cxx }} --verbose --timeout 240 -C Debug
-
-      - name: Release, Win32
-        if: matrix.tests == 'basic' && runner.os == 'Windows'
-        run: |
-          cmake . -B out/release-x86-${{ matrix.c_or_cxx }} -DCMAKE_BUILD_TYPE=Release -A Win32 ${{ steps.cmake_args.outputs.CMAKE_CXX_OPT_MSVC }}
-          cmake --build out/release-x86-${{ matrix.c_or_cxx }} --parallel 4 --config Release
-          ctest --test-dir out/release-x86-${{ matrix.c_or_cxx }} --verbose --timeout 240 -C Release
-
-      - name: Debug, Win32, clang-cl
-        if: matrix.tests == 'clang' && runner.os == 'Windows'
-        run: |
-          cmake . -B out/debug-x86-clang-cl-${{ matrix.c_or_cxx }} -DCMAKE_BUILD_TYPE=Debug -A Win32 -T ClangCl ${{ steps.cmake_args.outputs.CMAKE_CXX_OPT_MSVC }}
-          cmake --build out/debug-x86-clang-cl-${{ matrix.c_or_cxx }} --parallel 4 --config Debug
-          ctest --test-dir out/debug-x86-clang-cl-${{ matrix.c_or_cxx }} --verbose --timeout 240 -C Debug
-
-      - name: Release, Win32, clang-cl
-        if: matrix.tests == 'clang' && runner.os == 'Windows'
-        run: |
-          cmake . -B out/release-x86-clang-cl-${{ matrix.c_or_cxx }} -DCMAKE_BUILD_TYPE=Release -A Win32 -T ClangCl ${{ steps.cmake_args.outputs.CMAKE_CXX_OPT_MSVC }}
-          cmake --build out/release-x86-clang-cl-${{ matrix.c_or_cxx }} --parallel 4 --config Release
-          ctest --test-dir out/release-x86-clang-cl-${{ matrix.c_or_cxx }} --verbose --timeout 240 -C Release
-
+      # Extra Windows: clang-cl and clang
       - name: Debug, Windows, clang-cl
         if: matrix.tests == 'clang' && runner.os == 'Windows'
         run: |

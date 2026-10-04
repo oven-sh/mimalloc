@@ -98,9 +98,14 @@ void __mi_stat_adjust_decrease(mi_stat_count_t* stat, uint64_t amount) {
 // must be thread safe as it is called from stats_merge
 static void mi_stat_count_add_mt(mi_stat_count_t* stat, const mi_stat_count_t* src) {
   if (stat==src) return;
-  mi_atomic_void_addi64_relaxed(&stat->total, &src->total);
+  const int64_t src_total = mi_atomic_loadi64_relaxed((_Atomic(int64_t)*)&src->total);
   const int64_t src_peak = mi_atomic_loadi64_relaxed((_Atomic(int64_t)*)&src->peak);
   const int64_t src_current = mi_atomic_loadi64_relaxed((_Atomic(int64_t)*)&src->current);
+  // A count that the source never touched has nothing to add, and most counts of a merge are like that
+  // (there is a count per size bin). An atomic add of zero is still a locked instruction: a merge had
+  // about 180 of them, and `mi_heap_delete`/`mi_heap_destroy` merge three times (see `test-stats-merge.c`).
+  if (src_total==0 && src_peak==0 && src_current==0) return;
+  if (src_total!=0) { mi_atomic_addi64_relaxed(&stat->total, src_total); }
   const int64_t prev_current = mi_atomic_addi64_relaxed(&stat->current, src_current);
 
   // Global current plus thread peak approximates new global peak
@@ -117,27 +122,65 @@ static void mi_stat_counter_add_mt(mi_stat_counter_t* stat, const mi_stat_counte
   mi_atomic_void_addi64_relaxed(&stat->total, &src->total);
 }
 
-#define MI_STAT_COUNT(stat)    mi_stat_count_add_mt(&stats->stat, &src->stat);
-#define MI_STAT_COUNTER(stat)  mi_stat_counter_add_mt(&stats->stat, &src->stat);
+// non-atomic variants: `stat` must be thread-local
+static void mi_stat_count_add_local(mi_stat_count_t* stat, const mi_stat_count_t* src) {
+  const int64_t src_total = mi_atomic_loadi64_relaxed((_Atomic(int64_t)*)&src->total);
+  const int64_t src_peak = mi_atomic_loadi64_relaxed((_Atomic(int64_t)*)&src->peak);
+  const int64_t src_current = mi_atomic_loadi64_relaxed((_Atomic(int64_t)*)&src->current);
+  if (src_total==0 && src_peak==0 && src_current==0) return;
+  stat->total += src_total;
+  if (stat->current + src_peak > stat->peak) { stat->peak = stat->current + src_peak; }
+  stat->current += src_current;
+}
 
-// must be thread safe as it is called from stats_merge
-static void mi_stats_add(mi_stats_t* stats, const mi_stats_t* src) {
+static void mi_stat_counter_add_local(mi_stat_counter_t* stat, const mi_stat_counter_t* src) {
+  stat->total += mi_atomic_loadi64_relaxed((_Atomic(int64_t)*)&src->total);
+}
+
+#define MI_STAT_COUNT(stat)    mi_stat_count_add(&stats->stat, &src->stat, mt);
+#define MI_STAT_COUNTER(stat)  mi_stat_counter_add(&stats->stat, &src->stat, mt);
+
+static mi_decl_forceinline void mi_stat_count_add(mi_stat_count_t* stat, const mi_stat_count_t* src, const bool mt) {
+  if (mt) { mi_stat_count_add_mt(stat,src); } else { mi_stat_count_add_local(stat,src); }
+}
+
+static mi_decl_forceinline void mi_stat_counter_add(mi_stat_counter_t* stat, const mi_stat_counter_t* src, const bool mt) {
+  if (mt) { mi_stat_counter_add_mt(stat,src); } else { mi_stat_counter_add_local(stat,src); }
+}
+
+// Most bins are zero: skip them in groups (plain loads so the check can be vectorized).
+#define MI_STAT_COUNT_GROUP  (8)
+
+static mi_decl_forceinline void mi_stat_counts_add(mi_stat_count_t* stats, const mi_stat_count_t* src, const size_t count, const bool mt) {
+  for (size_t i = 0; i < count; i += MI_STAT_COUNT_GROUP) {
+    const size_t n = (count - i < MI_STAT_COUNT_GROUP ? count - i : MI_STAT_COUNT_GROUP);
+    if (!mt) {
+      int64_t any = 0;
+      for (size_t j = 0; j < n; j++) { any |= (src[i+j].total | src[i+j].peak | src[i+j].current); }
+      if (any==0) continue;
+    }
+    for (size_t j = 0; j < n; j++) {
+      mi_stat_count_add(&stats[i+j], &src[i+j], mt);
+    }
+  }
+}
+
+static mi_decl_forceinline void mi_stats_add_ex(mi_stats_t* stats, const mi_stats_t* src, const bool mt) {
   if (stats==NULL || src==NULL || stats==src) return;
 
   // copy all fields
   MI_STAT_FIELDS()
 
   #if MI_STATS
-  for (size_t i = 0; i <= MI_BIN_HUGE; i++) {
-    mi_stat_count_add_mt(&stats->malloc_bins[i], &src->malloc_bins[i]);
-  }
+  mi_stat_counts_add(stats->malloc_bins, src->malloc_bins, MI_BIN_HUGE+1, mt);
   #endif
-  for (size_t i = 0; i <= MI_BIN_HUGE; i++) {
-    mi_stat_count_add_mt(&stats->page_bins[i], &src->page_bins[i]);
-  }
-  for (size_t i = 0; i < MI_CBIN_COUNT; i++) {
-    mi_stat_count_add_mt(&stats->chunk_bins[i], &src->chunk_bins[i]);
-  }
+  mi_stat_counts_add(stats->page_bins, src->page_bins, MI_BIN_HUGE+1, mt);
+  mi_stat_counts_add(stats->chunk_bins, src->chunk_bins, MI_CBIN_COUNT, mt);
+}
+
+// must be thread safe as it is called from stats_merge
+static void mi_stats_add(mi_stats_t* stats, const mi_stats_t* src) {
+  mi_stats_add_ex(stats, src, true);
 }
 
 #undef MI_STAT_COUNT
@@ -451,10 +494,16 @@ void _mi_stats_init(void) {
   if (mi_process_start == 0) { mi_process_start = _mi_clock_start(); };
 }
 
-static void mi_stats_add_into(mi_stats_t* to, const mi_stats_t* from) {
+void _mi_stats_add_into(mi_stats_t* to, const mi_stats_t* from) {
   mi_assert_internal(to != NULL && from != NULL);
   if (to == from) return;
   mi_stats_add(to, from);
+}
+
+// Non-atomic add: `to` must be thread-local and `from` must no longer be updated.
+void _mi_stats_add_into_local(mi_stats_t* to, const mi_stats_t* from) {
+  mi_assert_internal(to != NULL && from != NULL);
+  mi_stats_add_ex(to, from, false);
 }
 
 void _mi_stats_merge_into(mi_stats_t* to, mi_stats_t* from) {
@@ -464,18 +513,17 @@ void _mi_stats_merge_into(mi_stats_t* to, mi_stats_t* from) {
   mi_stats_init(from); // zero field and keep the header 
 }
 
-static const mi_stats_t* mi_stats_merge_theap_to_heap(mi_theap_t* theap) mi_attr_noexcept {
-  mi_stats_t* stats = &theap->stats;
-  mi_stats_t* heap_stats = &_mi_theap_heap(theap)->stats;
-  _mi_stats_merge_into( heap_stats, stats );
-  return heap_stats;
+static void mi_stats_merge_theap_to_heap(mi_theap_t* theap) mi_attr_noexcept {
+  _mi_stats_merge_into( _mi_heap_stats(_mi_theap_heap(theap)), &theap->stats );
 }
 
 static const mi_stats_t* mi_heap_get_stats(mi_heap_t* heap) {
   if (heap==NULL) { heap = mi_heap_main(); }
   mi_theap_t* theap = _mi_heap_theap_peek(heap);
-  if (theap==NULL) return &heap->stats;
-              else return mi_stats_merge_theap_to_heap(theap);
+  if (theap!=NULL) { mi_stats_merge_theap_to_heap(theap); }
+  // don't allocate stats just to read them
+  const mi_stats_t* const stats = mi_atomic_load_ptr_acquire(mi_stats_t,&heap->stats);
+  return (stats!=NULL ? stats : &_mi_theap_empty.stats);
 }
 
 static const mi_stats_t* mi_theap_get_stats(mi_theap_t* theap) {
@@ -665,7 +713,7 @@ void mi_theap_stats_merge_to_heap(mi_theap_t* theap) mi_attr_noexcept {
 
 static bool mi_cdecl mi_heap_aggregate_visitor(mi_heap_t* heap, void* arg) {
   mi_stats_t* stats = (mi_stats_t*)arg;
-  mi_stats_add_into(stats, mi_heap_get_stats(heap));
+  _mi_stats_add_into(stats, mi_heap_get_stats(heap));
   return true;
 }
 

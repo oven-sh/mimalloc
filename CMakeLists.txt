@@ -916,7 +916,7 @@ if(MI_USE_CXX)
   set_source_files_properties(${mi_sources} PROPERTIES LANGUAGE CXX )
   set_source_files_properties(src/static.c test/test-api.c test/test-api-fill.c test/test-stress.c test/test-stress-heaps.c  test/test-stress-subprocs.c test/test-profile.c PROPERTIES LANGUAGE CXX )
   # the white-box tests call internal functions, whose names are mangled now; the heap tests use C11 atomics, which MSVC lacks in C mode
-  set_source_files_properties(test/test-theap-sentinel.c test/test-purge-holes.c test/test-purge-holes-large.c test/test-commit-fail.c
+  set_source_files_properties(test/test-theap-sentinel.c test/test-purge-holes.c test/test-purge-holes-large.c test/test-commit-fail.c test/test-stats-merge.c
                               test/test-heap-aba.c test/test-heap-delete-race.c test/test-heap-teardown.c
                               test/test-abandoned-lazy.c PROPERTIES LANGUAGE CXX )
 endif()
@@ -1147,14 +1147,14 @@ if (MI_BUILD_TESTS)
   enable_testing()
 
   # static link tests
-  set(mi_static_tests api api-fill stress-heaps stress-subprocs stress profile heap-mt heap-teardown heap-delete-race heap-churn heap-release-mt heap-aba heap-burst-destroy abandoned-lazy fork-user-heap snapshot purge-zero park-handoff forced-purge purge-behind-pass free-before-init tls-key-race)
+  set(mi_static_tests api api-fill stress-heaps stress-subprocs stress profile heap-mt heap-teardown heap-delete-race heap-churn heap-release-mt heap-aba heap-burst-destroy heap-new abandoned-lazy fork-user-heap snapshot purge-zero park-handoff forced-purge purge-behind-pass purge-age purge-resident park-again free-before-init tls-key-race)
   if(NOT (MI_DEBUG_TSAN OR (MI_TRACK STREQUAL "ASAN") OR MI_DEBUG_UBSAN))
     list(APPEND mi_static_tests thp-optout)  # counts madvise calls by interposing it, which a sanitizer runtime does first
     list(APPEND mi_static_tests huge-cycle)  # blocks above 1 GiB, which a debug build reads back byte by byte to check that they are zero: too slow under a sanitizer
   endif()
   if(MI_BUILD_STATIC AND NOT MI_DEBUG_TSAN)
     # these reach into internals that the shared library (which the TSAN build links the tests against) does not export
-    list(APPEND mi_static_tests theap-sentinel purge-holes purge-holes-large)
+    list(APPEND mi_static_tests theap-sentinel purge-holes purge-holes-large stats-merge)
   endif()
   if (MI_DEBUG)
     list(APPEND mi_static_tests commit-fail)  # uses mi_debug_fail_os_commit_after (MI_DEBUG>0 only)

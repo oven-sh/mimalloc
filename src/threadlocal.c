@@ -14,6 +14,7 @@ terms of the MIT license. A copy of the license can be found in the file
 #include "mimalloc.h"
 #include "mimalloc/internal.h"
 #include "mimalloc/prim.h"
+#include "mimalloc/prim-tls.h"  // _mi_theap_default
 
 /* -----------------------------------------------------------
   Each thread can have (a dynamically expanding) array of
@@ -238,7 +239,7 @@ void _mi_thread_locals_fork_child(void)   { mi_lock_init(&mi_thread_locals_lock)
 
 static mi_bitmap_t* mi_thread_locals_free;    // reuse an arena bitmap to track which slots were assigned (1=free, 0=in-use)
 static mi_memid_t   mi_thread_locals_memid;   // provenance of mi_thread_locals_free
-static size_t       mi_thread_locals_version; // version to be able to reuse slots safely
+static _Atomic(size_t) mi_thread_locals_version; // version to be able to reuse slots safely
 
 void _mi_thread_locals_init(void) {
   mi_lock_init(&mi_thread_locals_lock);
@@ -248,6 +249,7 @@ void _mi_thread_locals_done(void) {
   mi_lock(&mi_thread_locals_lock) {
     mi_bitmap_t* const slots = mi_thread_locals_free;
     if (slots!=NULL) {
+      mi_thread_locals_free = NULL;
       _mi_meta_free(_mi_subproc_main(), slots, mi_thread_locals_memid);
     }
   }
@@ -265,12 +267,33 @@ static bool mi_thread_local_claim_fun(size_t _slice_index, mi_arena_t* _arena, b
 
 // When we claim a free slot, we increase the global version counter
 // (so if we reuse a slot it will be returning NULL initially when a thread tries to get it)
-static mi_thread_local_t mi_thread_local_claim(void) {
+// Threads reserve versions in batches to avoid contention on the global counter.
+#if MI_SIZE_BITS >= 64
+#define MI_TLS_VERSION_BATCH  (64)
+#else
+#define MI_TLS_VERSION_BATCH  (1)    /* too few version bits to waste any */
+#endif
+
+static mi_thread_local_t mi_key_create_fresh(size_t idx, mi_tld_t* tld /* can be NULL */) {
+  size_t n;
+  if (tld==NULL) {
+    n = mi_atomic_increment_relaxed(&mi_thread_locals_version);
+  }
+  else {
+    if (tld->tls_version_count == 0) {
+      tld->tls_version_next  = mi_atomic_add_relaxed(&mi_thread_locals_version, (size_t)MI_TLS_VERSION_BATCH);
+      tld->tls_version_count = MI_TLS_VERSION_BATCH;
+    }
+    n = tld->tls_version_next++;
+    tld->tls_version_count--;
+  }
+  return mi_key_create( idx, 1 + (n % (MI_TLS_VERSION_MAX - 1)) );  /* wrap around the version */
+}
+
+static mi_thread_local_t mi_thread_local_claim(mi_tld_t* tld) {
   size_t idx = 0;
   if (mi_thread_locals_free != NULL && mi_bitmap_try_find_and_claim(mi_thread_locals_free,0,&idx,&mi_thread_local_claim_fun,NULL)) {
-    mi_thread_locals_version++;
-    if (mi_thread_locals_version >= MI_TLS_VERSION_MAX) { mi_thread_locals_version = 1; }  /* wrap around the version */
-    return mi_key_create( idx, mi_thread_locals_version);
+    return mi_key_create_fresh(idx,tld);
   }
   else {
     return 0;
@@ -303,14 +326,27 @@ static bool mi_thread_local_create_expand(void) {
 }
 
 
+// returns NULL if the thread is not initialized or is terminating
+static mi_tld_t* mi_thread_local_tld(void) {
+  mi_theap_t* const theap = _mi_theap_default();
+  return (mi_theap_is_initialized(theap) && !theap->is_detached ? theap->tld : NULL);
+}
+
 // create a fresh key
 mi_thread_local_t _mi_thread_local_create(void) {
   mi_thread_local_t key = 0;
+  // reuse the index of the last freed key?
+  mi_tld_t* const tld = mi_thread_local_tld();
+  if (tld!=NULL && tld->tls_idx_kept != 0) {
+    const size_t idx = tld->tls_idx_kept - 1;
+    tld->tls_idx_kept = 0;
+    return mi_key_create_fresh(idx,tld);
+  }
   mi_lock(&mi_thread_locals_lock) {
-    key = mi_thread_local_claim();
+    key = mi_thread_local_claim(tld);
     if (key==0) {
       if (mi_thread_local_create_expand()) {
-        key = mi_thread_local_claim();
+        key = mi_thread_local_claim(tld);
       }
     }
   }
@@ -319,15 +355,32 @@ mi_thread_local_t _mi_thread_local_create(void) {
   return key;
 }
 
-// free a key
-void _mi_thread_local_free(mi_thread_local_t key) {
-  if (key==0) return;
-  const size_t idx = mi_key_index(key);
+static void mi_thread_local_free_index(size_t idx) {
   mi_lock(&mi_thread_locals_lock) {
     mi_bitmap_t* const slots = mi_thread_locals_free;
     if (slots!=NULL && idx < mi_bitmap_max_bits(slots)) {
       mi_bitmap_set(slots,idx);
     }
+  }
+}
+
+// Free a key. Each thread keeps the last freed index for its next key to stay off the global lock
+// (the index is released in `_mi_thread_local_tld_done`).
+void _mi_thread_local_free(mi_thread_local_t key) {
+  if (key==0 || key==mi_thread_local_key_fast) return;  // the fast key has no index of its own
+  const size_t idx = mi_key_index(key);
+  mi_tld_t* const tld = mi_thread_local_tld();
+  if (tld!=NULL && tld->tls_idx_kept == 0) {
+    tld->tls_idx_kept = idx + 1;
+    return;
+  }
+  mi_thread_local_free_index(idx);
+}
+
+void _mi_thread_local_tld_done(mi_tld_t* tld) {
+  if (tld->tls_idx_kept != 0) {
+    mi_thread_local_free_index(tld->tls_idx_kept - 1);
+    tld->tls_idx_kept = 0;
   }
 }
 
