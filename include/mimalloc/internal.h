@@ -1066,7 +1066,7 @@ static inline bool mi_page_all_free(const mi_page_t* page) {
 
 void          _mi_page_purge_holes(mi_page_t* page, mi_tld_t* tld);   // `tld`: the thread whose sweep this is (see `_mi_page_purge_holes_begin`)
 void          _mi_page_purged_reset(mi_page_t* page);
-bool          _mi_page_unpurge_run(mi_page_t* page);
+bool          _mi_page_unpurge_run(mi_page_t* page, size_t max_size);
 void          _mi_page_unpurge_all(mi_page_t* page);
 size_t        _mi_page_purged_count(const mi_page_t* page);
 void          _mi_page_unpurge_unformed_upto(mi_page_t* page, uintptr_t end);   // hand the discarded unformed tail back below `end` (an absolute address)

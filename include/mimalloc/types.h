@@ -663,7 +663,7 @@ struct mi_theap_s {
   bool                  allow_page_reclaim;                  // `true` if this theap can reclaim abandoned pages
   bool                  allow_page_abandon;                  // `true` if this theap can abandon pages to reduce memory footprint
   bool                  is_detached;                         // `true` if `tld->thread_id == MI_THREADID_DETACHED`
-  bool                  purged_search_short;                 // `true` if the last search past pages with only purged blocks found no resident blocks (see `page.c`)
+  uint8_t               purged_search_fails;                 // how many searches in a row found no resident block and took purged ones (see `page.c`)
 
   // sampling
   size_t                sample_countdown;                    // sample countdown in requested bytes (don't change the field order; see `internal.h:_mi_theap_get_free_small_page`)

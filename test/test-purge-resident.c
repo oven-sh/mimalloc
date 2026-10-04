@@ -7,9 +7,9 @@ terms of the MIT license. A copy of the license can be found in the file
 
 // An allocation takes a resident free block before one that an idle sweep purged.
 //
-// The heap is fragmented and swept. One block in 8 is live, so half of the OS pages are purged and the other half
-// has resident free blocks, in every page. Then each "request" allocates some blocks and frees them again: there
-// are more than enough resident blocks for that.
+// The heap is fragmented and swept, so every page has purged blocks. Then each "request" allocates some blocks and
+// frees them again. The first ones may have to take purged blocks (how many are left resident depends on the block
+// size and the build); after that there are enough resident blocks around, and the requests are to find those.
 
 #include "mimalloc.h"
 #include <stdbool.h>
@@ -66,12 +66,20 @@ int main(void) {
     return 0;
   }
 
-  const size_t reused0 = reused();
+  size_t taken[REQUESTS];
+  fprintf(stderr, "  purged runs that each request took back:");
   for (int i = 0; i < REQUESTS; i++) {
+    const size_t reused0 = reused();
     do_request();
+    taken[i] = reused() - reused0;
+    fprintf(stderr, " %zu", taken[i]);
   }
-  fprintf(stderr, "  purged runs that were taken back: %zu\n", reused() - reused0);
-  check("the requests take resident blocks", reused() - reused0 <= REQUESTS / 4);
+  fprintf(stderr, "\n");
+  size_t late = 0;
+  for (int i = REQUESTS / 2; i < REQUESTS; i++) {
+    late += taken[i];
+  }
+  check("the requests find the resident blocks", late == 0);
 
   // the live blocks are as they were
   bool intact = true;
