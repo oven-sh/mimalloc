@@ -1689,6 +1689,9 @@ void _mi_arenas_free(mi_subproc_t* subproc, void* p, size_t size, mi_memid_t mem
 
 // Purge the arenas; if `force_purge` is true, amenable parts are purged even if not yet expired
 void _mi_arenas_collect(bool force_purge, bool visit_all, mi_tld_t* tld) {
+  // leave what is expired to the scavenger (which only serves the main subprocess)
+  if (!force_purge && _mi_scavenger_is_running() && _mi_subproc_is_main(tld->subproc)) return;
+
   // A forced purge is `mi_collect(true)`, and whoever asks for that reads the footprint next. Only one thread purges at
   // a time, and the pass that holds the guard does not stand in for ours: the scavenger's is never forced, so it leaves
   // every arena whose delay has not passed, and what was freed behind it is for its next pass. So take our turn
