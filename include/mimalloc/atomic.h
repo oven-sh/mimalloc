@@ -383,6 +383,7 @@ static inline bool mi_atomic_casi64_strong_acq_rel(volatile _Atomic(int64_t)* p,
 
 #define mi_atomic_loadi64_acquire(p)    mi_atomic(loadi64_explicit)(p,mi_memory_order(acquire))
 #define mi_atomic_loadi64_seq_cst(p)    mi_atomic(loadi64_explicit)(p,mi_memory_order(seq_cst))
+#define mi_atomic_casi64_strong_seq_cst(p,e,d)  mi_atomic_casi64_strong_acq_rel(p,e,d)   // (an interlocked operation is a full barrier)
 #define mi_atomic_loadi64_relaxed(p)    mi_atomic(loadi64_explicit)(p,mi_memory_order(relaxed))
 #define mi_atomic_storei64_release(p,x) mi_atomic(storei64_explicit)(p,x,mi_memory_order(release))
 #define mi_atomic_storei64_relaxed(p,x) mi_atomic(storei64_explicit)(p,x,mi_memory_order(relaxed))

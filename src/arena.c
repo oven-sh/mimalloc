@@ -2682,7 +2682,7 @@ static int mi_arena_try_purge(mi_arena_t* arena, mi_msecs_t now, bool force, boo
   _mi_bitmap_forall_setc_ranges(arena->slices_purge_young, &mi_arena_purge_young_visitor, arena, NULL);
   if (vinfo.any_kept) {
     mi_msecs_t expire0 = 0;
-    mi_atomic_casi64_strong_acq_rel(&arena->purge_expire, &expire0, now + interval);
+    mi_atomic_casi64_strong_acq_rel(&arena->purge_expire, &expire0, _mi_clock_now() + interval);  // (`now` is from before the pass)
   }
   return (vinfo.any_purged ? 1 : -1);
 }

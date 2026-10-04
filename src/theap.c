@@ -433,7 +433,7 @@ mi_msecs_t _mi_theap_sweep_parked(mi_subproc_t* subproc) {
         // that run. (Its fields are read once it is claimed: its owner writes them when it sweeps itself.)
         const bool done = (mi_atomic_load_seq_cst(&tld->park_swept) == MI_PARK_SWEPT_DONE);
         // Other threads can free the blocks of a thread that stays parked, so sweep it again every now and then.
-        const bool again = (done && now - tld->holes_sweep_last >= MI_PARK_SWEEP_AGAIN_MSECS);
+        const bool again = (done && now - tld->holes_sweep_last >= (interval > MI_PARK_SWEEP_AGAIN_MSECS ? interval : MI_PARK_SWEEP_AGAIN_MSECS));
         if (done && !again && (mi_atomic_load_relaxed(&tld->holes_floor_kept) == 0 || mi_atomic_load_relaxed(&tld->park_reclaim) != 0)) continue;   // (most: nothing kept. Or its owner is on the way out)
         if (!done && interval > 0 && tld->holes_sweep_last != 0 && now - tld->holes_sweep_last < interval) {
           if (mi_atomic_load_relaxed(&tld->park_state) == MI_PARK_PARKED) {
