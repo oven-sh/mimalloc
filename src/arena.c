@@ -875,7 +875,7 @@ mi_decl_maybe_unused static size_t mi_page_block_start(size_t block_size, bool o
     offset = MI_PAGE_ALIGN;
   }
   else if (_mi_is_power_of_two(block_size) && block_size <= MI_PAGE_MAX_START_BLOCK_ALIGN2) {
-    // naturally align power-of-2 blocks up to MI_PAGE_MAX_START_BLOCK_ALIGN2 size (4KiB)
+    // naturally align power-of-2 blocks up to MI_PAGE_MAX_START_BLOCK_ALIGN2 size
     offset = _mi_align_up(mi_page_info_size(), block_size);
     if (block_size < 64) { offset += 3*block_size; }
   }
