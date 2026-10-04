@@ -48,23 +48,7 @@ static mi_decl_noinline mi_decl_restrict void* mi_theap_malloc_guarded_aligned(m
   return p;
 }
 #endif
-#if MI_GUARDED
-static void* mi_theap_malloc_zero_no_guarded(mi_theap_t* theap, size_t size, bool zero, mi_page_t** ppage) {
-  // #if MI_THEAP_INITASNULL
-  // if mi_unlikely(theap==NULL) { theap = _mi_theap_empty_get(); }
-  // #endif
-  // const size_t rate = theap->guarded_sample_rate;
-  // only write if `rate!=0` so we don't write to the constant `_mi_theap_empty`
-  // if (rate != 0) { theap->guarded_sample_rate = 0; }
-  void* p = _mi_theap_malloc_zero(theap, size, zero, 0, ppage);
-  // if (rate != 0) { theap->guarded_sample_rate = rate; }
-  return p;
-}
-#else
-static void* mi_theap_malloc_zero_no_guarded(mi_theap_t* theap, size_t size, bool zero, mi_page_t** ppage) {
-  return _mi_theap_malloc_zero(theap, size, zero, 0, ppage);
-}
-#endif
+
 
 // A plain allocation for the naturally aligned path below. It has checked that no sample is due and relies on getting
 // the start of a block; a sample can still come due inside the allocation (a page refill with coarse sampling, a
@@ -77,7 +61,7 @@ static void* mi_theap_malloc_zero_block_start(mi_theap_t* theap, size_t size, bo
   mi_track_malloc(p, size, zero);
   return p;
   #else
-  return mi_theap_malloc_zero_no_guarded(theap, size, zero, ppage);
+  return _mi_theap_malloc_zero(theap, size, zero, 0, ppage);
   #endif
 }
 
@@ -109,7 +93,7 @@ static mi_decl_noinline void* mi_theap_malloc_zero_aligned_at_overalloc(mi_theap
     mi_assert_internal(size <= (MI_MAX_ALLOC_SIZE - MI_PADDING_SIZE) && alignment <= MI_PAGE_MAX_OVERALLOC_ALIGN);
     mi_assert_internal(size < SIZE_MAX - alignment); // `oversize` cannot overflow
     oversize = (size < MI_MAX_ALIGN_SIZE ? MI_MAX_ALIGN_SIZE : size) + alignment - 1;  // adjust for size <= 16; with size 0 and alignment 64k, we would allocate a 64k block and pointing just beyond that.
-    p = mi_theap_malloc_zero_no_guarded(theap, oversize, zero, &page);
+    p = _mi_theap_malloc_zero(theap, oversize, zero, 0, &page);
     if (p == NULL) return NULL;
   }
   mi_assert_internal(page == _mi_ptr_page(p));
@@ -249,7 +233,7 @@ static inline void* mi_theap_malloc_zero_aligned_at(mi_theap_t* const theap, con
           if mi_likely(is_aligned)
           {
             if (ppage!=NULL) { *ppage = page; }
-            void* p = _mi_page_malloc_zero(theap, page, padsize, zero);
+            void* p = _mi_page_malloc_zero(theap, page, padsize, zero); // theap!=NULL
             mi_assert_internal(p != NULL);
             mi_assert_internal(((uintptr_t)p + offset) % alignment == 0);
             mi_track_malloc(p, size, zero);
