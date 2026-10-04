@@ -182,6 +182,10 @@ static void test_free_into_visited_arena(int count) {
     if (heap != NULL) { mi_heap_delete(heap); }
     return;
   }
+  // allocate the (lazy) statistics of the heap now, or a free below does and takes a slice that we count on
+  mi_stats_t_decl(heap_stats);
+  mi_heap_stats_get(heap, &heap_stats);
+
   void* const late = mi_malloc(BLOCK_SIZE);
   if (late == NULL || !alloc_blocks(mains, count)) {
     check("out of memory", false);

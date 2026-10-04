@@ -19,6 +19,7 @@ int main(void) {
 #include <mimalloc.h>
 #include <mimalloc-stats.h>
 #include <pthread.h>
+#include <sched.h>
 #include <stdatomic.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -221,7 +222,11 @@ static void test_visit_heaps(void) {
 // --- a reused thread-local key must not find the theap of the previous heap
 
 #define USERS 4
+#if defined(MI_TEST_LIGHT)
+#define ROUNDS 200
+#else
 #define ROUNDS 2000
+#endif
 
 static _Atomic(mi_heap_t*) shared_heap;
 static _Atomic(int) shared_round;
@@ -238,7 +243,7 @@ static void alloc_and_check_heap(mi_heap_t* heap) {
 static void* use_shared_heap(void* arg) {
   (void)arg;
   for (int round = 1; round <= ROUNDS; round++) {
-    while (atomic_load(&shared_round) != round) { }
+    while (atomic_load(&shared_round) != round) { sched_yield(); }
     alloc_and_check_heap(atomic_load(&shared_heap));
     atomic_fetch_add(&users_done, 1);
   }
@@ -257,7 +262,7 @@ static void test_key_reuse(void) {
     atomic_store(&users_done, 0);
     atomic_store(&shared_heap, heap);
     atomic_store(&shared_round, round);
-    while (atomic_load(&users_done) != USERS) { }
+    while (atomic_load(&users_done) != USERS) { sched_yield(); }
     mi_heap_destroy(heap);
   }
   for (int i = 0; i < USERS; i++) {
@@ -299,7 +304,7 @@ static void* hold_heaps(void* arg) {
   }
   // make sure the theaps of all threads are live at the same time
   atomic_fetch_add(&holders_ready, 1);
-  while (atomic_load(&holders_ready) != HOLDERS) { }
+  while (atomic_load(&holders_ready) != HOLDERS) { sched_yield(); }
   for (int i = 0; i < HEAPS_PER_HOLDER; i++) {
     mi_heap_destroy(heaps[i]);
   }
