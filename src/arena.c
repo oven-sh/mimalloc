@@ -656,7 +656,7 @@ static bool mi_arena_try_claim_abandoned(size_t slice_index, mi_arena_t* arena, 
 static mi_arena_pages_t* mi_arena_pages_alloc(mi_arena_t* arena);
 
 static bool mi_arena_slice_is_purgeable(mi_arena_t* arena, size_t slice_index) {
-  return (mi_bitmap_is_set(arena->slices_purge[0], slice_index) || mi_bitmap_is_set(arena->slices_purge[1], slice_index));
+  return mi_bitmap_is_set(arena->slices_purge, slice_index);
 }
 
 static mi_arena_pages_t* mi_heap_arena_pages(mi_heap_t* heap, mi_arena_t* arena) {
@@ -867,7 +867,8 @@ mi_decl_maybe_unused static size_t mi_page_block_start(size_t block_size, bool o
   const size_t os_page_size = _mi_os_page_size();
   mi_assert_internal(MI_PAGE_ALIGN >= os_page_size);
   if (!os_align && block_size % os_page_size == 0 && block_size > os_page_size /* at least 2 or more */ ) {
-    offset = _mi_align_up(mi_page_info_size(), os_page_size);
+    const bool natural = (_mi_is_power_of_two(block_size) && block_size <= MI_PAGE_MAX_START_BLOCK_ALIGN2);
+    offset = _mi_align_up(mi_page_info_size(), (natural ? block_size : os_page_size));
   }
   else
   #endif
@@ -2013,8 +2014,8 @@ static mi_arena_t* mi_arena_initialize(mi_subproc_t* subproc, void* start,
   arena->slices_free = mi_arena_bbitmap_init(subproc, slice_count, &base);
   arena->slices_committed = mi_arena_bitmap_init(slice_count, &base);
   arena->slices_dirty = mi_arena_bitmap_init(slice_count, &base);
-  arena->slices_purge[0] = mi_arena_bitmap_init(slice_count, &base);
-  arena->slices_purge[1] = mi_arena_bitmap_init(slice_count, &base);
+  arena->slices_purge = mi_arena_bitmap_init(slice_count, &base);
+  arena->slices_purge_young = mi_arena_bitmap_init(slice_count, &base);
   arena->pages_main.pages = mi_arena_bitmap_init(slice_count, &base);
   for (size_t i = 0; i < MI_ARENA_BIN_COUNT; i++) {
     mi_atomic_store_ptr_relaxed(mi_bitmap_t, &arena->pages_main.pages_abandoned[i], NULL);  // allocated on first abandon
@@ -2589,8 +2590,9 @@ static void mi_arena_schedule_purge(mi_arena_t* arena, size_t slice_index, size_
   mi_assert_internal(delay > 0);
   // Set the bits before looking at the expiration: a pass resets the expiration before it scans
   // the bits, so either it sees our bits or we see the reset and schedule the next pass.
-  mi_bitmap_setN(arena->slices_purge[mi_atomic_load_acquire(&arena->purge_gen) & 1], slice_index, slice_count, NULL);
-  if (mi_atomic_loadi64_acquire(&arena->purge_expire) != 0) return;  // already scheduled
+  mi_bitmap_setN(arena->slices_purge_young, slice_index, slice_count, NULL);  // first: a pass that sees the purge bit sees this too
+  mi_bitmap_setN(arena->slices_purge, slice_index, slice_count, NULL);
+  if (mi_atomic_loadi64_seq_cst(&arena->purge_expire) != 0) return;  // already scheduled
 
   const mi_msecs_t expire = _mi_clock_now() + mi_arena_purge_interval(delay);
   mi_msecs_t expire0 = 0;
@@ -2603,16 +2605,14 @@ static void mi_arena_schedule_purge(mi_arena_t* arena, size_t slice_index, size_
 }
 
 typedef struct mi_purge_visit_info_s {
-  mi_bitmap_t* young;   // skip slices that are set in here (can be NULL)
+  bool keep_young;    // leave the slices that were freed since the last pass
+  bool keep_whole;    // and the range they are in (there is a minimal purge size)
+  bool any_kept;
   bool any_purged;
 } mi_purge_visit_info_t;
 
-static bool mi_arena_try_purge_range(mi_arena_t* arena, size_t slice_index, size_t slice_count, mi_bitmap_t* young) {
+static bool mi_arena_try_purge_range(mi_arena_t* arena, size_t slice_index, size_t slice_count) {
   mi_assert(slice_count < MI_BCHUNK_BITS);
-  if (young != NULL && !mi_bitmap_is_clearN(young, slice_index, slice_count)) {
-    // freed again since the last pass
-    return false;
-  }
   if (mi_bbitmap_try_clearNC(arena->slices_free, slice_index, slice_count)) {
     // purge
     bool decommitted = mi_arena_purge(arena, slice_index, slice_count); MI_UNUSED(decommitted);
@@ -2629,11 +2629,16 @@ static bool mi_arena_try_purge_range(mi_arena_t* arena, size_t slice_index, size
 
 static bool mi_arena_try_purge_visitor(size_t slice_index, size_t slice_count, mi_arena_t* arena, void* arg) {
   mi_purge_visit_info_t* vinfo = (mi_purge_visit_info_t*)arg;
-  if (mi_arena_try_purge_range(arena, slice_index, slice_count, vinfo->young)) {
+  const bool young = (vinfo->keep_young && !mi_bitmap_is_clearN(arena->slices_purge_young, slice_index, slice_count));
+  if (young && (slice_count == 1 || vinfo->keep_whole)) {
+    mi_bitmap_setN(arena->slices_purge, slice_index, slice_count, NULL);  // for the next pass
+    vinfo->any_kept = true;
+  }
+  else if (!young && mi_arena_try_purge_range(arena, slice_index, slice_count)) {
     vinfo->any_purged = true;
   }
   else if (slice_count > 1) {
-    // failed to claim the full range: try each half
+    // partly young, or failed to claim the full range: try each half
     const size_t half = slice_count / 2;
     mi_arena_try_purge_visitor(slice_index, half, arena, arg);
     mi_arena_try_purge_visitor(slice_index + half, slice_count - half, arena, arg);
@@ -2641,52 +2646,48 @@ static bool mi_arena_try_purge_visitor(size_t slice_index, size_t slice_count, m
   return true; // continue
 }
 
+static bool mi_arena_purge_young_visitor(size_t slice_index, size_t slice_count, mi_arena_t* arena, void* arg) {
+  MI_UNUSED(slice_index); MI_UNUSED(slice_count); MI_UNUSED(arena); MI_UNUSED(arg);
+  return true;
+}
+
 // returns -1 if nothing was purged, 0 if the arena is not expired yet, and 1 if something was purged
-static int mi_arena_try_purge(mi_arena_t* arena, mi_msecs_t now, bool force)
+// `visit_all`: also look at an arena where nothing is scheduled
+static int mi_arena_try_purge(mi_arena_t* arena, mi_msecs_t now, bool force, bool visit_all)
 {
   // check pre-conditions
   if (arena->memid.is_pinned) return -1;
 
   // expired yet?
   mi_msecs_t expire = mi_atomic_loadi64_relaxed(&arena->purge_expire);
-  if (expire==0) return -1;
+  if (expire==0 && (!visit_all || mi_bitmap_is_all_clear(arena->slices_purge))) return -1;
   if (!force && expire > now) return 0;
 
   // reset expire (with an RMW so it is ordered before the scan of the bits, see `mi_arena_schedule_purge`)
-  while (!mi_atomic_casi64_strong_acq_rel(&arena->purge_expire, &expire, (mi_msecs_t)0)) { }
+  while (!mi_atomic_casi64_strong_seq_cst(&arena->purge_expire, &expire, (mi_msecs_t)0)) { }
   mi_subproc_stat_counter_increase(arena->subproc, arena_purges, 1);
 
-  const size_t gen = mi_atomic_load_relaxed(&arena->purge_gen);  // only a pass changes it (under the purge guard)
-  mi_bitmap_t* const young = arena->slices_purge[gen & 1];
-  mi_bitmap_t* const old   = arena->slices_purge[(gen + 1) & 1];
+  // A pass that is an interval late (there is no scavenger) comes for everything: another one may never come.
+  const mi_msecs_t interval = mi_arena_purge_interval(mi_arena_purge_delay());
+  const bool late = (expire != 0 && now - expire >= interval);
 
   // we purge by at least `minslices` to not fragment transparent huge pages for example
   const size_t minslices = mi_slice_count_of_size(_mi_os_minimal_purge_size());
 
-  // purge the old generation (this also clears the bits atomically, with max MI_BFIELD_BITS ranges at a time)
-  mi_purge_visit_info_t vinfo = { young, false };
-  _mi_bitmap_forall_setc_rangesn(old, minslices, &mi_arena_try_purge_visitor, arena, &vinfo);
+  // go through all purge bits (this also clears them atomically, with max MI_BFIELD_BITS ranges at a time)
+  mi_purge_visit_info_t vinfo = { !force && !late, minslices > 1, false, false };
+  _mi_bitmap_forall_setc_rangesn(arena->slices_purge, minslices, &mi_arena_try_purge_visitor, arena, &vinfo);
 
-  // and the young generation becomes the old one
-  mi_atomic_store_release(&arena->purge_gen, gen + 1);
-  if (force) {
-    vinfo.young = NULL;
-    _mi_bitmap_forall_setc_rangesn(young, minslices, &mi_arena_try_purge_visitor, arena, &vinfo);
-  }
-  else if (!mi_bitmap_is_all_clear(young)) {
-    // schedule the pass that purges it
+  // what is young now is old in the next pass
+  _mi_bitmap_forall_setc_ranges(arena->slices_purge_young, &mi_arena_purge_young_visitor, arena, NULL);
+  if (vinfo.any_kept) {
     mi_msecs_t expire0 = 0;
-    mi_atomic_casi64_strong_acq_rel(&arena->purge_expire, &expire0, now + mi_arena_purge_interval(mi_arena_purge_delay()));
+    mi_atomic_casi64_strong_acq_rel(&arena->purge_expire, &expire0, now + interval);
   }
   return (vinfo.any_purged ? 1 : -1);
 }
 
 
-// The calling thread just went idle. `purge_delay` exists to avoid churning the OS while a
-// thread is actively allocating -- idle voids that premise -- so pull every scheduled arena
-// purge forward to `now` and wake the scavenger, which does the madvise off-thread. Arena
-// slices sit in no page and are owned by no thread, so this is the scavenger's job; only the
-// theap collect and the hole sweep have to run on the owner.
 static void mi_subproc_schedule_purge(mi_subproc_t* subproc, mi_msecs_t expire);
 
 
@@ -2761,7 +2762,7 @@ bool _mi_arenas_try_purge(bool force, bool visit_all, mi_subproc_t* subproc, siz
       if (i >= max_arena) { i -= max_arena; }
       mi_arena_t* arena = mi_arena_from_index(subproc,i);
       if (arena != NULL) {
-        const int purged = mi_arena_try_purge(arena, now, force);
+        const int purged = mi_arena_try_purge(arena, now, force, visit_all);
         // Its expire is set if it is not yet due, or if a free came in behind the pass over it. Read it with a CAS
         // (0 -> 0), not a load: that orders us with the CAS in `mi_arena_schedule_purge`, so either we see the expire
         // that a free sets, or that free sees our reset above. With a load both can miss (store buffering).

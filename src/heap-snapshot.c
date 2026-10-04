@@ -100,21 +100,16 @@ static void mi_snap_u64(mi_snap_out_t* o, uint64_t v) { mi_snap_put(o, &v, 8); }
 // ---------------------------------------------------------------------------
 
 // emits the union with `chunks2` if that is not NULL
-static void mi_snap_emit_bitmap2(mi_snap_out_t* out, const mi_bchunk_t* chunks, const mi_bchunk_t* chunks2, size_t chunk_count) {
+static void mi_snap_emit_bitmap(mi_snap_out_t* out, const mi_bchunk_t* chunks, size_t chunk_count) {
   mi_snap_u32(out, (uint32_t)chunk_count);
   mi_snap_u32(out, (uint32_t)MI_BCHUNK_SIZE);
   for (size_t i = 0; i < chunk_count; i++) {
     mi_bfield_t fields[MI_BCHUNK_FIELDS];   // the bitmaps are live: read them a word at a time
     for (size_t j = 0; j < MI_BCHUNK_FIELDS; j++) {
       fields[j] = mi_atomic_load_relaxed(&((mi_bchunk_t*)chunks)[i].bfields[j]);
-      if (chunks2 != NULL) { fields[j] |= mi_atomic_load_relaxed(&((mi_bchunk_t*)chunks2)[i].bfields[j]); }
     }
     mi_snap_put(out, fields, sizeof(fields));
   }
-}
-
-static void mi_snap_emit_bitmap(mi_snap_out_t* out, const mi_bchunk_t* chunks, size_t chunk_count) {
-  mi_snap_emit_bitmap2(out, chunks, NULL, chunk_count);
 }
 
 static void mi_snap_emit_mi_bitmap(mi_snap_out_t* out, mi_bitmap_t* bm) {
@@ -274,7 +269,7 @@ static void mi_snap_emit_arena_header(mi_snap_out_t* out, mi_arena_t* arena, siz
   mi_snap_u8 (out, 0); mi_snap_u8(out, 0);
   mi_snap_emit_mi_bitmap (out, arena->slices_committed);
   mi_snap_emit_mi_bbitmap(out, arena->slices_free);
-  mi_snap_emit_bitmap2(out, arena->slices_purge[0]->chunks, arena->slices_purge[1]->chunks, mi_bitmap_chunk_count(arena->slices_purge[0]));
+  mi_snap_emit_mi_bitmap (out, arena->slices_purge);
 }
 
 static void mi_snap_walk_arena_pages(mi_snap_ctx_t* ctx, mi_arena_t* arena, int32_t arena_idx) {
