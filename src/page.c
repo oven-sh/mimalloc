@@ -2405,7 +2405,7 @@ static mi_decl_noinline mi_page_t* mi_page_queue_find_free_ex(mi_theap_t* theap,
   long candidate_limit = 0;          // we reset this on the first candidate to limit the search
   long page_full_retain = (pq->block_size > MI_SMALL_MAX_OBJ_SIZE ? 0 : theap->page_full_retain); // only retain small pages
   mi_page_t* page_candidate = NULL;  // a page with free space
-  mi_page_t* page_purged = NULL;     // a page where all free blocks are purged
+  mi_page_t* page_purged = NULL;     // a page where all (formatted) free blocks are purged
   size_t purged_count = 0;
   const bool can_unpurge = !_mi_page_purge_holes_in_progress();
   mi_page_t* page = pq->first;
@@ -2428,8 +2428,8 @@ static mi_decl_noinline mi_page_t* mi_page_queue_find_free_ex(mi_theap_t* theap,
       immediate_available = mi_page_immediate_available(page);
     }
 
-    if (!immediate_available && !mi_page_is_expandable(page) && can_unpurge && mi_page_has_purged(page)) {
-      // only purged blocks are left: use this page only if there is no page with resident blocks
+    if (!immediate_available && can_unpurge && mi_page_has_purged(page)) {
+      // no resident blocks are left: use this page only if there is no page that has them
       if (page_purged == NULL) { page_purged = page; }
       candidate_limit++;  // not a candidate
       if (page!=last && pq->last!=page) {
