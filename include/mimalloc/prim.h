@@ -28,6 +28,7 @@ typedef struct mi_os_mem_config_s {
   size_t  alloc_granularity;      // smallest allocation size (usually 4KiB, on Windows 64KiB)
   size_t  physical_memory_in_kib; // physical memory size in KiB
   size_t  virtual_address_bits;   // usually 48 or 56 bits on 64-bit systems. (used to determine secure randomization)
+  size_t  virtual_address_limit;  // address space the process may reserve in total (RLIMIT_AS), or 0 if unlimited
   bool    has_overcommit;         // can we reserve more memory than can be actually committed?
   bool    has_partial_free;       // can allocated blocks be freed partially? (true for mmap, false for VirtualAlloc)
   bool    has_virtual_reserve;    // supports virtual address space reservation? (if true we can reserve virtual address space without using commit or physical memory)

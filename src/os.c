@@ -27,6 +27,7 @@ static mi_os_mem_config_t mi_os_mem_config = {
   4096,     // allocation granularity
   MI_DEFAULT_PHYSICAL_MEMORY_IN_KIB,
   MI_MAX_VABITS, // in `bits.h`
+  0,        // virtual address limit (0: unlimited)
   true,     // has overcommit?  (if true we use MAP_NORESERVE on mmap systems)
   false,    // can we partially free allocated blocks? (on mmap systems we can free anywhere in a mapped range, but on Windows we must free the entire span)
   true,     // has virtual reserve? (if true we can reserve virtual address space without using commit or physical memory)
@@ -44,6 +45,12 @@ bool _mi_os_has_virtual_reserve(void) {
 bool _mi_os_canuse_thp(void) {
   return mi_os_mem_config.has_transparent_huge_pages;
 }
+
+// total address space the process may reserve (RLIMIT_AS), or 0 if unlimited
+size_t _mi_os_virtual_address_limit(void) {
+  return mi_os_mem_config.virtual_address_limit;
+}
+
 
 // OS (small) page size
 size_t _mi_os_page_size(void) {
