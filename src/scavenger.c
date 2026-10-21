@@ -123,8 +123,30 @@ static void mi_scav_wait(_Atomic(uint32_t)* addr, mi_msecs_t timeout_ms) {
   }
 }
 
-static void mi_scav_wake_one(_Atomic(uint32_t)* addr) {
+// `ExitProcess` terminates every other thread, and only then the exiting thread runs the FLS callbacks, the DLL
+// detach routines and the TLS callbacks. What frees memory in those (thread local destructors of the host,
+// `mi_process_done`) gets here with the scavenger gone. Its wait block is still queued in ntdll, on its stack, and
+// a wake reads it: an access violation where the stack of a thread goes away with the thread (under Intel SDE).
+// So no wake once ntdll says that the process is shutting down. It sets that in `LdrShutdownProcess`, after the
+// other threads are terminated and before the first of those callbacks.
+typedef BOOLEAN (NTAPI *mi_rtl_dll_shutdown_in_progress_t)(void);
+static _Atomic(uintptr_t) mi_scav_shutdown_in_progress;   // `RtlDllShutdownInProgress` (0 if ntdll has none, and until `mi_scav_init`)
+
+// (not inlined: the callers stay as they are but for the call)
+static mi_decl_noinline void mi_scav_wake_one(_Atomic(uint32_t)* addr) {
+  const mi_rtl_dll_shutdown_in_progress_t shutdown_in_progress =
+    (mi_rtl_dll_shutdown_in_progress_t)mi_atomic_load_relaxed(&mi_scav_shutdown_in_progress);
+  if (shutdown_in_progress != NULL && shutdown_in_progress()) return;
   WakeByAddressSingle((PVOID)addr);
+}
+
+// Called by the scavenger before its first wait: there is no wait block of it before that.
+#define MI_SCAV_HAS_INIT  1
+static void mi_scav_init(void) {
+  const HMODULE ntdll = GetModuleHandleA("ntdll.dll");
+  if (ntdll != NULL) {
+    mi_atomic_store_release(&mi_scav_shutdown_in_progress, (uintptr_t)GetProcAddress(ntdll, "RtlDllShutdownInProgress"));
+  }
 }
 
 #else  // generic POSIX (FreeBSD, OpenBSD, etc.)
@@ -293,6 +315,7 @@ static HANDLE _mi_scavenger_thread;
 
 static DWORD WINAPI mi_scavenger_thread_main(LPVOID arg) {
   MI_UNUSED(arg);
+  mi_scav_init();
   // SetThreadDescription is Windows 10 1607+ and absent from older SDK import
   // libraries, so resolve it at runtime; naming the thread is best-effort.
   typedef HRESULT (WINAPI *mi_set_thread_description_t)(HANDLE, PCWSTR);

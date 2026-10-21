@@ -1165,7 +1165,7 @@ if (MI_BUILD_TESTS)
   enable_testing()
 
   # static link tests
-  set(mi_static_tests api api-fill stress-heaps stress-subprocs stress profile heap-mt heap-teardown heap-delete-race heap-churn heap-release-mt heap-aba heap-burst-destroy heap-new abandoned-lazy fork-user-heap snapshot purge-zero park-handoff forced-purge purge-behind-pass purge-age purge-resident park-again free-before-init tls-key-race thread-first-call)
+  set(mi_static_tests api api-fill stress-heaps stress-subprocs stress profile heap-mt heap-teardown heap-delete-race heap-churn heap-release-mt heap-aba heap-burst-destroy heap-new abandoned-lazy fork-user-heap snapshot purge-zero park-handoff forced-purge purge-behind-pass purge-age purge-resident park-again free-before-init tls-key-race thread-first-call exit-wake)
   if(NOT (MI_DEBUG_TSAN OR (MI_TRACK STREQUAL "ASAN") OR MI_DEBUG_UBSAN))
     list(APPEND mi_static_tests thp-optout)  # counts madvise calls by interposing it, which a sanitizer runtime does first
     list(APPEND mi_static_tests huge-cycle)  # blocks above 1 GiB, which a debug build reads back byte by byte to check that they are zero: too slow under a sanitizer
@@ -1229,6 +1229,12 @@ if (MI_BUILD_TESTS)
   add_test(NAME test-heap-release-mt-no-scavenger COMMAND ${CMAKE_COMMAND} -E env MIMALLOC_SCAVENGER=0 $<TARGET_FILE:mimalloc-test-heap-release-mt>)
   # and sweep every park, so the reclaim path is hit as hard as possible
   add_test(NAME test-park-handoff-eager COMMAND ${CMAKE_COMMAND} -E env MIMALLOC_PURGE_HOLES_MIN_INTERVAL=0 $<TARGET_FILE:mimalloc-test-park-handoff>)
+
+  # the other wakes of the scavenger at process exit (a process each: the first wake is the one that matters), the same
+  # with the stack of the scavenger gone, and the wakes of a process that lives
+  foreach(EXIT_WAKE_CASE park stop gone live)
+    add_test(NAME test-exit-wake-${EXIT_WAKE_CASE} COMMAND mimalloc-test-exit-wake ${EXIT_WAKE_CASE})
+  endforeach()
 
   # The allocator must never touch one of its own `__thread` variables from inside an allocation:
   # where `__thread` is emulated (Android before API 29) the first access on a thread mallocs, and
