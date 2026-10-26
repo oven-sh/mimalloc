@@ -220,8 +220,15 @@ mi_decl_export void mi_collect(bool force)      mi_attr_noexcept;
 // RETURNED, and three more times at the most: two will do as a rule, and what is left after
 // those are pages that other threads are using, for which it can stay true as long as they
 // do. The `_start`/`_end` pair below does all of that by itself.
+// A thread that is one of many that go idle around the threads that work (a compiler or a
+// collector helper thread of a runtime) asks `mi_on_thread_idle_pending_own` instead, which is
+// true only when one of those pages is its own. Each such thread passes the abandoned pages of
+// all of them, which is where the buffers of the threads that run are: if every helper called
+// again while any of those was young, their sweeps would end an epoch per interval and a thread
+// that takes its buffers again every few intervals would find them given back each time.
 mi_decl_export void mi_on_thread_idle(void)     mi_attr_noexcept;
 mi_decl_export bool mi_on_thread_idle_pending(void) mi_attr_noexcept;  // did the last sweep of this thread's heaps (its `mi_on_thread_idle`, or the scavenger's during a park) leave free blocks of a large page that was just in use? Not to be called between `_start` and `_end`.
+mi_decl_export bool mi_on_thread_idle_pending_own(void) mi_attr_noexcept;  // ..of a large page of this thread itself (not only of abandoned pages of its heaps, which other threads may be using)? Same rules.
 mi_decl_export bool mi_on_thread_idle_start(void) mi_attr_noexcept;  // about to block: hand the theaps to the scavenger. false = nothing handed off, no _end needed
 mi_decl_export void mi_on_thread_idle_end(void)   mi_attr_noexcept;  // awake again: take them back (pairs with a true from _start)
 mi_decl_export void mi_scavenger_stop(void)      mi_attr_noexcept;  // stop and join the background scavenger thread; a no-op if it is not running

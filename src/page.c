@@ -1240,7 +1240,7 @@ bool _mi_page_purge_holes_free_page_stays(mi_page_t* page, mi_tld_t* tld) {
   if (!_mi_page_purge_holes_large_page_waits(page, tld)) return false;
   uint32_t stamp;
   bool stays = false;
-  if (mi_page_sweep_state_is_alloc(page, &stamp) && mi_page_sweep_state_alloc_age(stamp) < 2) { tld->holes_sweep_deferred = true; stays = true; }
+  if (mi_page_sweep_state_is_alloc(page, &stamp) && mi_page_sweep_state_alloc_age(stamp) < 2) { tld->holes_sweep_deferred = true; tld->holes_sweep_deferred_own = true; stays = true; }   // (only a page of the thread comes here)
   else { stays = mi_page_holes_floor_keep(page, tld); }
   if (stays) { page->retire_expire = 0; }   // (not `_mi_theap_collect_retired`: the sweeps decide from here on)
   return stays;
@@ -1359,7 +1359,12 @@ void _mi_page_purge_holes(mi_page_t* page, mi_tld_t* tld) {
       // is full, so that is where most of a thread's own buffers are (and those of others; hence a fixed number of
       // sweeps, not "until nothing is left", in `_mi_theap_sweep_parked`). With nothing to take now, the epoch stays for
       // what is freed until the next sweep.
-      if (page->free != NULL || mi_page_unformed_tail_pending(page)) { tld->holes_sweep_deferred = true; }
+      // Which of the two it was is kept apart: a thread that comes back only for abandoned pages takes the buffers of
+      // the threads that use them, an epoch sooner with every sweep it adds (`mi_on_thread_idle_pending_own`).
+      if (page->free != NULL || mi_page_unformed_tail_pending(page)) {
+        tld->holes_sweep_deferred = true;
+        if (!mi_page_is_abandoned(page)) { tld->holes_sweep_deferred_own = true; }
+      }
       return;
     }
   }

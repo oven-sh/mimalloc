@@ -744,8 +744,18 @@ static bool test_park_defers_large(void) {
 // 10. ..and the same for the sweep that a thread does itself: nothing of a large page goes at the first sweep after an
 //     allocation from it, whatever was freed, nor at a second one right after that, and `mi_on_thread_idle_pending` says so;
 //     the pages that were left alone for a whole epoch go; a page that is allocated from in every epoch keeps its blocks
-//     for good, however many sweeps pass, and they go when that stops
+//     for good, however many sweeps pass, and they go when that stops.
+//     `mi_on_thread_idle_pending_own` says the same where one of the pages that were left is a page of this thread
 // ---------------------------------------------------------------------------
+
+// Is one of the pages of the blocks in `freed` (or `only`, if given) a page of a thread, not an abandoned one?
+static bool any_own_page(void** freed, size_t n, size_t bsize, const mi_page_t* only) {
+  for (size_t i = 0; i < n; i++) {
+    const mi_page_t* const page = (freed[i] != NULL ? freed_block_page(freed[i], bsize) : NULL);
+    if (page != NULL && (only == NULL || page == only) && !mi_page_is_abandoned(page)) return true;
+  }
+  return false;
+}
 
 static size_t count_purged_in(void** freed, size_t n, size_t bsize, const mi_page_t* only) {
   size_t npurged = 0;
@@ -797,9 +807,12 @@ static bool test_recent_allocation(void) {
     // the first sweep after the allocations, whenever it comes
     mi_on_thread_idle();
     const bool all1 = !mi_on_thread_idle_pending();
+    const bool own1 = mi_on_thread_idle_pending_own();
     const size_t n1 = count_purged_in(freed, n, bsize, NULL);
     if (n1 != 0) { fprintf(stderr, "\n  the first sweep after the allocations discarded %zu blocks of the large pages\n", n1); ok_all = false; }
     if (all1) { fprintf(stderr, "\n  a sweep that left the free blocks of large pages did not say so\n"); ok_all = false; }
+    if (!own1 && any_own_page(freed, n, bsize, NULL)) { fprintf(stderr, "\n  a sweep that left the free blocks of a large page of this thread did not say that one is its own\n"); ok_all = false; }
+    if (own1 && all1) { fprintf(stderr, "\n  a sweep says that it left a page of this thread, and that it left none\n"); ok_all = false; }
     // ..and a second one right after it: two epochs cannot end within one interval
     mi_on_thread_idle();
     const bool all1b = !mi_on_thread_idle_pending();
@@ -827,7 +840,7 @@ static bool test_recent_allocation(void) {
     if (nother_purged != nother) { fprintf(stderr, "\n  %zu of the %zu free blocks in the pages that were left alone for an epoch were discarded\n", nother_purged, nother); ok_all = false; }
     // a page that is allocated from in every epoch keeps its blocks, sweep after sweep (the same page every time, as the
     // queue of the size class has it first; the check is per sweep, so it holds for whichever page it is)
-    size_t nbusy = 0, nbusy_same = 0, nbusy_bad = 0, nbusy_quiet = 0;
+    size_t nbusy = 0, nbusy_same = 0, nbusy_bad = 0, nbusy_quiet = 0, nbusy_quiet_own = 0;
     const mi_page_t* busy_prev = NULL;
     for (int round = 0; round < 4; round++) {
       sleep_ms((unsigned)interval_ms + 20);
@@ -840,17 +853,21 @@ static bool test_recent_allocation(void) {
       mi_on_thread_idle();
       if (count_purged_in(freed, n, bsize, busy) != nb0) { nbusy_bad++; }
       if (!mi_on_thread_idle_pending()) { nbusy_quiet++; }
+      if (!mi_on_thread_idle_pending_own() && any_own_page(freed, n, bsize, busy)) { nbusy_quiet_own++; }
     }
     if (nbusy_bad != 0) { fprintf(stderr, "\n  %zu of %zu sweeps, an interval apart, discarded blocks of a large page that was allocated from before each of them\n", nbusy_bad, nbusy); ok_all = false; }
     if (nbusy_quiet != 0) { fprintf(stderr, "\n  %zu of %zu sweeps that left the free blocks of a large page did not say so\n", nbusy_quiet, nbusy); ok_all = false; }
+    if (nbusy_quiet_own != 0) { fprintf(stderr, "\n  %zu of %zu sweeps that left the free blocks of a large page of this thread did not say that it is its own\n", nbusy_quiet_own, nbusy); ok_all = false; }
     // and they go once it has been left alone for an epoch: the last sweep above ended the epoch of the last allocation,
     // the next one ends the one after it
     sleep_ms((unsigned)interval_ms + 20);
     mi_on_thread_idle();
     const bool all3 = !mi_on_thread_idle_pending();
+    const bool own3 = mi_on_thread_idle_pending_own();
     const size_t n3 = count_purged_in(freed, n, bsize, NULL);
     if (n3 != nfreed) { fprintf(stderr, "\n  %zu of the %zu free blocks are discarded after the pages were left alone\n", n3, nfreed); ok_all = false; }
     if (!all3) { fprintf(stderr, "\n  a sweep that left nothing says that it did\n"); ok_all = false; }
+    if (own3) { fprintf(stderr, "\n  a sweep that left nothing says that it left a page of this thread\n"); ok_all = false; }
     // a sweep after that has nothing to do in them
     const hole_stats_t s3 = hole_stats();
     mi_on_thread_idle();
@@ -866,7 +883,8 @@ static bool test_recent_allocation(void) {
 
 // ---------------------------------------------------------------------------
 // 11. the same for an abandoned page: the sweep of another thread leaves its free blocks while the page is young, and
-//     takes them when it is two epochs old
+//     takes them when it is two epochs old. That sweep says that it left something, and not that it left a page of
+//     its own thread: it is not for that thread to come back for the pages that others use
 // ---------------------------------------------------------------------------
 
 static bool test_abandoned_young(void) {
@@ -887,11 +905,14 @@ static bool test_abandoned_young(void) {
     mi_on_thread_idle();   // goes over the abandoned pages of the heaps of this thread: allocated from in the epoch that this sweep ended
     const size_t n1 = count_purged_in(ab_freed, ab_n, bsize, NULL);
     const bool pending1 = mi_on_thread_idle_pending();
+    const bool own1 = mi_on_thread_idle_pending_own();
+    const bool reclaimed1 = any_own_page(ab_freed, ab_n, bsize, NULL);   // (not expected: this thread took nothing from them)
     sleep_ms((unsigned)interval_ms + 20);
     mi_on_thread_idle();   // two epochs old now
     const size_t n2 = count_purged_in(ab_freed, ab_n, bsize, NULL);
     if (n1 != 0) { fprintf(stderr, "\n  the first sweep after a thread abandoned its large pages discarded %zu of their free blocks\n", n1); ok_all = false; }
     if (n2 != 0 && !pending1) { fprintf(stderr, "\n  a sweep that left the free blocks of abandoned large pages did not say so\n"); ok_all = false; }
+    if (own1 && !reclaimed1) { fprintf(stderr, "\n  a sweep that left the free blocks of abandoned large pages only says that one of them is a page of its thread\n"); ok_all = false; }
     if (n2 == 0) { fprintf(stderr, "\n  none of the %zu free blocks in the abandoned pages was discarded two epochs later\n", nfreed); ok_all = false; }
     fprintf(stderr, "(%zu, then %zu of %zu free blocks in abandoned pages purged) ", n1, n2, nfreed);
   }
