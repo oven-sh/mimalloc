@@ -226,6 +226,9 @@ mi_decl_export void mi_collect(bool force)      mi_attr_noexcept;
 // all of them, which is where the buffers of the threads that run are: if every helper called
 // again while any of those was young, their sweeps would end an epoch per interval and a thread
 // that takes its buffers again every few intervals would find them given back each time.
+// (The `_start`/`_end` pair still comes back on the first answer, for any page: it was made for
+// the threads that run, whose buffers those pages hold. A helper thread that parks with it comes
+// back for the pages of the others as before.)
 mi_decl_export void mi_on_thread_idle(void)     mi_attr_noexcept;
 mi_decl_export bool mi_on_thread_idle_pending(void) mi_attr_noexcept;  // did the last sweep of this thread's heaps (its `mi_on_thread_idle`, or the scavenger's during a park) leave free blocks of a large page that was just in use? Not to be called between `_start` and `_end`.
 mi_decl_export bool mi_on_thread_idle_pending_own(void) mi_attr_noexcept;  // ..of a large page of this thread itself (not only of abandoned pages of its heaps, which other threads may be using)? Same rules.

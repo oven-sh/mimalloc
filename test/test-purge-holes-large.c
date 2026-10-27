@@ -1276,6 +1276,8 @@ static bool test_floor_free_page(void) {
   mi_option_set(mi_option_purge_holes_large_floor_epochs, epochs);
   mi_option_set(mi_option_purge_holes_large_floor, 8 * 1024);
   sweep();   // (this thread is one that is swept)
+  fd_sweeps_past_the_hold(interval_ms);   // nothing of the cases before this one is young any more
+  const bool own_before = mi_on_thread_idle_pending_own();
   const size_t size = (MI_LARGE_MAX_OBJ_SIZE / 2) + (MI_LARGE_MAX_OBJ_SIZE / 8);   // a size class of its own in this test
   void* p[3];
   size_t usable = 0;
@@ -1290,6 +1292,18 @@ static bool test_floor_free_page(void) {
     const size_t bsize = page->block_size;
     void* const p0 = p[0];
     free_all(p, 3);   // the last block of the page is freed: it waits for the sweep
+    // the first sweep after the allocations leaves the page, which is young and has no block in use, and says that it is
+    // a page of this thread (`mi_on_thread_idle_pending_own`; with the floor on, this is the store that a thread whose
+    // blocks were all freed comes back for)
+    sweep();
+    const bool pending_young = mi_on_thread_idle_pending();
+    const bool own_young = mi_on_thread_idle_pending_own();
+    const bool there_young = (freed_block_page(p0, bsize) == page && !mi_page_is_abandoned(page));
+    if (own_before || !there_young || !pending_young || !own_young) {
+      fprintf(stderr, "\n  a young large page of this thread with no block in use %s there after the first sweep, which says: left something=%d, of its own=%d (of its own before the page was there=%d)\n",
+              (there_young ? "is" : "is not"), (int)pending_young, (int)own_young, (int)own_before);
+      ok_all = false;
+    }
     fd_sweeps_past_the_hold(interval_ms);
     const size_t kept1 = _mi_page_purge_holes_floor_kept();
     // A collect that is not forced is not a sweep, and leaves what the floor keeps: every `generic_collect` allocations
@@ -1385,6 +1399,117 @@ static bool test_floor_free_page(void) {
   return ok_all;
 }
 
+// ---------------------------------------------------------------------------
+// 13. A thread that runs (A, this thread) keeps its buffers in large pages that became full, which are abandoned pages.
+//     It takes them again and frees them again once per round and never sweeps. A helper thread (B) goes idle after
+//     each round: it sweeps an interval later, and again an interval after each sweep while `key` says so, three more
+//     times at the most (what `mimalloc.h` tells a caller that blocks to do).
+//       key = `mi_on_thread_idle_pending_own`: B sweeps once per round and none of A's free blocks is ever discarded
+//       key = `mi_on_thread_idle_pending`:     B comes back, its sweeps end two epochs per round, A's blocks go
+//     A starts a round only when B is done with the one before. The only thing that depends on time is that a sleep is
+//     not shorter than asked for.
+// ---------------------------------------------------------------------------
+
+#define HK_ROUNDS (6)
+
+static _Atomic(uintptr_t) hk_round;        // rounds that A has done (B goes idle after each)
+static _Atomic(uintptr_t) hk_idle_done;    // rounds after which B is done sweeping
+static _Atomic(uintptr_t) hk_stop;
+static bool   hk_own_key;
+static long   hk_interval_ms;
+static size_t hk_sweeps;                   // sweeps of B in all
+static size_t hk_followups;                // ..of which after a true key
+
+static void hk_helper(void) {
+  uintptr_t seen = 0;
+  void* const warm = mi_malloc(100);   // a thread that never allocated has no heap, and `mi_on_thread_idle` has nothing to sweep
+  if (warm != NULL) { memset(warm, 1, 100); }
+  for (;;) {
+    uintptr_t r;
+    while ((r = mi_atomic_load_acquire(&hk_round)) == seen && mi_atomic_load_acquire(&hk_stop) == 0) { sleep_ms(1); }
+    if (r == seen) break;
+    seen = r;
+    for (int k = 0; k < 4; k++) {
+      sleep_ms((unsigned)hk_interval_ms + 10);   // an interval without work..
+      mi_on_thread_idle();                       // ..then release, and come back while the key says so
+      hk_sweeps++;
+      if (k > 0) { hk_followups++; }
+      if (!(hk_own_key ? mi_on_thread_idle_pending_own() : mi_on_thread_idle_pending())) break;
+    }
+    mi_atomic_store_release(&hk_idle_done, seen);
+  }
+  mi_free(warm);
+}
+
+static bool test_helper_key(bool own_key) {
+  const size_t size = large_size(1);
+  void* ptrs[MAXB];
+  void* freed[MAXB];
+  void* take[MAXB];
+  size_t usable = 0;
+  bool ok_all = true;
+  const size_t n = 36;   // three large pages of this class, each full
+  memset(ptrs, 0, sizeof(ptrs)); memset(freed, 0, sizeof(freed)); memset(take, 0, sizeof(take));
+  const long old_interval = mi_option_get(mi_option_purge_holes_min_interval);
+  hk_interval_ms = 100;
+  mi_option_set(mi_option_purge_holes_min_interval, hk_interval_ms);
+  hk_own_key = own_key;
+  hk_sweeps = 0; hk_followups = 0;
+  mi_atomic_store_release(&hk_round, (uintptr_t)0);
+  mi_atomic_store_release(&hk_idle_done, (uintptr_t)0);
+  mi_atomic_store_release(&hk_stop, (uintptr_t)0);
+  // (so that the first sweep of B ends an epoch whatever ran before this, see `test_recent_allocation`)
+  mi_on_thread_idle();
+  sleep_ms((unsigned)hk_interval_ms + 20);
+  if (!alloc_filled(ptrs, n, size, &usable)) { free_all(ptrs, n); mi_option_set(mi_option_purge_holes_min_interval, old_interval); return false; }
+  const bool large = is_large_page(_mi_ptr_page(ptrs[0]));
+  const size_t bsize = _mi_ptr_page(ptrs[0])->block_size;
+  size_t nfreed = 0;
+  for (size_t i = 0; i < n; i++) { if ((i % 4) != 0) { freed[i] = ptrs[i]; mi_free(ptrs[i]); ptrs[i] = NULL; nfreed++; } }
+  if (purging_enabled && large) {
+    size_t purged[HK_ROUNDS + 1];
+    memset(purged, 0, sizeof(purged));
+    test_thread_t helper;
+    if (!test_thread_start(&helper, &hk_helper)) { free_all(ptrs, n); mi_option_set(mi_option_purge_holes_min_interval, old_interval); return false; }
+    const mi_msecs_t t0 = _mi_clock_now();
+    for (uintptr_t round = 1; round <= HK_ROUNDS; round++) {
+      // A takes its buffers again and frees them again: the pages were allocated from in the current epoch
+      size_t ntake = 0;
+      for (size_t k = 0; k < nfreed; k++) {
+        void* const p = mi_malloc(size);
+        if (p == NULL) break;
+        memset(p, (int)round, size);
+        take[ntake++] = p;
+      }
+      free_all(take, ntake);
+      // B goes idle..
+      mi_atomic_store_release(&hk_round, round);
+      while (mi_atomic_load_acquire(&hk_idle_done) != round && _mi_clock_now() - t0 < 60000) { sleep_ms(1); }
+      // ..and what did it take of A's buffers?
+      purged[round] = count_purged_in(freed, n, bsize, NULL);
+    }
+    mi_atomic_store_release(&hk_stop, (uintptr_t)1);
+    test_thread_join(helper);
+    size_t rounds_with_purge = 0;
+    fprintf(stderr, "(%zu free blocks; purged per round:", nfreed);
+    for (int r = 1; r <= HK_ROUNDS; r++) { fprintf(stderr, " %zu", purged[r]); if (purged[r] != 0) rounds_with_purge++; }
+    fprintf(stderr, "; the helper: %zu sweeps, %zu follow-ups in %d rounds) ", hk_sweeps, hk_followups, HK_ROUNDS);
+    if (own_key) {
+      if (rounds_with_purge != 0) { fprintf(stderr, "\n  the sweeps of an idle thread discarded the buffers of a thread that runs in %zu of %d rounds\n", rounds_with_purge, HK_ROUNDS); ok_all = false; }
+      if (hk_followups != 0) { fprintf(stderr, "\n  an idle thread that holds nothing of its own came back %zu times\n", hk_followups); ok_all = false; }
+    }
+    else if (rounds_with_purge == 0) {
+      // (the control: without it the case above proves nothing)
+      fprintf(stderr, "\n  a thread that comes back while any page is young did not discard the buffers of a thread that runs either\n"); ok_all = false;
+    }
+  }
+  if (!survivors_intact(ptrs, n, usable, "helper key")) { ok_all = false; }
+  mi_option_set(mi_option_purge_holes_min_interval, old_interval);
+  free_all(ptrs, n);
+  mi_collect(true);
+  return ok_all;
+}
+
 int main(void) {
   mi_version();
   purging_enabled = mi_option_is_enabled(mi_option_purge_holes);
@@ -1418,6 +1543,8 @@ int main(void) {
   CHECK("floor", test_floor());
   CHECK("floor-decay", test_floor_decay());
   CHECK("floor-free-page", test_floor_free_page());
+  CHECK("helper-comes-back-for-its-own-pages", test_helper_key(true));
+  CHECK("helper-comes-back-for-any-page (control)", test_helper_key(false));
 
   // everything above is freed by now, so every hole must have been handed back
   mi_collect(true);
