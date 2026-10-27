@@ -349,6 +349,7 @@ void mi_on_thread_idle(void) mi_attr_noexcept {
   if (theap0->tld->thread_id != _mi_thread_id()) return;
   mi_tld_t* const tld = theap0->tld;
   tld->holes_sweep_deferred = false;
+  tld->holes_sweep_deferred_own = false;
   _mi_thread_idle_work(tld, theap0);
 }
 
@@ -361,6 +362,20 @@ bool mi_on_thread_idle_pending(void) mi_attr_noexcept {
   if (theap0 == NULL || !mi_theap_is_initialized(theap0) || theap0->tld == NULL) return false;
   if (theap0->tld->thread_id != _mi_thread_id()) return false;
   return theap0->tld->holes_sweep_deferred;
+}
+
+// ..and was one of those a page of this thread itself, not an abandoned page of its heaps? The answer for a thread
+// that may be one of many that go idle around the threads that work (the compiler and collector helper threads of a
+// runtime): an abandoned large page is one that became full, which is where the buffers of the threads that run are,
+// and every one of those helpers passes all of them. If each came back while any was young, their sweeps would end an
+// epoch per interval, and a thread that takes its buffers again every few intervals would find them given back each
+// time. A thread that holds nothing of its own has nothing to come back for: what it leaves in the abandoned pages
+// goes at the next sweep of any thread that finds it old. Same rules as for `mi_on_thread_idle_pending`.
+bool mi_on_thread_idle_pending_own(void) mi_attr_noexcept {
+  mi_theap_t* const theap0 = _mi_theap_default();
+  if (theap0 == NULL || !mi_theap_is_initialized(theap0) || theap0->tld == NULL) return false;
+  if (theap0->tld->thread_id != _mi_thread_id()) return false;
+  return theap0->tld->holes_sweep_deferred_own;
 }
 
 // Declare that this thread will not allocate or free until `mi_on_thread_idle_end` -- the sweep's
@@ -467,6 +482,7 @@ mi_msecs_t _mi_theap_sweep_parked(mi_subproc_t* subproc) {
     // is not due, so the next one in the list is claimed.
     const uint32_t swept = mi_atomic_load_relaxed(&claimed->park_swept);
     claimed->holes_sweep_deferred = false;
+    claimed->holes_sweep_deferred_own = false;
     _mi_thread_idle_work(claimed, theap0);
     // After the work: the sweep that comes back is to find the epoch that this one began (if it did) as old as the interval.
     claimed->holes_sweep_last = _mi_clock_now();
