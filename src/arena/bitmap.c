@@ -568,6 +568,11 @@ static void mi_bbitmap_set_chunk_bin(mi_bbitmap_t* bbitmap, size_t chunk_idx, mi
   }
 }
 
+void mi_bbitmap_unsafe_set_bin(mi_bbitmap_t* bbitmap, size_t idx, mi_chunkbin_t bin) {
+  mi_assert_internal(idx < mi_bbitmap_max_bits(bbitmap));
+  mi_bbitmap_set_chunk_bin(bbitmap, idx / MI_BCHUNK_BITS, bin);
+}
+
 mi_chunkbin_t mi_bbitmap_debug_get_bin(const mi_bchunkmap_t* chunkmap_bins, size_t chunk_idx) {
   for (mi_chunkbin_t ibin = MI_CBIN_SMALL; ibin < MI_CBIN_NONE; ibin = mi_chunkbin_inc(ibin)) {
     if (mi_bchunk_is_xsetN(MI_BIT_SET, &chunkmap_bins[ibin], chunk_idx, 1)) {

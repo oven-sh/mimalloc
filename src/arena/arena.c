@@ -490,6 +490,18 @@ static mi_bbitmap_t* mi_arena_bbitmap_init(mi_subproc_t* subproc, size_t slice_c
   return bbitmap;
 }
 
+// Mark the slices after a run of meta info as free (while the arena is still local to the thread).
+static void mi_arena_init_free_slices(mi_arena_t* arena, size_t start_idx, size_t count) {
+  mi_bbitmap_unsafe_setN(arena->slices_free, start_idx, count);
+  // A chunk gets its size bin from the allocation that takes its first slice. Meta info holds that slice for good, so
+  // this chunk would never get a bin and be searched last: once a later chunk has a bin, slices freed here (still
+  // resident) are passed over for fresh ones there. Every size fits the smallest bin.
+  // Shared arenas keep the old order: there it measured neutral at best.
+  if (arena->is_exclusive && (start_idx % MI_BCHUNK_BITS) != 0) {
+    mi_bbitmap_unsafe_set_bin(arena->slices_free, start_idx, MI_CBIN_SMALL);
+  }
+}
+
 
 static mi_arena_t* mi_arena_initialize(mi_subproc_t* subproc, void* start,
                                         size_t slice_count, mi_arena_t* parent, size_t total_size,
@@ -608,11 +620,11 @@ static mi_arena_t* mi_arena_initialize(mi_subproc_t* subproc, void* start,
         count = arena->slice_count - start_idx;
         mi_assert_internal(count > 0);
       }
-      mi_bbitmap_unsafe_setN(arena->slices_free, start_idx, count);
+      mi_arena_init_free_slices(arena, start_idx, count);
     }
   }
   #else
-  mi_bbitmap_unsafe_setN(arena->slices_free, info_slices /* start */, arena->slice_count - info_slices);
+  mi_arena_init_free_slices(arena, info_slices /* start */, arena->slice_count - info_slices);
   #endif
   if (memid.initially_committed) {
     mi_bitmap_unsafe_setN(arena->slices_committed, 0, arena->slice_count);
