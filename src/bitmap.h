@@ -262,8 +262,9 @@ typedef mi_decl_bchunk_align struct mi_bbitmap_s {
   _Atomic(size_t)  chunk_count;         // total count of chunks (0 < N <= MI_BCHUNKMAP_BITS)
   _Atomic(size_t)  chunk_max_accessed;  // max chunk index that was once cleared or set
   mi_subproc_t*    subproc;             // constant, for stats
-  #if (MI_BCHUNK_SIZE / MI_SIZE_SIZE) > 3
-  size_t           _padding[MI_BCHUNK_SIZE/MI_SIZE_SIZE - 3];    // suppress warning on msvc by aligning manually
+  size_t           is_of_exclusive_arena;  // constant
+  #if (MI_BCHUNK_SIZE / MI_SIZE_SIZE) > 4
+  size_t           _padding[MI_BCHUNK_SIZE/MI_SIZE_SIZE - 4];    // suppress warning on msvc by aligning manually
   #endif
   mi_bchunkmap_t   chunkmap;
   mi_bchunkmap_t   chunkmap_bins[MI_CBIN_COUNT - 1];             // chunkmaps with bit set if the chunk is in that size class (excluding MI_CBIN_NONE)

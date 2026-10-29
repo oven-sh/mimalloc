@@ -1814,7 +1814,8 @@ static bool mi_bbitmap_try_find_and_clear_generic(mi_bbitmap_t* bbitmap, size_t 
   mi_assert_internal(MI_BFIELD_BITS >= MI_BCHUNK_FIELDS);
   const mi_bfield_t cmap_mask  = mi_bfield_mask(cmap_max_count,0);
   const size_t cmap_cycle      = cmap_acc+1;
-  const mi_chunkbin_t bbin = mi_chunkbin_of(n);
+  mi_chunkbin_t bbin = mi_chunkbin_of(n);
+again: ;
   // visit each cmap entry
   size_t cmap_idx = 0;
   mi_bfield_cycle_iterate(cmap_mask, tseq, cmap_cycle, cmap_idx, X)
@@ -1885,6 +1886,11 @@ static bool mi_bbitmap_try_find_and_clear_generic(mi_bbitmap_t* bbitmap, size_t 
     }
   }
   mi_bfield_cycle_iterate_end(X);
+  // a request to an exclusive arena has no other arena to go to: it goes on to look in the chunks of every bin
+  if (bbin != MI_CBIN_HUGE && bbitmap->is_of_exclusive_arena) {
+    bbin = MI_CBIN_HUGE;
+    goto again;
+  }
   return false;
 }
 
