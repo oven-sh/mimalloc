@@ -1190,7 +1190,7 @@ if (MI_BUILD_TESTS)
       message(STATUS "cannot build TSAN tests without MI_BUILD_SHARED being enabled")
     endif()
     set(mi_test_env "")
-    if(MI_GUARDED AND (TEST_NAME STREQUAL "purge-holes" OR TEST_NAME STREQUAL "purge-holes-large"))
+    if(MI_GUARDED AND (TEST_NAME STREQUAL "purge-holes" OR TEST_NAME STREQUAL "purge-holes-large" OR TEST_NAME STREQUAL "exclusive-arena-bins"))
       list(APPEND mi_test_env MIMALLOC_GUARDED_SAMPLE_RATE=0)     # it knows the page layout, which guard pages change (set explicitly: the CI sets a rate for the whole job)
     elseif(MI_GUARDED AND TEST_NAME STREQUAL "profile")
       list(APPEND mi_test_env MIMALLOC_GUARDED_SAMPLE_RATE=0)     # it checks what the samples add up to, which guarded samples in between change (set explicitly: the CI sets a rate for the whole job); the case with guarded blocks sets its own rate
