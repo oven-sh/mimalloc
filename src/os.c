@@ -210,7 +210,7 @@ bool _mi_os_secure_guard_page_set_at(mi_subproc_t* subproc, void* addr, mi_memid
       ok = (*(arena->commit_fun))(false /* decommit */, addr, _mi_os_secure_guard_page_size(), NULL, arena->commit_fun_arg);
     }
     else {
-      ok = _mi_os_decommit(subproc, addr, _mi_os_secure_guard_page_size());
+      ok = _mi_os_decommit(subproc, addr, _mi_os_secure_guard_page_size()) && _mi_os_protect(addr, _mi_os_secure_guard_page_size());
     }
   }
   if (!ok) {
@@ -238,7 +238,7 @@ bool _mi_os_secure_guard_page_reset_at(mi_subproc_t* subproc, void* addr, mi_mem
       return (*(arena->commit_fun))(true, addr, _mi_os_secure_guard_page_size(), NULL, arena->commit_fun_arg);
     }
     else {
-      return _mi_os_commit(subproc, addr, _mi_os_secure_guard_page_size(), NULL);
+      return _mi_os_unprotect(addr, _mi_os_secure_guard_page_size()) && _mi_os_commit(subproc, addr, _mi_os_secure_guard_page_size(), NULL);
     }
   }
   #else
