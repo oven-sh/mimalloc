@@ -418,6 +418,7 @@ mi_theap_t* _mi_thread_init_with_heap(mi_heap_t* heap_main)
   #if MI_DEBUG || defined(MI_TLS_RECURSE_GUARD)
   theap = mi_heap_check_for_existing_theap(heap_main);  // recursion check
   #if !defined(MI_TLS_RECURSE_GUARD)
+  if (_mi_process_is_forked_child) { theap = NULL; }    // a thread that the fork left behind may have had this thread id
   mi_assert_internal(theap==NULL);
   #endif
   #else
