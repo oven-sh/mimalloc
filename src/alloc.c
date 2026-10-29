@@ -759,6 +759,14 @@ it returns false, but we limit the total calls.
 -------------------------------------------------------*/
 #define MI_TRY_NEW_MAX (4)
 
+#if defined(MI_NEW_OOM) && !defined(_CPPUNWIND) && !defined(__cpp_exceptions)
+// Reports out of memory and does not return. Stands in for the
+// `throw std::bad_alloc()` that a build without exceptions cannot do, so a
+// throwing `new` never returns NULL to a caller the standard promised memory.
+mi_decl_externc mi_decl_noreturn void MI_NEW_OOM(void);
+#define MI_HAS_NEW_OOM 1
+#endif
+
 #ifdef __cplusplus
 #include <new>
 static bool mi_try_new_handler(bool nothrow) {
@@ -773,6 +781,10 @@ static bool mi_try_new_handler(bool nothrow) {
     #if defined(_CPPUNWIND) || defined(__cpp_exceptions)  // exceptions are not always enabled
     if (!nothrow) {
       throw std::bad_alloc();
+    }
+    #elif defined(MI_HAS_NEW_OOM)
+    if (!nothrow) {
+      MI_NEW_OOM();
     }
     #else
     MI_UNUSED(nothrow);
