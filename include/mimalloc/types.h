@@ -570,10 +570,12 @@ typedef struct mi_page_s {
 #define MI_PAGE_MAX_OVERALLOC_ALIGN       MI_ARENA_SLICE_SIZE       // (64 KiB) limit for which we overallocate in arena pages, beyond this use OS allocation
 
 // Offset the first block in pages with larger blocks (using the unused space at the end of the page) spread across cache sets (issue #1121).
-// Off by default here: with an offset the blocks do not start on an OS page, and `_mi_page_purge_holes` can never discard the first one.
+// Here only for a block that has a page of its own (upstream: every block). In a page with more blocks an offset takes them
+// off the OS pages, and `_mi_page_purge_holes` can no longer discard a free block as a whole.
 #if !defined(MI_PAGE_CACHE_OFFSET)
-#define MI_PAGE_CACHE_OFFSET              0
+#define MI_PAGE_CACHE_OFFSET              1
 #endif
+#define MI_PAGE_CACHE_OFFSET_MIN_SIZE     MI_LARGE_MAX_OBJ_SIZE     // blocks above this size get one
 #define MI_PAGE_CACHE_OFFSET_UNIT         (128)                                                     // offset granularity (power of 2 between 16 and 4KiB)
 #define MI_PAGE_CACHE_OFFSET_MAX          (MI_PAGE_OSPAGE_BLOCK_ALIGN2 - MI_PAGE_CACHE_OFFSET_UNIT) // maximal offset (32 possible offsets)
 // Offset the first block in pages with small blocks (< 512)

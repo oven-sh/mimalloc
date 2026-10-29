@@ -364,7 +364,7 @@ static size_t mi_page_small_block_cache_offset(uint8_t* slice_start, size_t slic
 // if that wastes less than 12.5% of the page (e.g. 64 KiB blocks in a 4 MiB page, but not 512 KiB blocks).
 static size_t mi_page_block_cache_offset(uint8_t* slice_start, size_t slice_count, size_t block_size, size_t block_start, bool os_align) {
   if (MI_PAGE_CACHE_OFFSET == 0 || os_align) return 0;
-  if (!mi_block_size_has_cache_offset(block_size)) return mi_page_small_block_cache_offset(slice_start, slice_count, block_size);
+  if (!mi_block_size_has_cache_offset(block_size)) return (MI_PAGE_CACHE_OFFSET_MIN_SIZE > MI_SMALL_MAX_OBJ_SIZE ? 0 : mi_page_small_block_cache_offset(slice_start, slice_count, block_size));
   if (!mi_page_block_can_cache_offset(block_size, os_align)) return 0;
   const size_t page_noguard_size = mi_arenas_page_noguard_size(_mi_size_of_slices(slice_count));
   mi_assert_internal(block_start + block_size <= page_noguard_size);

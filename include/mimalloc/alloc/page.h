@@ -79,7 +79,7 @@ static inline size_t mi_page_info_size(void) {
 // Can the first block in a page with blocks of size `bsize` have a cache offset? (see `MI_PAGE_CACHE_OFFSET`)
 // Not the power-of-two blocks that are naturally aligned (`mi_natural_alignment_of_size`): an offset would take that away.
 static inline bool mi_block_size_has_cache_offset(size_t bsize) {
-  return (MI_PAGE_CACHE_OFFSET != 0 && bsize > MI_SMALL_MAX_OBJ_SIZE &&
+  return (MI_PAGE_CACHE_OFFSET != 0 && bsize > MI_PAGE_CACHE_OFFSET_MIN_SIZE &&
           !(mi_is_power_of_two(bsize) && bsize <= MI_PAGE_MAX_START_BLOCK_ALIGN2));
 }
 
