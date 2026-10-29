@@ -299,6 +299,9 @@ size_t mi_bbitmap_init(mi_subproc_t* subproc, mi_bbitmap_t* bbitmap, size_t bit_
 // Not atomic so only use if still local to a thread.
 void mi_bbitmap_unsafe_setN(mi_bbitmap_t* bbitmap, size_t idx, size_t n);
 
+// Give the chunk that holds bit `idx` a size bin up front (normally the allocation that takes its first bit does).
+// Not atomic so only use if still local to a thread.
+void mi_bbitmap_unsafe_set_bin(mi_bbitmap_t* bbitmap, size_t idx, mi_chunkbin_t bin);
 
 // Set a sequence of `n` bits in the bbitmap; returns `true` if atomically transitioned from all 0's to 1's
 bool mi_bbitmap_setN(mi_bbitmap_t* bbitmap, size_t idx, size_t n);
