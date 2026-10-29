@@ -94,7 +94,7 @@ static mi_decl_noinline mi_theap_t* mi_heap_init_theap(const mi_heap_t* const_he
     // allocate a fresh theap
     theap = _mi_theap_create(heap, mi_theap_get_default()->tld); // sets the theap thread local
     if (theap==NULL) {
-      _mi_error_message(EFAULT, "unable to allocate memory for a thread local heap\n");
+      _mi_error_message(ENOMEM, "unable to allocate memory for a thread local heap\n");
       return NULL;
     }
     _mi_heap_theap_set(heap, theap);
@@ -164,7 +164,7 @@ mi_heap_t* _mi_heap_new_for_subproc(mi_subproc_t* subproc, mi_arena_id_t exclusi
   // reserve a thread local slot for this heap (see also issue #1230)
   mi_thread_local_t theap_slot = (is_main_heap ? mi_thread_local_key_fast : _mi_thread_local_create());
   if (theap_slot == 0) {
-    _mi_error_message(EFAULT, "unable to dynamically create a thread local for a heap\n");
+    _mi_error_message(ENOMEM, "unable to dynamically create a thread local for a heap\n");
     mi_free(heap);
     return NULL;
   }

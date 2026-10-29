@@ -1165,7 +1165,7 @@ if (MI_BUILD_TESTS)
   enable_testing()
 
   # static link tests
-  set(mi_static_tests api api-fill stress-heaps stress-subprocs stress profile heap-mt heap-teardown heap-delete-race heap-churn heap-release-mt heap-aba heap-burst-destroy heap-new abandoned-lazy fork-user-heap snapshot purge-zero park-handoff forced-purge purge-behind-pass purge-age purge-resident park-again free-before-init tls-key-race thread-first-call)
+  set(mi_static_tests api api-fill exclusive-arena-bins stress-heaps stress-subprocs stress profile heap-mt heap-teardown heap-delete-race heap-churn heap-release-mt heap-aba heap-burst-destroy heap-new abandoned-lazy fork-user-heap snapshot purge-zero park-handoff forced-purge purge-behind-pass purge-age purge-resident park-again free-before-init tls-key-race thread-first-call)
   if(NOT (MI_DEBUG_TSAN OR (MI_TRACK STREQUAL "ASAN") OR MI_DEBUG_UBSAN))
     list(APPEND mi_static_tests thp-optout)  # counts madvise calls by interposing it, which a sanitizer runtime does first
     list(APPEND mi_static_tests huge-cycle)  # blocks above 1 GiB, which a debug build reads back byte by byte to check that they are zero: too slow under a sanitizer
@@ -1190,7 +1190,7 @@ if (MI_BUILD_TESTS)
       message(STATUS "cannot build TSAN tests without MI_BUILD_SHARED being enabled")
     endif()
     set(mi_test_env "")
-    if(MI_GUARDED AND (TEST_NAME STREQUAL "purge-holes" OR TEST_NAME STREQUAL "purge-holes-large"))
+    if(MI_GUARDED AND (TEST_NAME STREQUAL "purge-holes" OR TEST_NAME STREQUAL "purge-holes-large" OR TEST_NAME STREQUAL "exclusive-arena-bins"))
       list(APPEND mi_test_env MIMALLOC_GUARDED_SAMPLE_RATE=0)     # it knows the page layout, which guard pages change (set explicitly: the CI sets a rate for the whole job)
     elseif(MI_GUARDED AND TEST_NAME STREQUAL "profile")
       list(APPEND mi_test_env MIMALLOC_GUARDED_SAMPLE_RATE=0)     # it checks what the samples add up to, which guarded samples in between change (set explicitly: the CI sets a rate for the whole job); the case with guarded blocks sets its own rate

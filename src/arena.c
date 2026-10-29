@@ -2013,6 +2013,7 @@ static mi_arena_t* mi_arena_initialize(mi_subproc_t* subproc, void* start,
   // init bitmaps
   uint8_t* base = mi_arena_start(arena) + bitmap_base;
   arena->slices_free = mi_arena_bbitmap_init(subproc, slice_count, &base);
+  arena->slices_free->is_of_exclusive_arena = exclusive;
   arena->slices_committed = mi_arena_bitmap_init(slice_count, &base);
   arena->slices_dirty = mi_arena_bitmap_init(slice_count, &base);
   arena->slices_purge = mi_arena_bitmap_init(slice_count, &base);

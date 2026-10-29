@@ -211,6 +211,9 @@ bool _mi_os_secure_guard_page_set_at(mi_subproc_t* subproc, void* addr, mi_memid
     }
     else {
       ok = _mi_os_decommit(subproc, addr, _mi_os_secure_guard_page_size());
+      #if !defined(_WIN32)  // on Windows a decommitted page is not accessible, and `VirtualProtect` refuses it
+      ok = ok && _mi_os_protect(addr, _mi_os_secure_guard_page_size());
+      #endif
     }
   }
   if (!ok) {
@@ -238,6 +241,9 @@ bool _mi_os_secure_guard_page_reset_at(mi_subproc_t* subproc, void* addr, mi_mem
       return (*(arena->commit_fun))(true, addr, _mi_os_secure_guard_page_size(), NULL, arena->commit_fun_arg);
     }
     else {
+      #if !defined(_WIN32)
+      if (!_mi_os_unprotect(addr, _mi_os_secure_guard_page_size())) return false;
+      #endif
       return _mi_os_commit(subproc, addr, _mi_os_secure_guard_page_size(), NULL);
     }
   }

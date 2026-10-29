@@ -1814,7 +1814,8 @@ static bool mi_bbitmap_try_find_and_clear_generic(mi_bbitmap_t* bbitmap, size_t 
   mi_assert_internal(MI_BFIELD_BITS >= MI_BCHUNK_FIELDS);
   const mi_bfield_t cmap_mask  = mi_bfield_mask(cmap_max_count,0);
   const size_t cmap_cycle      = cmap_acc+1;
-  const mi_chunkbin_t bbin = mi_chunkbin_of(n);
+  mi_chunkbin_t bbin = mi_chunkbin_of(n);
+again: ;
   // visit each cmap entry
   size_t cmap_idx = 0;
   mi_bfield_cycle_iterate(cmap_mask, tseq, cmap_cycle, cmap_idx, X)
@@ -1857,7 +1858,12 @@ static bool mi_bbitmap_try_find_and_clear_generic(mi_bbitmap_t* bbitmap, size_t 
 
         size_t cidx;
         bool did_temp_clear_bits = false;
-        if ((*on_find)(chunk, n, &cidx, &did_temp_clear_bits)) {
+        const bool found = (*on_find)(chunk, n, &cidx, &did_temp_clear_bits);
+        if (did_temp_clear_bits) {
+          // a concurrent find_and_claim may have cleared the chunkmap bit, restore it now
+          mi_bbitmap_chunkmap_set(bbitmap, chunk_idx, false);
+        }        
+        if (found) {
           if (cidx==0 && ibin == MI_CBIN_NONE) { // only the first block determines the size bin
             // this chunk is now reserved for the `bbin` size class
             mi_bbitmap_set_chunk_bin(bbitmap, chunk_idx, bbin);
@@ -1871,11 +1877,7 @@ static bool mi_bbitmap_try_find_and_clear_generic(mi_bbitmap_t* bbitmap, size_t 
           //       but that is ok as the chunkmap is a conservative approximation.
           // todo: should _on_find_ return a boolean if there is a chance all are clear to avoid calling `try_clear?`
           //       probably not as we already only call `try_clear` once we fail to clear any bits.
-          if (did_temp_clear_bits) {
-            // a concurrent find_and_claim may have cleared the chunkmap bit, restore it now
-            mi_bbitmap_chunkmap_set(bbitmap, chunk_idx, false);
-          }
-          else {
+          if (!did_temp_clear_bits) {
             mi_bbitmap_chunkmap_try_clear(bbitmap, chunk_idx);
           }
         }
@@ -1884,6 +1886,11 @@ static bool mi_bbitmap_try_find_and_clear_generic(mi_bbitmap_t* bbitmap, size_t 
     }
   }
   mi_bfield_cycle_iterate_end(X);
+  // a request to an exclusive arena has no other arena to go to: it goes on to look in the chunks of every bin
+  if (bbin != MI_CBIN_HUGE && bbitmap->is_of_exclusive_arena) {
+    bbin = MI_CBIN_HUGE;
+    goto again;
+  }
   return false;
 }
 
@@ -1926,7 +1933,12 @@ static bool mi_bchunk_try_clearN_(mi_bbitmap_t* bbitmap, size_t chunk_idx, size_
   size_t count = 0;  // chunk count
   while (m > 0) {
     mi_bchunk_t* chunk = &bbitmap->chunks[chunk_idx + count];
-    if (!mi_bchunk_try_clearN(chunk, 0, (m > MI_BCHUNK_BITS ? MI_BCHUNK_BITS : m), NULL, NULL)) {
+    bool did_temp_clear_bits = false;
+    if (!mi_bchunk_try_clearN(chunk, 0, (m > MI_BCHUNK_BITS ? MI_BCHUNK_BITS : m), NULL, &did_temp_clear_bits)) {
+      if (did_temp_clear_bits) {
+        // may have raced with a clearer (in on_find) so set the chunkmap bit conservatively
+        mi_bbitmap_chunkmap_set(bbitmap, chunk_idx + count, false);
+      }
       goto rollback;
     }
     m = (m <= MI_BCHUNK_BITS ? 0 : m - MI_BCHUNK_BITS);
