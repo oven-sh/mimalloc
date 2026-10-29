@@ -96,8 +96,27 @@ int _mi_getenv(const char* name, char* result, size_t result_size) {
   return ENOENT;
 }
 #else
+#if defined(MI_GETENV_ALLOWED)
+// MI_GETENV_ALLOWED is a string of the names that are read from the environment, in lower case and separated
+// by commas ("mimalloc_purge_delay,mimalloc_arena_reserve"). No other name is read. An embedder can ask as well.
+mi_decl_externc bool mi_is_read_from_environment(const char* name);
+bool mi_is_read_from_environment(const char* name) {
+  const size_t len = _mi_strlen(name);
+  for (const char* s = MI_GETENV_ALLOWED; *s != 0; ) {
+    const char* end = s;
+    while (*end != 0 && *end != ',') { end++; }
+    if ((size_t)(end - s) == len && _mi_strnicmp(s, name, len) == 0) return true;
+    s = (*end == 0 ? end : end + 1);
+  }
+  return false;
+}
+#endif
+
 int _mi_getenv(const char* name, char* result, size_t result_size) {
   if (name==NULL || result == NULL || result_size < 64) return ENOENT;
+  #if defined(MI_GETENV_ALLOWED)
+  if (!mi_is_read_from_environment(name)) return ENOENT;
+  #endif
   // change the result of _mi_prim_getenv to an errno result
   const int res = _mi_prim_getenv(name,result,result_size);
   return (res > 0 ? 0 : (res == 0 ? ENOENT : EAGAIN));
