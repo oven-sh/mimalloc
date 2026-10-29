@@ -1267,6 +1267,8 @@ if (MI_BUILD_TESTS)
     endif()
     if(MI_DEBUG_TSAN AND TEST_NAME STREQUAL "fork")
     # don't add as a test
+    elseif(MI_DEBUG_TSAN AND TEST_NAME STREQUAL "pprof")
+    # don't add as a test: a pprof snapshot reads its tables as if sampling has stopped, and here other threads only notice a `mi_profiler_stop` at their next look
     elseif((NOT MI_PROFILE) AND (TEST_NAME STREQUAL "profile" OR TEST_NAME STREQUAL "pprof" OR TEST_NAME STREQUAL "stress-pprof"))
     # don't add as a test
     elseif(NOT APPLE AND TEST_NAME STREQUAL "stress-pprof")
