@@ -148,7 +148,7 @@ static mi_decl_noinline bool mi_thread_local_set_expand( mi_thread_local_t key, 
   const size_t idx = mi_key_index(key);
   mi_thread_locals_t* tls = mi_thread_locals_expand(idx);
   if (tls==NULL) {
-    _mi_error_message(EFAULT,"unable to allocate thread local variables\n");
+    _mi_error_message(ENOMEM,"unable to allocate thread local variables\n");
     return false;
   }
   mi_assert_internal(tls == mi_thread_locals_get());
