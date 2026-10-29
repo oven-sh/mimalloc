@@ -21,7 +21,7 @@ terms of the MIT license. A copy of the license can be found in the file
 
 #include "mimalloc.h"
 #include "mimalloc-stats.h"
-#include "mimalloc/internal.h"   // _mi_ptr_page, _mi_page_purged_count, _mi_page_purge_os_page_blocks
+#include "mimalloc/internal.h"   // mi_ptr_page, _mi_page_purged_count, _mi_page_purge_os_page_blocks
 
 #include "testhelper.h"
 
@@ -100,7 +100,7 @@ static size_t purged_blocks(void** ptrs, size_t n) {
   mi_page_t* last = NULL;
   for (size_t i = 0; i < n; i++) {
     if (ptrs[i] == NULL) continue;
-    mi_page_t* const page = _mi_ptr_page(ptrs[i]);
+    mi_page_t* const page = mi_ptr_page(ptrs[i]);
     if (page == last) continue;   // pointers are handed out per page, so this dedups most of it
     last = page;
     total += _mi_page_purged_count(page);
@@ -486,8 +486,8 @@ static bool test_large_pages(void) {
     if (ptrs[i] == NULL) { ok_all = false; goto done; }
     pattern_fill(ptrs[i], LARGE_SZ, i);
   }
-  eligible = mi_page_can_purge_holes(_mi_ptr_page(ptrs[0]));
-  singleton = (_mi_ptr_page(ptrs[0])->reserved <= 1);
+  eligible = mi_page_can_purge_holes(mi_ptr_page(ptrs[0]));
+  singleton = (mi_ptr_page(ptrs[0])->reserved <= 1);
   for (size_t i = 1; i < LARGE_N; i += 2) { mi_free(ptrs[i]); ptrs[i] = NULL; }
 
   before = hole_stats();
@@ -587,7 +587,7 @@ done:
 // 6b. the unformed tail: the blocks in `[capacity,reserved)` of a page are never
 //     handed out, but on a recycled arena slice their memory is already resident.
 //     The sweep must discard the OS pages that lie wholly inside that tail, and
-//     `mi_page_extend_free` must hand them back before it formats a block in one.
+//     `_mi_page_extend_free` must hand them back before it formats a block in one.
 // ---------------------------------------------------------------------------
 
 // Dirty a lot of arena slices and give them all back, so the pages we allocate next are
@@ -635,7 +635,7 @@ static bool test_unformed_tail(void) {
 
   void* first = mi_malloc(bsize);
   if (first == NULL) return false;
-  mi_page_t* const page = _mi_ptr_page(first);
+  mi_page_t* const page = mi_ptr_page(first);
   const size_t usable = mi_usable_size(first);
   const uint16_t cap0 = page->capacity;
   const uint16_t reserved = page->reserved;
@@ -686,7 +686,7 @@ static bool test_unformed_tail(void) {
   }
 
   // (b) fill the page: every block must be usable and keep its contents. This drives
-  //     `mi_page_extend_free` straight through the discarded tail, a few OS pages at a time.
+  //     `_mi_page_extend_free` straight through the discarded tail, a few OS pages at a time.
   ptrs = (void**)calloc(reserved, sizeof(void*));
   if (ptrs == NULL) { mi_free(first); return false; }
   ptrs[0] = first;
@@ -695,7 +695,7 @@ static bool test_unformed_tail(void) {
   for (size_t i = 1; i < (size_t)reserved; i++) {
     void* const q = mi_malloc(bsize);
     if (q == NULL) { ok = false; goto done; }
-    if (_mi_ptr_page(q) != page) { mi_free(q); break; }   // this page is full: the rest comes from another one
+    if (mi_ptr_page(q) != page) { mi_free(q); break; }   // this page is full: the rest comes from another one
     ptrs[i] = q;
     nlive++;
     pattern_fill(q, usable, i);
@@ -743,7 +743,7 @@ static bool test_unformed_tail_freed(void) {
 
   void* keep = mi_malloc(bsize);
   if (keep == NULL) return false;
-  mi_page_t* const page = _mi_ptr_page(keep);
+  mi_page_t* const page = mi_ptr_page(keep);
   if (!tail_page_is_interesting(page, "unformed-tail-freed")) { mi_free(keep); return false; }
 
   mi_on_thread_idle();
@@ -980,7 +980,7 @@ static bool test_holes_report(int mode) {
   for (size_t i = 0; i < REPORT_N; i++) {
     const uintptr_t key = (mode == 0
                              ? ((uintptr_t)ptrs[i] & ~(uintptr_t)(os - 1))
-                             : (uintptr_t)_mi_ptr_page(ptrs[i]));
+                             : (uintptr_t)mi_ptr_page(ptrs[i]));
     bool seen = false;
     for (size_t j = 0; j < nkept; j++) { if (kept[j] == key) { seen = true; break; } }
     if (seen) { mi_free(ptrs[i]); ptrs[i] = NULL; }
@@ -991,7 +991,7 @@ static bool test_holes_report(int mode) {
 
   for (size_t i = 0; i < REPORT_N; i++) {
     if (ptrs[i] == NULL) continue;
-    mi_page_t* const page = _mi_ptr_page(ptrs[i]);
+    mi_page_t* const page = mi_ptr_page(ptrs[i]);
     bool seen = false;
     for (size_t j = 0; j < npages; j++) { if (pages[j] == page) { seen = true; break; } }
     if (!seen) { pages[npages++] = page; }
@@ -1007,7 +1007,7 @@ static bool test_holes_report(int mode) {
     if (live == NULL) { ok = false; goto done; }
     size_t nmine = 0;
     for (size_t i = 0; i < REPORT_N; i++) {
-      if (ptrs[i] == NULL || _mi_ptr_page(ptrs[i]) != page) continue;
+      if (ptrs[i] == NULL || mi_ptr_page(ptrs[i]) != page) continue;
       const size_t idx = (size_t)((uint8_t*)ptrs[i] - mi_page_start(page)) / bs;
       live[idx / 64] |= ((uint64_t)1 << (idx % 64));
       nmine++;
@@ -1082,7 +1082,7 @@ static bool test_holes_report(int mode) {
     // the whole point: with one live block per OS page nothing around them is discardable, so every free
     // byte next to a live block is undiscardable -- the amplification we are chasing in JSC. (Not every free
     // byte: the last page can have formed blocks past the last one we were handed -- how far
-    // `mi_page_extend_free` reaches ahead depends on the configuration and, under MI_SECURE, on a random
+    // `_mi_page_extend_free` reaches ahead depends on the configuration and, under MI_SECURE, on a random
     // draw -- and an OS page of only those holds no live block and is discarded or pending. The per-page
     // ground truth above accounts for those exactly; here we only check the split adds up.)
     if (r->undiscardable_bytes + r->discarded_bytes + r->pending_bytes != r->free_bytes) {
@@ -1224,7 +1224,7 @@ static bool test_report_read_only_abandoned(void) {
 
   for (size_t i = 0; i < RO_N; i++) {
     if (ro_ptrs[i] == NULL) continue;
-    mi_page_t* const page = _mi_ptr_page(ro_ptrs[i]);
+    mi_page_t* const page = mi_ptr_page(ro_ptrs[i]);
     bool seen = false;
     for (size_t j = 0; j < npages; j++) { if (pages[j] == page) { seen = true; break; } }
     if (!seen) { pages[npages++] = page; }
@@ -1313,8 +1313,8 @@ static bool test_sweep_skip(void) {
   // area, so freeing it -- and nothing else -- makes that OS page discardable.
   for (size_t p0 = 0; p0 < SKIP_N && victim == SKIP_N; p0++) {
     if (ptrs[p0] == NULL) continue;
-    if (page != NULL && _mi_ptr_page(ptrs[p0]) == page) continue;   // (pages come in runs; only re-examine on a new one)
-    page = _mi_ptr_page(ptrs[p0]);
+    if (page != NULL && mi_ptr_page(ptrs[p0]) == page) continue;   // (pages come in runs; only re-examine on a new one)
+    page = mi_ptr_page(ptrs[p0]);
     bs = page->block_size;
     cap = page->capacity;
     pstart = (uintptr_t)mi_page_start(page);
@@ -1323,7 +1323,7 @@ static bool test_sweep_skip(void) {
     if (live == NULL) { ok = false; goto done; }
     nmine = 0;
     for (size_t i = 0; i < SKIP_N; i++) {
-      if (ptrs[i] == NULL || _mi_ptr_page(ptrs[i]) != page) continue;
+      if (ptrs[i] == NULL || mi_ptr_page(ptrs[i]) != page) continue;
       const size_t idx = (size_t)((uintptr_t)ptrs[i] - pstart) / bs;
       live[idx / 64] |= ((uint64_t)1 << (idx % 64));
       nmine++;
@@ -1342,7 +1342,7 @@ static bool test_sweep_skip(void) {
       }
       if (nlive != 1) continue;
       for (size_t i = 0; i < SKIP_N; i++) {
-        if (ptrs[i] == NULL || _mi_ptr_page(ptrs[i]) != page) continue;
+        if (ptrs[i] == NULL || mi_ptr_page(ptrs[i]) != page) continue;
         if ((size_t)((uintptr_t)ptrs[i] - pstart) / bs == only) { victim = i; break; }
       }
     }
@@ -1555,7 +1555,7 @@ static bool test_double_free_of_purged_block(void) {
   if (victim == NULL) { fprintf(stderr, "\n  no block was purged, so this proves nothing\n"); ok = false; goto done; }
 
   {
-    mi_page_t* const page = _mi_ptr_page(victim);
+    mi_page_t* const page = mi_ptr_page(victim);
     const size_t used = mi_page_used(page);
     const hole_stats_t s1 = hole_stats();
     dfree_eagain = 0; dfree_other = 0;
@@ -1617,14 +1617,14 @@ static bool test_sweep_full_every(void) {
     if ((i % 64) != 0) { mi_free(ptrs[i]); ptrs[i] = NULL; }   // 1 live block per pinned OS page
   }
   mi_on_thread_idle();   // sweep: discards what it can, leaves the pinned OS pages alone
-  page = _mi_ptr_page(ptrs[0]);
+  page = mi_ptr_page(ptrs[0]);
 
   // free a live block -- some OS page in this page may now be entirely free -- and then stamp the
   // page's swept state back to what it is NOW, which is exactly what a balanced churn (this free
   // plus one allocation elsewhere in the page) would have left behind. The `(capacity,used)` check
   // is blind to it by construction.
   for (size_t i = 0; i < BOUND_N; i++) {
-    if (ptrs[i] != NULL && _mi_ptr_page(ptrs[i]) == page) { mi_free(ptrs[i]); ptrs[i] = NULL; break; }
+    if (ptrs[i] != NULL && mi_ptr_page(ptrs[i]) == page) { mi_free(ptrs[i]); ptrs[i] = NULL; break; }
   }
   s0 = hole_stats();
   page->swept_state = (((uint64_t)page->capacity) << 32) | (uint64_t)mi_page_used(page);   // must match mi_page_sweep_state() in page.c

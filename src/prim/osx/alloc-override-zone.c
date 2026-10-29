@@ -6,8 +6,7 @@ terms of the MIT license. A copy of the license can be found in the file
 -----------------------------------------------------------------------------*/
 
 #include "mimalloc.h"
-#include "mimalloc/internal.h"
-#include "mimalloc/prim-tls.h"  // _mi_thread_is_initialized
+#include "mimalloc/prim/os.h"
 #if defined(MI_MALLOC_OVERRIDE)
 
 #if !defined(__APPLE__)
@@ -31,6 +30,10 @@ terms of the MIT license. A copy of the license can be found in the file
 #include <unistd.h>  // getpid
 
 #include "mimalloc-stats.h"
+#include "mimalloc/alloc/page.h"      // mi_page_used, mi_ptr_decode
+#include "mimalloc/heap/page-map.h"   // mi_aligned_ptr_page0
+#include "mimalloc/heap/subproc.h"    // _mi_subproc_main, _mi_process_fork_prepare
+#include "../../arena/bitmap.h"       // mi_bitmap_t / mi_bchunk_t layout
 
 #ifdef __cplusplus
 extern "C" {
@@ -45,10 +48,10 @@ extern malloc_zone_t* malloc_default_purgeable_zone(void) __attribute__((weak_im
    malloc zone members
 ------------------------------------------------------ */
 
-static bool is_mimalloc_zone( malloc_zone_t* zone ); 
+static bool is_mimalloc_zone( malloc_zone_t* zone );
 
 static size_t zone_size(malloc_zone_t* zone, const void* p) {
-  if (mi_any_heap_contains(p)) { 
+  if (mi_any_heap_contains(p)) {
     return mi_usable_size(p);
   }
   else if (!is_mimalloc_zone(zone)) {  // can happen due to interpose
@@ -75,7 +78,7 @@ static void* zone_valloc(malloc_zone_t* zone, size_t size) {
 }
 
 static void zone_free(malloc_zone_t* zone, void* p) {
-  // during C++ thread shutdown `_pthread_tsd_cleanup` may call `zone_free` 
+  // during C++ thread shutdown `_pthread_tsd_cleanup` may call `zone_free`
   // after mimalloc mi_thread_done, and also on a pointer that was allocated in another subproc.
   if mi_unlikely(!mi_cfree(p)) {
     if (!is_mimalloc_zone(zone)) {  // can happen due to interpose
@@ -173,8 +176,6 @@ static void mi_zone_enum_push(mi_zone_enum_t* e, unsigned type, void* addr, size
    Every pointer is a remote address; dereference via `reader`.
 ------------------------------------------------------ */
 
-#include "../../bitmap.h"   // mi_bitmap_t / mi_bchunk_t layout
-
 static kern_return_t mi_zr_identity(task_t task, vm_address_t addr, vm_size_t size, void** out) {
   MI_UNUSED(task); MI_UNUSED(size);
   *out = (void*)addr;
@@ -242,7 +243,7 @@ static kern_return_t mi_zone_enum_remote_page(task_t task, memory_reader_t reade
   #define MI_ZR_MAX_BLOCKS  (MI_SMALL_PAGE_SIZE / sizeof(void*))
   uintptr_t free_map[MI_ZR_MAX_BLOCKS / MI_INTPTR_BITS];
   const size_t cap = (lpage.capacity > MI_ZR_MAX_BLOCKS ? MI_ZR_MAX_BLOCKS : lpage.capacity);
-  const size_t mapw = _mi_divide_up(cap, MI_INTPTR_BITS);
+  const size_t mapw = mi_divide_up(cap, MI_INTPTR_BITS);
   memset(free_map, 0, mapw * sizeof(uintptr_t));
 
   if (mi_zone_enum_remote_freelist(task, reader, rpage, &lpage, pstart, bsize, lpage.free,       free_map, cap) != KERN_SUCCESS) return KERN_FAILURE;
@@ -281,9 +282,9 @@ static kern_return_t mi_zone_enum_remote_bitmap(task_t task, memory_reader_t rea
         #if MI_PAGE_META_IS_ALIGNED
         // mirror `mi_arena_page_at_slice`: the aligned page meta entry of the slice points to the actual page
         // struct through `self` (also for small-block pages that keep it at the slice start).
-        // (`_mi_aligned_ptr_page0` is address arithmetic only, so it is fine on a remote address)
+        // (`mi_aligned_ptr_page0` is address arithmetic only, so it is fine on a remote address)
         MI_UNUSED(rpages_meta);
-        const vm_address_t rmeta = (vm_address_t)_mi_aligned_ptr_page0((const void*)rpage);
+        const vm_address_t rmeta = (vm_address_t)mi_aligned_ptr_page0((const void*)rpage);
         vm_address_t rself = 0;
         MI_ZR(&rself, rmeta + offsetof(mi_page_t, self), sizeof(rself));
         rpage = rself;
@@ -339,27 +340,29 @@ static kern_return_t intro_enumerator(task_t task, void* context,
   }
 
   // walk every heap → arena_pages[i]->pages bitmap → page → blocks
-  vm_address_t rheap = (vm_address_t)lsubproc.heaps;
-  while (rheap != 0) {
-    mi_heap_t lheap; MI_ZR(&lheap, rheap, sizeof(lheap));
-    for (size_t i = 0; i < MI_MAX_ARENAS; i++) {
-      mi_arena_pages_t* rap = lheap.arena_pages[i];
-      mi_arena_t*       ra  = lsubproc.arenas[i];
-      if (rap == NULL || ra == NULL) continue;
-      mi_arena_t la; MI_ZR(&la, ra, sizeof(la));
-      mi_arena_pages_t lap; MI_ZR(&lap, rap, sizeof(lap));
-      kern_return_t kr = mi_zone_enum_remote_bitmap(task, reader, &e,
-                            (vm_address_t)la.start, (vm_address_t)la.pages_meta, (vm_address_t)lap.pages);
-      if (kr != KERN_SUCCESS) return kr;
+  for (size_t shard = 0; shard < MI_HEAPS_SHARD_COUNT; shard++) {
+    vm_address_t rheap = (vm_address_t)lsubproc.heaps[shard].first;
+    while (rheap != 0) {
+      mi_heap_t lheap; MI_ZR(&lheap, rheap, sizeof(lheap));
+      for (size_t i = 0; i < MI_MAX_ARENAS; i++) {
+        mi_arena_pages_t* rap = lheap.arena_pages[i];
+        mi_arena_t*       ra  = lsubproc.arenas[i];
+        if (rap == NULL || ra == NULL) continue;
+        mi_arena_t la; MI_ZR(&la, ra, sizeof(la));
+        mi_arena_pages_t lap; MI_ZR(&lap, rap, sizeof(lap));
+        kern_return_t kr = mi_zone_enum_remote_bitmap(task, reader, &e,
+                              (vm_address_t)la.start, (vm_address_t)la.pages_meta, (vm_address_t)lap.pages);
+        if (kr != KERN_SUCCESS) return kr;
+      }
+      // OS-allocated abandoned pages (not in any arena bitmap)
+      vm_address_t rosp = (vm_address_t)lheap.os_abandoned_pages;
+      while (rosp != 0) {
+        mi_page_t lp; MI_ZR(&lp, rosp, sizeof(lp));
+        mi_zone_enum_remote_page(task, reader, &e, rosp);
+        rosp = (vm_address_t)lp.next;
+      }
+      rheap = (vm_address_t)lheap.next;
     }
-    // OS-allocated abandoned pages (not in any arena bitmap)
-    vm_address_t rosp = (vm_address_t)lheap.os_abandoned_pages;
-    while (rosp != 0) {
-      mi_page_t lp; MI_ZR(&lp, rosp, sizeof(lp));
-      mi_zone_enum_remote_page(task, reader, &e, rosp);
-      rosp = (vm_address_t)lp.next;
-    }
-    rheap = (vm_address_t)lheap.next;
   }
   mi_zone_enum_flush(&e, MALLOC_PTR_IN_USE_RANGE_TYPE);
   return KERN_SUCCESS;
@@ -466,7 +469,7 @@ static malloc_introspection_t mi_introspect = {
   #else
   .enumerate_unavailable_without_blocks = NULL,
   #endif
-#endif  
+#endif
 #if defined(MAC_OS_X_VERSION_10_12) && (MAC_OS_X_VERSION_MAX_ALLOWED >= MAC_OS_X_VERSION_10_12) && !defined(__ppc__)
   .reinit_lock = &intro_reinit_lock,
 #endif
@@ -522,7 +525,7 @@ static bool is_mimalloc_zone( malloc_zone_t* zone ) {
 // our mimalloc zone. Since even the loader uses malloc
 // on macOS, this ensures that all allocations go through
 // mimalloc (as all calls are interposed).
-// The main `malloc`, `free`, etc calls are interposed in `alloc-override.c`,
+// The main `malloc`, `free`, etc calls are interposed in `alloc/alloc-override.c`,
 // Here, we also override macOS specific API's like
 // `malloc_zone_calloc` etc. see <https://github.com/aosm/libmalloc/blob/master/man/malloc_zone_malloc.3>
 // ------------------------------------------------------
@@ -625,16 +628,9 @@ static void zone_unregister(malloc_zone_t* zone) {
 
 // use interposing so `DYLD_INSERT_LIBRARIES` works without `DYLD_FORCE_FLAT_NAMESPACE=1`
 // See: <https://books.google.com/books?id=K8vUkpOXhN4C&pg=PA73>
-struct mi_interpose_s {
-  const void* replacement;
-  const void* target;
-};
-#define MI_INTERPOSE_FUN(oldfun,newfun) { (const void*)&newfun, (const void*)&oldfun }
-#define MI_INTERPOSE_MI(fun)            MI_INTERPOSE_FUN(fun,mi_##fun)
 #define MI_INTERPOSE_ZONE(fun)          MI_INTERPOSE_FUN(malloc_##fun,fun)
-__attribute__((used)) static const struct mi_interpose_s _mi_zone_interposes[]  __attribute__((section("__DATA, __interpose"))) =
+MI_INTERPOSE_DECLS(_mi_zone_interposes) =
 {
-
   MI_INTERPOSE_MI(malloc_create_zone),
   MI_INTERPOSE_MI(malloc_default_purgeable_zone),
   MI_INTERPOSE_MI(malloc_default_zone),

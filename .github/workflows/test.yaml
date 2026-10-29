@@ -31,7 +31,7 @@ jobs:
           - os: macos-14
             tests: extra
           - c_or_cxx: cxx
-            tests: extra                       
+            tests: extra
           # this fork is always compiled as C++ on Windows (32-bit atomics that the MSVC C wrapper does not model)
           - os: windows-latest
             c_or_cxx: c
@@ -51,7 +51,7 @@ jobs:
           - os: windows-latest      # clang-cl and clang
             tests: clang
           - os: windows-11-arm      # clang-cl and clang
-            tests: clang  
+            tests: clang
           # - os: ubuntu-latest       # slow, so disable by default
           #   tests: freebsd-arm64    # qemu
 
@@ -59,6 +59,8 @@ jobs:
       # Checkout: https://github.com/actions/checkout
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       # Choose MI_USE_CXX setting
       - name: Set default cmake options
@@ -69,7 +71,7 @@ jobs:
             echo "CMAKE_CXX_OPT_DEFAULT=-DMI_USE_CXX=ON"  >> $GITHUB_OUTPUT
           else # Default to C mode
             echo "CMAKE_CXX_OPT_DEFAULT=-DMI_USE_CXX=OFF" >> $GITHUB_OUTPUT
-          fi          
+          fi
 
       # Basic
       - name: Release
@@ -156,7 +158,7 @@ jobs:
       - name: Release, Linux, TLS pthreads
         if: matrix.tests == 'extra' && runner.os == 'linux'
         run: |
-          cmake . -B out/release-tls-pthreads -DCMAKE_BUILD_TYPE=Release -DMI_TLS_MODEL_PTHREADS=ON -DMI_SEE_ASM=ON 
+          cmake . -B out/release-tls-pthreads -DCMAKE_BUILD_TYPE=Release -DMI_TLS_MODEL_PTHREADS=ON -DMI_SEE_ASM=ON
           cmake --build out/release-tls-pthreads --parallel 4 --config Release
           ctest --test-dir out/release-tls-pthreads --verbose --timeout 240 -C Release
 
@@ -164,26 +166,26 @@ jobs:
       - name: Release, SIMD
         if: matrix.tests == 'extra'
         run: |
-          cmake . -B out/release-simd -DCMAKE_BUILD_TYPE=Release -DMI_OPT_ARCH=ON -DMI_OPT_SIMD=ON 
+          cmake . -B out/release-simd -DCMAKE_BUILD_TYPE=Release -DMI_OPT_ARCH=ON -DMI_OPT_SIMD=ON
           cmake --build out/release-simd --parallel 8 --config Release
           ctest --test-dir out/release-simd --verbose --timeout 240 -C Release
 
       - name: Debug, C++, clang++
-        if: matrix.tests == 'extra' && runner.os == 'Linux' 
+        if: matrix.tests == 'extra' && runner.os == 'Linux'
         run: |
           CC=clang CXX=clang++ cmake . -B out/debug-clang-cxx -DCMAKE_BUILD_TYPE=Debug -DMI_DEBUG=FULL -DMI_USE_CXX=ON
           cmake --build out/debug-clang-cxx --parallel 8 --config Debug
           ctest --test-dir out/debug-clang-cxx --verbose --timeout 240 -C Debug
 
       - name: Release, C++, clang++
-        if: matrix.tests == 'extra' && runner.os == 'Linux' 
+        if: matrix.tests == 'extra' && runner.os == 'Linux'
         run: |
           CC=clang CXX=clang++ cmake . -B out/release-clang-cxx -DCMAKE_BUILD_TYPE=Release -DMI_OPT_ARCH=ON -DMI_USE_CXX=ON -DMI_SEE_ASM=ON
           cmake --build out/release-clang-cxx --parallel 8 --config Release
           ctest --test-dir out/release-clang-cxx --verbose --timeout 240 -C Release
 
       - name: Release, C++, clang++, Asm
-        if: matrix.tests == 'extra' && runner.os == 'Linux' 
+        if: matrix.tests == 'extra' && runner.os == 'Linux'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: ${{ matrix.os }}-clang-cxx-asm
@@ -192,14 +194,14 @@ jobs:
       - name: Debug, ASAN
         if: matrix.tests == 'extra' && runner.os == 'Linux'
         run: |
-          CC=clang CXX=clang++ cmake . -B out/debug-asan -DCMAKE_BUILD_TYPE=Debug -DMI_DEBUG=FULL -DMI_TRACK=ASAN 
+          CC=clang CXX=clang++ cmake . -B out/debug-asan -DCMAKE_BUILD_TYPE=Debug -DMI_DEBUG=FULL -DMI_TRACK=ASAN
           cmake --build out/debug-asan --parallel 8 --config Debug
           ctest --test-dir out/debug-asan --verbose --timeout 240 -C Debug
 
       - name: Debug, UBSAN
-        if: matrix.tests == 'extra' && runner.os == 'Linux' 
+        if: matrix.tests == 'extra' && runner.os == 'Linux'
         run: |
-          CC=clang CXX=clang++ cmake . -B out/debug-ubsan-cxx -DCMAKE_BUILD_TYPE=Debug -DMI_DEBUG=FULL -DMI_DEBUG_UBSAN=ON 
+          CC=clang CXX=clang++ cmake . -B out/debug-ubsan-cxx -DCMAKE_BUILD_TYPE=Debug -DMI_DEBUG=FULL -DMI_DEBUG_UBSAN=ON
           cmake --build out/debug-ubsan-cxx --parallel 8 --config Debug
           ctest --test-dir out/debug-ubsan-cxx --verbose --timeout 240 -C Debug
 
@@ -208,9 +210,9 @@ jobs:
         env:
           MI_TEST_LIGHT: 1   # the full TSAN stress does not fit the timeout on the 4 core runners
         run: |
-          CC=clang CXX=clang++ cmake . -B out/debug-tsan -DCMAKE_BUILD_TYPE=Debug -DMI_DEBUG=FULL -DMI_DEBUG_TSAN=ON 
+          CC=clang CXX=clang++ cmake . -B out/debug-tsan -DCMAKE_BUILD_TYPE=Debug -DMI_DEBUG=FULL -DMI_DEBUG_TSAN=ON
           cmake --build out/debug-tsan --parallel 8 --config Debug
-          ctest --test-dir out/debug-tsan --verbose --timeout 240 -C Debug
+          ctest --test-dir out/debug-tsan --verbose --timeout 360 -C Debug
 
       - name: Debug, Guarded
         if: matrix.tests == 'extra' && runner.os != 'macOS'
@@ -233,7 +235,7 @@ jobs:
       - name: Debug, Use pagemap
         if: matrix.tests == 'extra' && runner.os == 'Linux' && (startsWith(github.ref_name,'dev3') || startsWith(github.ref_name,'bun') || github.event_name == 'pull_request')
         run: |
-          cmake . -B out/debug-pagemap -DCMAKE_BUILD_TYPE=Debug -DMI_DEBUG=FULL -DMI_FREE_USE_PAGEMAP=ON 
+          cmake . -B out/debug-pagemap -DCMAKE_BUILD_TYPE=Debug -DMI_DEBUG=FULL -DMI_FREE_USE_PAGEMAP=ON
           cmake --build out/debug-pagemap --parallel 8 --config Debug
           ctest --test-dir out/debug-pagemap --verbose --timeout 240 -C Debug
 
@@ -247,7 +249,7 @@ jobs:
       - name: Debug, Secure Full
         if: matrix.tests == 'extra' && runner.os != 'macOS'
         run: |
-          cmake . -B out/debug-secure-full -DCMAKE_BUILD_TYPE=Debug -DMI_DEBUG=FULL -DMI_SECURE=FULL 
+          cmake . -B out/debug-secure-full -DCMAKE_BUILD_TYPE=Debug -DMI_DEBUG=FULL -DMI_SECURE=FULL
           cmake --build out/debug-secure-full --parallel 8 --config Debug
           ctest --test-dir out/debug-secure-full --verbose --timeout 240 -C Debug
 
@@ -261,8 +263,8 @@ jobs:
       # MSYS2 mingw64
       - name: mingw-ucrt64 x64, Setup
         if: matrix.tests == 'mingw-ucrt64'
-        uses: msys2/setup-msys2@66cd2cce69caa17b53920067426061ca1de3a884 # v2.32.0     
-        with: 
+        uses: msys2/setup-msys2@ec48f7c5447b3140e2b088413ae3a55687bccb6e # v2.33.0
+        with:
           msystem: UCRT64
           install: |
             mingw-w64-ucrt-x86_64-gcc
@@ -291,7 +293,7 @@ jobs:
       # VM: FreeBSD (arm64 and x64)
       - name: FreeBSD arm64, Setup
         if: matrix.tests == 'freebsd-arm64'
-        uses: vmactions/freebsd-vm@f0552d3b69211736abd97f02ff3d4674c56b73b1 # v1.5.5
+        uses: vmactions/freebsd-vm@a2f9a41fa97f6848b8c3b791087dfcdaa5b473ff # v1.5.8
         with:
           arch: arm64
           custom-shell-name: freebsd-arm64
@@ -305,7 +307,7 @@ jobs:
         shell: freebsd-arm64 {0}
         run: |
           export MI_TEST_LIGHT=1
-          cmake . -B out/debug-arm64 -G Ninja -DCMAKE_BUILD_TYPE=Debug -DMI_DEBUG=FULL 
+          cmake . -B out/debug-arm64 -G Ninja -DCMAKE_BUILD_TYPE=Debug -DMI_DEBUG=FULL
           cmake --build out/debug-arm64 --parallel 4 --config Debug
           ctest --test-dir out/debug-arm64 --verbose --timeout 240 -C Debug
 
@@ -314,7 +316,7 @@ jobs:
         shell: freebsd-arm64 {0}
         run: |
           export MI_TEST_LIGHT=1
-          cmake . -B out/release-arm64 -G Ninja -DCMAKE_BUILD_TYPE=Release  -DMI_OPT_ARCH=ON 
+          cmake . -B out/release-arm64 -G Ninja -DCMAKE_BUILD_TYPE=Release  -DMI_OPT_ARCH=ON
           cmake --build out/release-arm64 --parallel 4 --config Release
           ctest --test-dir out/release-arm64 --verbose --timeout 240 -C Release
 
@@ -323,7 +325,7 @@ jobs:
         shell: freebsd-arm64 {0}
         run: |
           export MI_TEST_LIGHT=1
-          cmake . -B out/secure-arm64 -G Ninja -DCMAKE_BUILD_TYPE=Release -DMI_SECURE=ON 
+          cmake . -B out/secure-arm64 -G Ninja -DCMAKE_BUILD_TYPE=Release -DMI_SECURE=ON
           cmake --build out/secure-arm64 --parallel 4 --config Release
           ctest --test-dir out/secure-arm64 --verbose --timeout 240 -C Release
 
@@ -343,7 +345,7 @@ jobs:
         if: matrix.tests == 'freebsd-x64'
         shell: freebsd-x64 {0}
         run: |
-          cmake . -B out/debug-x64 -DCMAKE_BUILD_TYPE=Debug -DMI_DEBUG=FULL 
+          cmake . -B out/debug-x64 -DCMAKE_BUILD_TYPE=Debug -DMI_DEBUG=FULL
           cmake --build out/debug-x64 --parallel 4 --config Debug
           ctest --test-dir out/debug-x64 --verbose --timeout 240 -C Debug
 
@@ -351,7 +353,7 @@ jobs:
         if: matrix.tests == 'freebsd-x64'
         shell: freebsd-x64 {0}
         run: |
-          cmake . -B out/release-x64 -DCMAKE_BUILD_TYPE=Release  -DMI_OPT_ARCH=ON 
+          cmake . -B out/release-x64 -DCMAKE_BUILD_TYPE=Release  -DMI_OPT_ARCH=ON
           cmake --build out/release-x64 --parallel 4 --config Release
           ctest --test-dir out/release-x64 --verbose --timeout 240 -C Release
 
@@ -359,6 +361,6 @@ jobs:
         if: matrix.tests == 'freebsd-x64'
         shell: freebsd-x64 {0}
         run: |
-          cmake . -B out/secure-x64 -DCMAKE_BUILD_TYPE=Release -DMI_SECURE=ON 
+          cmake . -B out/secure-x64 -DCMAKE_BUILD_TYPE=Release -DMI_SECURE=ON
           cmake --build out/secure-x64 --parallel 4 --config Release
           ctest --test-dir out/secure-x64 --verbose --timeout 240 -C Release

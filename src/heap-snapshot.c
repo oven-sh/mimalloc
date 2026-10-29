@@ -16,11 +16,14 @@ terms of the MIT license. A copy of the license can be found in the file
 // is requested (those pages have their free lists collected).
 
 #include "mimalloc.h"
-#include "mimalloc/internal.h"
-#include "mimalloc/atomic.h"
-#include "mimalloc/prim.h"
-#include "mimalloc/prim-tls.h"
-#include "bitmap.h"
+#include "mimalloc/prim/prim-tls.h"   // _mi_theap_default, _mi_prim_thread_id
+#include "mimalloc/util/libc.h"       // _mi_getenv, _mi_snprintf
+#include "mimalloc/util/options.h"    // _mi_message
+#include "mimalloc/util/stats.h"      // _mi_clock_now
+#include "mimalloc/alloc/page.h"
+#include "mimalloc/heap/page-map.h"   // _mi_safe_ptr_page
+#include "mimalloc/heap/heap.h"
+#include "arena/arena.h"              // mi_arena_slice_start, mi_arenas_get_count, and the bitmaps
 
 #if defined(_WIN32)
 #include <io.h>
@@ -85,7 +88,7 @@ static void mi_snap_put(mi_snap_out_t* out, const void* p, size_t n) {
     if (out->pos == MI_SNAP_BUFSIZE) mi_snap_flush(out);
     size_t avail = MI_SNAP_BUFSIZE - out->pos;
     size_t take = (n < avail ? n : avail);
-    _mi_memcpy(out->buf + out->pos, src, take);
+    mi_memcpy(out->buf + out->pos, src, take);
     out->pos += take; src += take; n -= take;
   }
 }
@@ -143,7 +146,7 @@ static void mi_snap_emit_page_freemap(mi_snap_out_t* out, mi_page_t* page) {
   // Because the free list is unordered, do it in a single buffer if it fits;
   // otherwise fall back to a simple per-block scan (rare: cap > 4096).
   if (nbytes <= sizeof(map)) {
-    _mi_memzero(map, nbytes);
+    mi_memzero(map, nbytes);
     uint64_t magic; size_t shift;
     {
       // fast division setup (replicates mi_get_fast_divisor)
@@ -174,7 +177,7 @@ static void mi_snap_emit_page_freemap(mi_snap_out_t* out, mi_page_t* page) {
   mi_snap_u32(out, (uint32_t)nbytes);
   while (emitted < nbytes) {
     size_t take = nbytes - emitted; if (take > sizeof(map)) take = sizeof(map);
-    _mi_memzero(map, take);
+    mi_memzero(map, take);
     // mark every block index whose address appears in the free list within this window
     for (mi_block_t* b = page->free; b != NULL; b = mi_block_next(page, b)) {
       size_t off = (size_t)((uint8_t*)b - pstart);
@@ -203,7 +206,7 @@ static uint8_t mi_snap_page_kind(const mi_page_t* page) {
   if (mi_page_is_singleton(page)) return (uint8_t)MI_PAGE_SINGLETON;
   const size_t bsize = mi_page_block_size(page);
   if (bsize <= MI_SMALL_MAX_OBJ_SIZE)  return (uint8_t)MI_PAGE_SMALL;
-  if (bsize <= MI_MEDIUM_MAX_OBJ_SIZE) return (uint8_t)MI_PAGE_MEDIUM;
+  if (mi_block_size_is_medium(bsize))  return (uint8_t)MI_PAGE_MEDIUM;
   return (uint8_t)MI_PAGE_LARGE;
 }
 
@@ -260,7 +263,7 @@ static void mi_snap_emit_arena_header(mi_snap_out_t* out, mi_arena_t* arena, siz
   mi_snap_u32(out, MI_SNAP_SEC_ARENA);
   mi_snap_u32(out, (uint32_t)idx);
   mi_snap_u64(out, (uint64_t)(uintptr_t)mi_arena_slice_start(arena,0));   // base address (the arena info itself comes after the aligned page meta slices)
-  mi_snap_u64(out, (uint64_t)mi_size_of_slices(arena->slice_count));
+  mi_snap_u64(out, (uint64_t)_mi_size_of_slices(arena->slice_count));
   mi_snap_u32(out, (uint32_t)arena->slice_count);
   mi_snap_u32(out, (uint32_t)arena->info_slices);
   mi_snap_u32(out, (uint32_t)(int32_t)arena->numa_node);
@@ -346,7 +349,7 @@ int mi_heap_snapshot(int fd, unsigned flags) mi_attr_noexcept {
   if (subproc == NULL) return -1;
 
   mi_snap_out_t out;
-  _mi_memzero(&out, sizeof(out));
+  mi_memzero(&out, sizeof(out));
   out.fd = fd;
 
   mi_snap_ctx_t ctx;
@@ -427,7 +430,7 @@ void _mi_heap_snapshot_on_exit(void) {
   unsigned flags = (opt >= 2 ? MI_SNAPSHOT_BLOCKS : 0);
 
   char path[512];
-  if (!_mi_getenv("MIMALLOC_SNAPSHOT_PATH", path, sizeof(path))) {
+  if (_mi_getenv("MIMALLOC_SNAPSHOT_PATH", path, sizeof(path)) != 0) {
     _mi_snprintf(path, sizeof(path), "mimalloc-snapshot.%d.bin", (int)mi_snap_getpid());
   }
   if (mi_heap_snapshot_to_file(path, flags) == 0) {

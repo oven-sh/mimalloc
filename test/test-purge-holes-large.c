@@ -26,8 +26,8 @@ terms of the MIT license. A copy of the license can be found in the file
 
 #include "mimalloc.h"
 #include "mimalloc-stats.h"
-#include "mimalloc/internal.h"   // _mi_ptr_page, mi_page_purge_unit, _mi_page_purged_count, _mi_page_purge_os_page_blocks
-#include "mimalloc/prim-tls.h"   // _mi_theap_default
+#include "mimalloc/internal.h"   // mi_ptr_page, mi_page_purge_unit, _mi_page_purged_count, _mi_page_purge_os_page_blocks
+#include "mimalloc/prim/prim-tls.h"   // _mi_theap_default
 
 #include "testhelper.h"
 #if !defined(_WIN32)
@@ -103,8 +103,8 @@ static void sleep_ms(unsigned ms) {
 static size_t resident_bytes(const void* p, size_t size) {
   #if HAVE_MINCORE
   const size_t os = _mi_os_page_size();
-  const uintptr_t lo = _mi_align_up((uintptr_t)p, os);
-  const uintptr_t hi = _mi_align_down((uintptr_t)p + size, os);
+  const uintptr_t lo = mi_align_up((uintptr_t)p, os);
+  const uintptr_t hi = mi_align_down((uintptr_t)p + size, os);
   if (hi <= lo) return 0;
   const size_t n = (size_t)(hi - lo) / os;
   unsigned char* vec = (unsigned char*)calloc(n, 1);
@@ -189,7 +189,7 @@ static bool test_unit(void) {
   for (size_t i = 0; i < 4; i++) {
     void* p = mi_malloc(small_sizes[i]);
     if (p == NULL) return false;
-    const mi_page_t* page = _mi_ptr_page(p);
+    const mi_page_t* page = mi_ptr_page(p);
     if (mi_page_size(page) <= MI_MEDIUM_PAGE_SIZE && mi_page_purge_unit(page) != os) {
       fprintf(stderr, "\n  a page of %zu byte blocks has a unit of %zu bytes (the OS page is %zu)\n", small_sizes[i], mi_page_purge_unit(page), os);
       ok_all = false;
@@ -200,17 +200,17 @@ static bool test_unit(void) {
   for (int which = 0; which < 3; which++) {
     void* p = mi_malloc(large_size(which));
     if (p == NULL) return false;
-    const mi_page_t* page = _mi_ptr_page(p);
+    const mi_page_t* page = mi_ptr_page(p);
     if (is_large_page(page)) {
       const size_t unit = mi_page_purge_unit(page);
       const size_t bits = mi_page_purge_bits(page);
       const uintptr_t start = (uintptr_t)mi_page_start(page);
       const uintptr_t end = start + mi_page_size(page);
-      bool good = (unit >= os && _mi_is_power_of_two(unit) && bits <= MI_PAGE_PURGE_BITS && mi_page_can_purge_holes(page));
+      bool good = (unit >= os && mi_is_power_of_two(unit) && bits <= MI_PAGE_PURGE_BITS && mi_page_can_purge_holes(page));
       // no smaller unit fits
       if (good && unit > os) {
         const size_t half = unit / 2;
-        good = (_mi_divide_up((size_t)(end - _mi_align_down(start, half)), half) > MI_PAGE_PURGE_BITS);
+        good = (mi_divide_up((size_t)(end - mi_align_down(start, half)), half) > MI_PAGE_PURGE_BITS);
       }
       // the base is aligned to the unit and covers the start of the blocks
       good = good && ((mi_page_purge_base(page) % unit) == 0) && (mi_page_purge_base(page) <= start) && (start - mi_page_purge_base(page) < unit);
@@ -247,9 +247,9 @@ static bool test_unit_arithmetic(void) {
         const uintptr_t slice = (uintptr_t)1 << 30;
         const uintptr_t pstart = slice + offsets[o];
         const size_t capacity = (4*MI_MiB - offsets[o]) / bs;
-        const uintptr_t base = _mi_align_down(pstart, unit);
+        const uintptr_t base = mi_align_down(pstart, unit);
         const uintptr_t pend = pstart + capacity*bs;
-        const size_t nbits = _mi_divide_up((size_t)((pstart + capacity*bs) - base), unit);
+        const size_t nbits = mi_divide_up((size_t)((pstart + capacity*bs) - base), unit);
         for (size_t k = 0; k < nbits; k++) {
           const uintptr_t lo = base + k*unit;
           const uintptr_t hi = lo + unit;
@@ -295,8 +295,8 @@ static bool test_discard(int which) {
   const size_t n = 40;
   memset(ptrs, 0, sizeof(ptrs)); memset(freed, 0, sizeof(freed));
   if (!alloc_filled(ptrs, n, size, &usable)) { free_all(ptrs, n); return false; }
-  const bool large = is_large_page(_mi_ptr_page(ptrs[0]));
-  const size_t bsize = _mi_ptr_page(ptrs[0])->block_size;
+  const bool large = is_large_page(mi_ptr_page(ptrs[0]));
+  const size_t bsize = mi_ptr_page(ptrs[0])->block_size;
 
   // keep every third block: the others are free blocks with a live neighbour
   size_t nfreed = 0;
@@ -328,7 +328,7 @@ static bool test_discard(int which) {
   }
   else if (purging_enabled) {
     // every freed block shares no unit with a live one when the block size is a multiple of the unit; else it keeps its edges
-    const mi_page_t* page = _mi_ptr_page(ptrs[0]);
+    const mi_page_t* page = mi_ptr_page(ptrs[0]);
     const size_t unit = mi_page_purge_unit(page);
     const bool whole_blocks = ((bsize % unit) == 0 && (((uintptr_t)mi_page_start(page)) % unit) == 0);
     if (whole_blocks && npurged != nfreed) {
@@ -409,7 +409,7 @@ static bool test_reuse(void) {
     if (pattern_check(again[i], u, 1000 + i) != u) { fprintf(stderr, "\n  a reused block lost its contents\n"); ok_all = false; break; }
   }
   if (!survivors_intact(ptrs, n, usable, "reuse")) { ok_all = false; }
-  if (purging_enabled && is_large_page(_mi_ptr_page(ptrs[0]))) {
+  if (purging_enabled && is_large_page(mi_ptr_page(ptrs[0]))) {
     if (swept.bytes_now <= before.bytes_now) { fprintf(stderr, "\n  nothing was discarded before the reuse\n"); ok_all = false; }
     if (after.reuses <= swept.reuses || after.bytes_now >= swept.bytes_now) {
       fprintf(stderr, "\n  the holes were not taken back: %lld reuses, %lld bytes still discarded (of %lld)\n",
@@ -464,7 +464,7 @@ static bool test_cross_thread_free(void) {
   sweep();                                  // collects those frees; they are holes as well now
   const hole_stats_t second = hole_stats();
   if (!survivors_intact(xt_ptrs, xt_n, xt_usable, "cross-thread free, second sweep")) { ok_all = false; }
-  if (purging_enabled && is_large_page(_mi_ptr_page(xt_ptrs[0]))) {
+  if (purging_enabled && is_large_page(mi_ptr_page(xt_ptrs[0]))) {
     if (first.bytes_now <= start.bytes_now || second.bytes_now <= first.bytes_now) {
       fprintf(stderr, "\n  discarded bytes: %lld at the start, %lld after the first sweep, %lld after the frees from the other thread and a second sweep\n",
               (long long)start.bytes_now, (long long)first.bytes_now, (long long)second.bytes_now);
@@ -489,7 +489,7 @@ static bool test_realloc(void) {
   const size_t n = 16;
   memset(ptrs, 0, sizeof(ptrs));
   if (!alloc_filled(ptrs, n, size, &usable)) { free_all(ptrs, n); return false; }
-  const bool large = is_large_page(_mi_ptr_page(ptrs[0]));
+  const bool large = is_large_page(mi_ptr_page(ptrs[0]));
   const hole_stats_t before = hole_stats();
   for (size_t i = 0; i < n; i++) { if ((i % 2) == 1) { mi_free(ptrs[i]); ptrs[i] = NULL; } }
   sweep();
@@ -543,8 +543,8 @@ static bool test_abandoned(void) {
   ab_n = 20;
   memset(ab_ptrs, 0, sizeof(ab_ptrs)); memset(ab_freed, 0, sizeof(ab_freed));
   if (!mi_run_on_thread(&ab_worker)) return false;
-  const size_t bsize = (ab_ptrs[0] != NULL ? _mi_ptr_page(ab_ptrs[0])->block_size : 0);
-  const bool large = (ab_ptrs[0] != NULL && is_large_page(_mi_ptr_page(ab_ptrs[0])));
+  const size_t bsize = (ab_ptrs[0] != NULL ? mi_ptr_page(ab_ptrs[0])->block_size : 0);
+  const bool large = (ab_ptrs[0] != NULL && is_large_page(mi_ptr_page(ab_ptrs[0])));
   sweep();   // the sweep of this thread goes over the abandoned pages of its heaps that are in the abandoned map
   size_t npurged = 0, nfreed = 0;
   for (size_t i = 0; i < ab_n; i++) {
@@ -596,7 +596,7 @@ static bool test_heap_release(bool destroy) {
   const hole_stats_t before = hole_stats();
   sweep();
   const hole_stats_t swept = hole_stats();
-  if (purging_enabled && is_large_page(_mi_ptr_page(ptrs[0])) && swept.bytes_now <= before.bytes_now) {
+  if (purging_enabled && is_large_page(mi_ptr_page(ptrs[0])) && swept.bytes_now <= before.bytes_now) {
     fprintf(stderr, "\n  nothing was discarded in the pages of the heap\n");
     ok_all = false;
   }
@@ -635,7 +635,7 @@ static bool test_double_free(void) {
   void* const victim = ptrs[3];
   mi_free(ptrs[3]); ptrs[3] = NULL;
   sweep();
-  const mi_page_t* const page = freed_block_page(victim, _mi_ptr_page(ptrs[0])->block_size);
+  const mi_page_t* const page = freed_block_page(victim, mi_ptr_page(ptrs[0])->block_size);
   bool ok_all = true;
   if (purging_enabled && is_large_page(page) && mi_page_block_is_purged(page, victim)) {
     const size_t used = mi_page_used(page);
@@ -679,7 +679,7 @@ static bool test_park_defers_large(void) {
   const long old_interval = mi_option_get(mi_option_purge_holes_min_interval);
   mi_option_set(mi_option_purge_holes_min_interval, interval_ms);
   if (!alloc_filled(ptrs, n, size, &usable)) { free_all(ptrs, n); return false; }
-  const mi_page_t* const page0 = _mi_ptr_page(ptrs[0]);
+  const mi_page_t* const page0 = mi_ptr_page(ptrs[0]);
   const bool large = is_large_page(page0);
   const size_t bsize = page0->block_size;
   size_t nfreed = 0;
@@ -767,7 +767,7 @@ static const mi_page_t* touch_one_page(void** freed, size_t n, size_t size) {
     if (p == NULL) break;
     memset(p, 0x3E, size);
     extra[nextra++] = p;
-    for (size_t i = 0; i < n; i++) { if (freed[i] == p) { hit = _mi_ptr_page(p); } }
+    for (size_t i = 0; i < n; i++) { if (freed[i] == p) { hit = mi_ptr_page(p); } }
   }
   free_all(extra, nextra);
   return hit;
@@ -789,8 +789,8 @@ static bool test_recent_allocation(void) {
   sleep_ms((unsigned)interval_ms + 20);
   const mi_msecs_t t_alloc = _mi_clock_now();   // before the allocations: no page is older than this
   if (!alloc_filled(ptrs, n, size, &usable)) { free_all(ptrs, n); return false; }
-  const bool large = is_large_page(_mi_ptr_page(ptrs[0]));
-  const size_t bsize = _mi_ptr_page(ptrs[0])->block_size;
+  const bool large = is_large_page(mi_ptr_page(ptrs[0]));
+  const size_t bsize = mi_ptr_page(ptrs[0])->block_size;
   size_t nfreed = 0;
   for (size_t i = 0; i < n; i++) { if ((i % 4) != 0) { freed[i] = ptrs[i]; mi_free(ptrs[i]); ptrs[i] = NULL; nfreed++; } }
   if (purging_enabled && large) {
@@ -879,8 +879,8 @@ static bool test_abandoned_young(void) {
   mi_on_thread_idle();                     // (so that the first sweep below ends an epoch, see `test_recent_allocation`)
   sleep_ms((unsigned)interval_ms + 20);
   if (!mi_run_on_thread(&ab_worker)) { mi_option_set(mi_option_purge_holes_min_interval, old_interval); return false; }
-  const size_t bsize = (ab_ptrs[0] != NULL ? _mi_ptr_page(ab_ptrs[0])->block_size : 0);
-  const bool large = (ab_ptrs[0] != NULL && is_large_page(_mi_ptr_page(ab_ptrs[0])));
+  const size_t bsize = (ab_ptrs[0] != NULL ? mi_ptr_page(ab_ptrs[0])->block_size : 0);
+  const bool large = (ab_ptrs[0] != NULL && is_large_page(mi_ptr_page(ab_ptrs[0])));
   size_t nfreed = 0;
   for (size_t i = 0; i < ab_n; i++) { if (ab_freed[i] != NULL) { nfreed++; } }
   if (purging_enabled && large) {
@@ -951,8 +951,8 @@ static bool test_concurrent_sweepers(void) {
   const long old_interval = mi_option_get(mi_option_purge_holes_min_interval);
   mi_option_set(mi_option_purge_holes_min_interval, interval_ms);
   if (!alloc_filled(ptrs, n, size, &usable)) { free_all(ptrs, n); return false; }
-  const bool large = is_large_page(_mi_ptr_page(ptrs[0]));
-  const size_t bsize = _mi_ptr_page(ptrs[0])->block_size;
+  const bool large = is_large_page(mi_ptr_page(ptrs[0]));
+  const size_t bsize = mi_ptr_page(ptrs[0])->block_size;
   for (size_t i = 0; i < n; i++) { if ((i % 2) == 1) { freed[i] = ptrs[i]; mi_free(ptrs[i]); ptrs[i] = NULL; } }
   if (purging_enabled && large) {
     test_thread_t threads[CS_SWEEPERS];
@@ -1068,15 +1068,15 @@ static bool test_floor(void) {
   const size_t n = 60;
   memset(fl_ptrs, 0, sizeof(fl_ptrs)); memset(fl_freed, 0, sizeof(fl_freed));
   if (!alloc_filled(fl_ptrs, n, size, &fl_usable)) { free_all(fl_ptrs, n); return false; }
-  if (!is_large_page(_mi_ptr_page(fl_ptrs[0]))) { fprintf(stderr, "(not in a large page here) "); free_all(fl_ptrs, n); return true; }
-  const size_t bsize = _mi_ptr_page(fl_ptrs[0])->block_size;
+  if (!is_large_page(mi_ptr_page(fl_ptrs[0]))) { fprintf(stderr, "(not in a large page here) "); free_all(fl_ptrs, n); return true; }
+  const size_t bsize = mi_ptr_page(fl_ptrs[0])->block_size;
   size_t nfreed = 0;
   for (size_t i = 0; i < n; i++) {
     if ((i % 3) != 0) { fl_freed[i] = fl_ptrs[i]; mi_free(fl_ptrs[i]); fl_ptrs[i] = NULL; nfreed++; }
   }
   // a quarter of what is freed, whatever a large page and its blocks are here (4 MiB and 320 KiB, or 1 MiB and 80 KiB):
   // more than the free blocks of one page and less than all of them
-  const size_t floor = _mi_align_up((nfreed * bsize) / 4, MI_KiB);
+  const size_t floor = mi_align_up((nfreed * bsize) / 4, MI_KiB);
   if (nfreed * bsize <= 2 * floor) { fprintf(stderr, "\n  the case frees too little: %zu bytes\n", nfreed * bsize); ok_all = false; }
 
   // (there is a floor only where there is an epoch to count in: an interval, and then the hold comes first)
@@ -1155,7 +1155,7 @@ static size_t fd_count_purged(int g, size_t n, size_t bsize) {
 
 static size_t fd_fill(int g, size_t n, size_t size, size_t* bsize) {   // two of three blocks freed; returns how many
   if (!alloc_filled(fd_ptrs[g], n, size, &fd_usable[g])) return 0;
-  *bsize = _mi_ptr_page(fd_ptrs[g][0])->block_size;
+  *bsize = mi_ptr_page(fd_ptrs[g][0])->block_size;
   size_t nfreed = 0;
   for (size_t i = 0; i < n; i++) {
     if ((i % 3) != 0) { fd_freed[g][i] = fd_ptrs[g][i]; mi_free(fd_ptrs[g][i]); fd_ptrs[g][i] = NULL; nfreed++; }
@@ -1177,9 +1177,9 @@ static bool test_floor_decay(void) {
   size_t bsize0 = 0, bsize1 = 0;
   const size_t nfreed0 = fd_fill(0, n, large_size(1), &bsize0);
   if (nfreed0 == 0) { mi_option_set(mi_option_purge_holes_min_interval, old_interval); mi_option_set(mi_option_purge_holes_large_floor_epochs, old_epochs); return false; }
-  if (!is_large_page(_mi_ptr_page(fd_ptrs[0][0]))) { fprintf(stderr, "(not in a large page here) "); free_all(fd_ptrs[0], n); mi_option_set(mi_option_purge_holes_min_interval, old_interval); mi_option_set(mi_option_purge_holes_large_floor_epochs, old_epochs); return true; }
+  if (!is_large_page(mi_ptr_page(fd_ptrs[0][0]))) { fprintf(stderr, "(not in a large page here) "); free_all(fd_ptrs[0], n); mi_option_set(mi_option_purge_holes_min_interval, old_interval); mi_option_set(mi_option_purge_holes_large_floor_epochs, old_epochs); return true; }
   // room for all of the first group, and not for both
-  const size_t floor = _mi_align_up(nfreed0 * bsize0 + bsize0, MI_KiB);
+  const size_t floor = mi_align_up(nfreed0 * bsize0 + bsize0, MI_KiB);
   mi_option_set(mi_option_purge_holes_large_floor, (long)(floor / MI_KiB));
 
   // 1. out of the hold, the free blocks stay under the floor, sweep after sweep
@@ -1259,8 +1259,8 @@ static bool test_floor_free_page(void) {
   void* p[3];
   size_t usable = 0;
   if (!alloc_filled(p, 3, size, &usable)) { free_all(p, 3); mi_option_set(mi_option_purge_holes_large_floor, 0); mi_option_set(mi_option_purge_holes_large_floor_epochs, old_epochs); mi_option_set(mi_option_purge_holes_min_interval, old_interval); return false; }
-  const mi_page_t* const page = _mi_ptr_page(p[0]);
-  if (!is_large_page(page) || _mi_ptr_page(p[1]) != page || _mi_ptr_page(p[2]) != page) {
+  const mi_page_t* const page = mi_ptr_page(p[0]);
+  if (!is_large_page(page) || mi_ptr_page(p[1]) != page || mi_ptr_page(p[2]) != page) {
     fprintf(stderr, "(the blocks are not in one large page here) ");
     free_all(p, 3);
   }
@@ -1282,7 +1282,7 @@ static bool test_floor_free_page(void) {
       ok_all = false;
     }
     void* const q = mi_malloc(size);   // and the next allocation of that size takes it
-    const bool same = (q != NULL && _mi_ptr_page(q) == page);
+    const bool same = (q != NULL && mi_ptr_page(q) == page);
     if (kept1 == 0 || pages_freed_by_sweeps() != freed0 || !same) {
       fprintf(stderr, "\n  out of the hold: %zu bytes kept, %zu pages freed by the sweeps, the next block %s from that page\n", kept1, pages_freed_by_sweeps() - freed0, (same ? "is" : "is not"));
       ok_all = false;
@@ -1301,7 +1301,7 @@ static bool test_floor_free_page(void) {
     // ..but it does not wait for a sweep that never comes: no sweep has counted that page, so it is retired, as where
     // its last block is freed, and gone some collects later.
     void* const q2 = mi_malloc(size);
-    const bool same2 = (q2 != NULL && _mi_ptr_page(q2) == page);
+    const bool same2 = (q2 != NULL && mi_ptr_page(q2) == page);
     mi_free(q2);
     sweep();
     for (int i = 0; i < 40; i++) { mi_collect(false); }
@@ -1311,7 +1311,7 @@ static bool test_floor_free_page(void) {
     }
     // A forced collect takes the one under the floor as well.
     void* const q3 = mi_malloc(size);
-    const mi_page_t* const page3 = (q3 != NULL ? _mi_ptr_page(q3) : NULL);
+    const mi_page_t* const page3 = (q3 != NULL ? mi_ptr_page(q3) : NULL);
     mi_free(q3);
     fd_sweeps_past_the_hold(interval_ms);
     const size_t kept1d = _mi_page_purge_holes_floor_kept();
@@ -1322,7 +1322,7 @@ static bool test_floor_free_page(void) {
     }
     // (the rest of the case is about the page of before: one more, out of the hold and under the floor)
     void* const q4 = mi_malloc(size);
-    const mi_page_t* const page4 = (q4 != NULL ? _mi_ptr_page(q4) : NULL);
+    const mi_page_t* const page4 = (q4 != NULL ? mi_ptr_page(q4) : NULL);
     mi_free(q4);
     fd_sweeps_past_the_hold(interval_ms);
     if (page4 == NULL || _mi_page_purge_holes_floor_kept() == 0 || pages_freed_by_sweeps() != freed0) {
@@ -1345,7 +1345,7 @@ static bool test_floor_free_page(void) {
   void* r[6];
   if (!alloc_filled(r, 6, size, &usable)) { free_all(r, 6); mi_option_set(mi_option_purge_holes_large_floor, 0); mi_option_set(mi_option_purge_holes_large_floor_epochs, old_epochs); mi_option_set(mi_option_purge_holes_min_interval, old_interval); return false; }
   {
-  const size_t bsize = _mi_ptr_page(r[0])->block_size;
+  const size_t bsize = mi_ptr_page(r[0])->block_size;
   const int64_t before = hole_stats().bytes_now;
   for (size_t i = 1; i < 5; i++) { mi_free(r[i]); r[i] = NULL; }
   sweep();

@@ -15,7 +15,7 @@ terms of the MIT license.
    tld_main.theaps_lock and the surviving thread's tld->theaps_lock. If a
    thread that vanished at fork time held its tld->theaps_lock (e.g. inside
    _mi_theap_init), the child deadlocks the first time it touches that tld
-   via mi_heap_delete -> _mi_theap_free -> theap.c:322.
+   via mi_heap_delete -> mi_theap_free -> theap.c:322.
 
    Case C: the scavenger thread does not survive fork(), but fork_child left
    `_mi_scavenger_running` set. Purging is then left to a thread that does not
