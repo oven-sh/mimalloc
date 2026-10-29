@@ -174,7 +174,7 @@ static void test_destroyed_heaps_are_counted(void) {
       void* p = mi_heap_malloc(heap, BSIZE);
       if (p == NULL) { fprintf(stderr, "allocation failed\n"); abort(); }
       memset(p, i, BSIZE);
-      bin = _mi_page_stats_bin(_mi_ptr_page(p));
+      bin = _mi_page_stats_bin(mi_ptr_page(p));
     }
     mi_heap_destroy(heap);
   }

@@ -16,7 +16,7 @@ terms of the MIT license. A copy of the license can be found in the file
 #include "mimalloc.h"
 #include "mimalloc-profile.h"
 #include "mimalloc-stats.h"
-#include "mimalloc/internal.h"
+#include "mimalloc/types.h"   // MI_GUARDED, MI_UNUSED, atomics
 #include "testhelper.h"
 
 typedef void (thread_entry_fun_t)(intptr_t tid);
@@ -48,26 +48,26 @@ typedef struct {
 
 #define SMALL_MAX  1024
 
-static inline my_profiler_t* downcast( mi_profiler_t* prof ) { 
-  return (my_profiler_t*)prof; 
-} 
+static inline my_profiler_t* downcast( mi_profiler_t* prof ) {
+  return (my_profiler_t*)prof;
+}
 
 // We store ptr in user_data so on_free can verify the round-trip.
 
 #define TEST_THRESHOLD (16 * 1024)
 
-static size_t mi_cdecl on_alloc(mi_profiler_t* profiler, mi_profiler_sample_data_t* data, void* ptr, size_t requested_size, size_t threshold, uint64_t bytes_since_last_sample, const mi_heap_t* heap) {
+static size_t mi_cdecl on_alloc(mi_profiler_t* profiler, mi_profiler_sample_data_t* data, void* ptr, size_t requested_size, size_t threshold, uint64_t bytes_since_last_sample, mi_heap_t* heap) {
   MI_UNUSED(threshold); MI_UNUSED(heap); MI_UNUSED(requested_size);
   my_profiler_t* prof = downcast(profiler);
-  assert(bytes_since_last_sample >= requested_size);  
+  assert(bytes_since_last_sample >= requested_size);
   prof->alloc_count++;
   prof->last_ptr      = ptr;
   prof->last_size     = requested_size;
-  prof->last_upscaled = bytes_since_last_sample;   
-  // store ptr to verify round-trip 
+  prof->last_upscaled = bytes_since_last_sample;
+  // store ptr to verify round-trip
   assert(data->user_data_size >= sizeof(void*));
   assert(data->user_data_size >= prof->profiler.sample_data_size);
-  data->user_data[0] = ptr; 
+  data->user_data[0] = ptr;
   if (requested_size <= SMALL_MAX) { prof->upscaled_small += bytes_since_last_sample; }
                               else { prof->upscaled_large += bytes_since_last_sample; }
   if (heap == prof->watch_heap) { prof->watch_alloc_count++; }
@@ -79,7 +79,7 @@ static size_t mi_cdecl on_alloc(mi_profiler_t* profiler, mi_profiler_sample_data
   return prof->threshold;
 }
 
-static void mi_cdecl on_free(mi_profiler_t* profiler, mi_profiler_sample_data_t* data, void* ptr, const mi_heap_t* heap) {
+static void mi_cdecl on_free(mi_profiler_t* profiler, mi_profiler_sample_data_t* data, void* ptr, mi_heap_t* heap) {
   MI_UNUSED_RELEASE(data); MI_UNUSED_RELEASE(ptr);
   my_profiler_t* prof = downcast(profiler);
   prof->free_count++;
@@ -89,17 +89,18 @@ static void mi_cdecl on_free(mi_profiler_t* profiler, mi_profiler_sample_data_t*
     if (data->user_data[0] != ptr) { prof->watch_bad_free = true; }
   }
   // verify the user_data round-trip
-  assert(data->user_data[0] == ptr);  
+  assert(data->user_data[0] == ptr);
 }
 
 static my_profiler_t my_profiler = {
   { // profiler_t
     NULL,            // reserved
     sizeof(void*),   // needed sample data size
-    0,               // initial sample rate (default)        
-    &on_alloc,       
+    0,               // initial sample rate (default)
+    &on_alloc,
     &on_free,
-    NULL
+    NULL,            // on_realloc
+    NULL,            // on_snapshot
   },
   0, 0, 0, 0, NULL,
   TEST_THRESHOLD, 0, 0, 0, NULL, 0, 0, false, false, 0
@@ -146,7 +147,7 @@ bool test_profiler_record_fields(void) {
       void* p = mi_malloc(1024);
       mi_free(p);
     }
-    assert(count!=MAXLOOP);    
+    assert(count!=MAXLOOP);
     result = (my_profiler.last_ptr != NULL && my_profiler.last_size > 0 && my_profiler.last_upscaled > 0 && count!=MAXLOOP);
   }
   return true;
@@ -461,12 +462,12 @@ bool test_profiler_aligned(void) {
 // `mi_profiler_stop` and `mi_profiler_start` on one thread while another one is being sampled.
 static _Atomic(size_t) toggle_done;
 static _Atomic(size_t) toggle_samples;
-static size_t mi_cdecl toggle_on_alloc(mi_profiler_t* profiler, mi_profiler_sample_data_t* data, void* ptr, size_t requested_size, size_t threshold, uint64_t bytes_since_last_sample, const mi_heap_t* heap) {
+static size_t mi_cdecl toggle_on_alloc(mi_profiler_t* profiler, mi_profiler_sample_data_t* data, void* ptr, size_t requested_size, size_t threshold, uint64_t bytes_since_last_sample, mi_heap_t* heap) {
   MI_UNUSED(profiler); MI_UNUSED(data); MI_UNUSED(ptr); MI_UNUSED(requested_size); MI_UNUSED(threshold); MI_UNUSED(bytes_since_last_sample); MI_UNUSED(heap);
   mi_atomic_increment_relaxed(&toggle_samples);
   return 1024;
 }
-static mi_profiler_t toggle_profiler = { NULL, 0, 1024, &toggle_on_alloc, NULL, NULL };
+static mi_profiler_t toggle_profiler = { NULL, 0, 1024, &toggle_on_alloc, NULL, NULL, NULL };
 
 static void toggle_thread(intptr_t tid) {
   if (tid == 0) {
@@ -547,7 +548,7 @@ static _Atomic(size_t) late_first[LATE_THREADS];   // what a thread requested af
 static mi_decl_thread size_t   late_requested;
 static mi_decl_thread intptr_t late_tid = -1;
 
-static size_t mi_cdecl late_on_alloc(mi_profiler_t* profiler, mi_profiler_sample_data_t* data, void* ptr, size_t requested_size, size_t threshold, uint64_t bytes_since_last_sample, const mi_heap_t* heap) {
+static size_t mi_cdecl late_on_alloc(mi_profiler_t* profiler, mi_profiler_sample_data_t* data, void* ptr, size_t requested_size, size_t threshold, uint64_t bytes_since_last_sample, mi_heap_t* heap) {
   MI_UNUSED(profiler); MI_UNUSED(data); MI_UNUSED(ptr); MI_UNUSED(threshold); MI_UNUSED(bytes_since_last_sample); MI_UNUSED(heap);
   if (late_tid >= 0 && mi_atomic_load_relaxed(&late_first[late_tid]) == 0) {
     mi_atomic_store_release(&late_first[late_tid], late_requested + requested_size);
@@ -555,7 +556,7 @@ static size_t mi_cdecl late_on_alloc(mi_profiler_t* profiler, mi_profiler_sample
   return LATE_RATE;
 }
 
-static mi_profiler_t late_profiler = { NULL, 0, LATE_RATE, &late_on_alloc, NULL, NULL };
+static mi_profiler_t late_profiler = { NULL, 0, LATE_RATE, &late_on_alloc, NULL, NULL, NULL };
 
 static size_t late_step(void** slots, uint64_t* r) {   // free a slot that is in use, or fill it; returns the size it allocated
   *r ^= *r << 13; *r ^= *r >> 7; *r ^= *r << 17;
@@ -630,7 +631,7 @@ static mi_decl_thread size_t restart_got;   // (a block can be larger than what 
 static mi_decl_thread bool   restart_is_worker;
 static void* restart_small[4096];
 
-static size_t mi_cdecl restart_on_alloc(mi_profiler_t* profiler, mi_profiler_sample_data_t* data, void* ptr, size_t requested_size, size_t threshold, uint64_t bytes_since_last_sample, const mi_heap_t* heap) {
+static size_t mi_cdecl restart_on_alloc(mi_profiler_t* profiler, mi_profiler_sample_data_t* data, void* ptr, size_t requested_size, size_t threshold, uint64_t bytes_since_last_sample, mi_heap_t* heap) {
   MI_UNUSED(profiler); MI_UNUSED(data); MI_UNUSED(ptr); MI_UNUSED(threshold); MI_UNUSED(heap);
   if (restart_is_worker) {
     if (mi_atomic_increment_relaxed(&restart_samples) == 0) {
@@ -642,9 +643,9 @@ static size_t mi_cdecl restart_on_alloc(mi_profiler_t* profiler, mi_profiler_sam
   return mi_atomic_load_relaxed(&restart_rate);
 }
 
-static mi_profiler_t restart_profiler  = { NULL, 0, RESTART_EVEN_RATE, &restart_on_alloc, NULL, NULL };
-static mi_profiler_t restart_profiler2 = { NULL, 0, RESTART_EVEN_RATE, &restart_on_alloc, NULL, NULL };
-static mi_profiler_t restart_profiler3 = { NULL, 0, 1, &restart_on_alloc, NULL, NULL };
+static mi_profiler_t restart_profiler  = { NULL, 0, RESTART_EVEN_RATE, &restart_on_alloc, NULL, NULL, NULL };
+static mi_profiler_t restart_profiler2 = { NULL, 0, RESTART_EVEN_RATE, &restart_on_alloc, NULL, NULL, NULL };
+static mi_profiler_t restart_profiler3 = { NULL, 0, 1, &restart_on_alloc, NULL, NULL, NULL };
 
 static void restart_wait(size_t phase) {
   while (mi_atomic_load_acquire(&restart_phase) != phase) { mi_atomic_pause(); }

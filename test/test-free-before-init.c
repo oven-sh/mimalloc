@@ -8,7 +8,7 @@ terms of the MIT license.
 
    glibc 2.44's `__newlocale` calls `free(NULL)` from the dynamic loader, before any constructor
    of the executable has run. With `malloc` overridden that lands in `mi_free`, which looks `p`
-   up in the page map without a NULL check: `_mi_unchecked_ptr_page` reads `submaps[0][0]`. The
+   up in the page map without a NULL check: `mi_unchecked_ptr_page` reads `submaps[0][0]`. The
    initial (static) page map has to carry a real all-NULL submap at index 0; with a NULL submap
    the lookup faults at address 0 and the process dies before `main()`.
 

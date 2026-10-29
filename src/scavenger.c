@@ -10,7 +10,11 @@ terms of the MIT license. A copy of the license can be found in the file
 // arena memory returns to the OS without waiting for the next allocation.
 
 #include "mimalloc.h"
-#include "mimalloc/internal.h"
+#include "mimalloc/prim/prim-tls.h"      // _mi_thread_id
+#include "mimalloc/util/stats.h"         // _mi_clock_now
+#include "mimalloc/arena/arena-alloc.h"  // _mi_arenas_try_purge
+#include "mimalloc/heap/subproc.h"       // _mi_subproc_main
+#include "mimalloc/heap/theap.h"         // _mi_theap_sweep_parked
 
 #if defined(__wasi__) || (defined(__EMSCRIPTEN__) && !defined(__EMSCRIPTEN_PTHREADS__))
 

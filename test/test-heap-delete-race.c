@@ -9,11 +9,11 @@ terms of the MIT license.
 
    Thread B allocates from heap H then exits, which runs
    mi_thread_theaps_done -> _mi_theap_collect_abandon -> mi_theap_collect_ex
-   -> mi_theap_merge_stats(theap), which loads _mi_theap_heap(theap) and
+   -> mi_theap_merge_stats(theap), which loads mi_theap_heap(theap) and
    dereferences ->stats.
 
    Concurrently the main thread calls mi_heap_delete(H) ->
-   mi_heap_free_theaps -> _mi_theap_free, which atomically exchanges
+   mi_heap_free_theaps -> mi_theap_free, which atomically exchanges
    theap->heap to NULL *before* it blocks on tld->theaps_lock. If that
    exchange lands between collect_ex's entry guard and merge_stats, the
    dereference faults.
